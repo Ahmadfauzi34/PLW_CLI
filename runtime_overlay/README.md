@@ -51,6 +51,8 @@ correctness, or evidence-acceptance authority.
 Shared-graph semantic-usage lists are sorted before hashing so candidate
 discovery snapshots remain reproducible across separate Python processes.
 
+The `codesearch_engine_v1` readable, digest-pinned overlay adds the codesearch-go tree-sitter engine as an external binary (never bundled): `plw ast` defs/callers/related/search with a fail-closed schema gate, and `plw doctor` engine status. The `codesearch_engine_v2` overlay builds on it: `plw agent orient` executes the dynamic context matrix (context A/B from target languages plus engine availability, with routes — never from the task text). Its standalone smoke checks pure-Go, TS-only, and mixed targets with and without the engine.
+
 Overlays are a transport/build mechanism only. They are never required beside the released `plw` executable and are never copied into target repositories.
 
 The long-term repository cleanup is to normalize the runtime source into ordinary browsable Git files after the binary contract is stable.

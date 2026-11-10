@@ -1,0 +1,214 @@
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -11,13 +11,32 @@
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ 
+-from core.shared_graph import discover_source_files
++from core.shared_graph import DEFAULT_IGNORE_DIRS, discover_source_files
+ from core.semantic_affordance import COMMAND_CONTRACTS, describe_command
+ from language_semantics import JS_SOURCE_EXTENSIONS
+ 
+ SCHEMA_VERSION = "plw-portable-agent-v1"
+ POLICY = "standalone-binary-target-first-agent-surface-v1"
+ 
++DYNAMIC_CONTEXT_SCHEMA_VERSION = "plw-dynamic-context-v1"
++
++# Languages the dynamic context matrix distinguishes, by file extension.
++# language_semantics only defines JS/Python sets; Go/Rust live here because
++# the matrix (not the stable topology graph) is what needs them.
++MATRIX_LANGUAGE_EXTENSIONS = {
++    ".go": "go",
++    ".rs": "rust",
++    ".py": "python",
++    ".js": "javascript",
++    ".jsx": "jsx",
++    ".ts": "typescript",
++    ".tsx": "tsx",
++}
++# Languages the stable topology graph covers without any engine.
++STABLE_TOPOLOGY_LANGUAGES = {"javascript", "jsx", "typescript", "tsx"}
++# Languages whose structural questions need the tree-sitter engine.
++ENGINE_LANGUAGES = {"go", "rust", "python"}
++
+ 
+ def _state_root() -> Path:
+     home = os.environ.get("PLW_HOME")
+@@ -235,6 +254,139 @@
+     return doctor_status()
+ 
+ 
++def _target_languages(root: str = ".") -> Dict[str, int]:
++    """Count target files per matrix language. Never raises.
++
++    Same walk discipline as discover_source_files (ignored dirs, no
++    hidden dirs) but keyed by matrix language instead of stable scope,
++    so Go/Rust/Python files — invisible to the topology graph — are
++    counted here.
++    """
++    target = Path(root).expanduser().resolve()
++    counts: Dict[str, int] = {}
++    if not target.is_dir():
++        return counts
++    try:
++        for dirpath, dirnames, filenames in os.walk(target):
++            dirnames[:] = sorted(
++                d
++                for d in dirnames
++                if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")
++            )
++            for filename in sorted(filenames):
++                language = MATRIX_LANGUAGE_EXTENSIONS.get(
++                    Path(filename).suffix.lower()
++                )
++                if language is None:
++                    continue
++                counts[language] = counts.get(language, 0) + 1
++    except OSError:
++        return {}
++    return counts
++
++
++def dynamic_context(root: str = ".") -> Dict[str, Any]:
++    """Execute the dynamic context matrix (KONTEKS_DAN_RILIS.md §2) for one target root.
++
++    Inputs, all computed from the target — never from the task text:
++    the kernel's capability selection is explicitly not keyword-based
++    (policy evidence-class-to-capability-contract-not-task-keyword-v1),
++    so no task kind is classified here. Instead the matrix reports
++    which routes exist for this (languages, engine) state, and the
++    agent picks the route matching its task:
++
++    * target languages: Go/Rust/Python need the engine; TS/JS/JSX/TSX
++      are answered by the stable topology graph alone.
++    * engine availability: from doctor (available -> context B,
++      unavailable -> context A plus the recorded reason).
++    * routes: structural questions go via `plw ast` when the engine is
++      present, via the stable graph when the target is TS/JS-only, and
++      nowhere when the target needs the engine and it is missing.
++      Topology stays TS/JS-only either way (G6: the engine does not
++      extend topology).
++    """
++    languages = _target_languages(root)
++    engine = _codesearch_engine_status()
++    support = target_topology_support(root)
++    needs_engine = any(lang in ENGINE_LANGUAGES for lang in languages)
++    engine_available = bool(engine.get("available"))
++    context = "B" if engine_available else "A"
++
++    if not languages:
++        structural: Dict[str, Any] = {
++            "available": False,
++            "route": None,
++            "reason": "no matrix-language files found in target",
++        }
++    elif engine_available:
++        structural = {
++            "available": True,
++            "route": "plw ast defs|callers|related|search <root> <query>",
++            "reason": "engine available",
++        }
++    elif not needs_engine:
++        structural = {
++            "available": True,
++            "route": "stable topology graph (plw topology)",
++            "reason": "target languages are all in stable topology scope",
++        }
++    else:
++        structural = {
++            "available": False,
++            "route": None,
++            "reason": (
++                "engine unavailable; structural questions on go/rust/python "
++                "need the codesearch-go release binary"
++            ),
++        }
++    topology: Dict[str, Any] = {
++        "available": bool(support.get("topology_ready")),
++        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx only)",
++        "reason": str(support.get("reason") or ""),
++        "note": "the engine does not extend topology (G6)",
++    }
++
++    if not languages:
++        reason = "Context " + context + ": no matrix-language files found in target."
++    elif context == "B":
++        engine_id = ""
++        if engine.get("schema"):
++            engine_id = f" (schema {engine.get('schema')}, commit {engine.get('commit')})"
++        reason = (
++            f"Context B: engine available{engine_id}; "
++            "structural questions answered via plw ast; "
++            "topology stays TS/JS-only."
++        )
++    elif needs_engine:
++        missing = sorted(lang for lang in languages if lang in ENGINE_LANGUAGES)
++        parts = ", ".join(
++            f"{lang} ({languages[lang]} file{'s' if languages[lang] != 1 else ''})"
++            for lang in missing
++        )
++        engine_reason = f" ({engine.get('reason')})" if engine.get("reason") else ""
++        reason = (
++            f"Context A: target contains {parts} which need the engine; "
++            f"engine unavailable{engine_reason}; "
++            "structural questions cannot be answered; "
++            "required: codesearch-go release binary."
++        )
++    else:
++        reason = (
++            "Context A: target languages are all in stable topology scope; "
++            "no engine needed."
++        )
++    return {
++        "schema_version": DYNAMIC_CONTEXT_SCHEMA_VERSION,
++        "context": context,
++        "languages": languages,
++        "needs_engine": needs_engine,
++        "engine": engine,
++        "topology": topology,
++        "structural_query": structural,
++        "reason": reason,
++    }
++
++
+ def target_topology_support(root: str = ".") -> Dict[str, Any]:
+     """Describe the stable shared-graph source scope for one target root."""
+     target = Path(root).expanduser().resolve()
+@@ -351,5 +503,6 @@
+     "read_skill",
+     "doctor",
+     "target_topology_support",
++    "dynamic_context",
+     "orientation_surface",
+ ]
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -155,6 +155,7 @@
+     from core.portable_agent import (
+         build_version as portable_build_version,
+         doctor as portable_doctor,
++        dynamic_context as portable_dynamic_context,
+         list_capabilities as portable_list_capabilities,
+         describe_capability as portable_describe_capability,
+         list_skills as portable_list_skills,
+@@ -4591,6 +4592,7 @@
+         result = dict(result)
+         result["portable_agent_surface"] = portable_orientation_surface()
+         result["target_support"] = support
++        result["dynamic_context"] = portable_dynamic_context(opts.root)
+         reason = str(support.get("reason") or "")
+         if support.get("topology_ready"):
+             portable_state = "TARGET_TOPOLOGY_READY"
+@@ -4613,6 +4615,12 @@
+             handoff = (result.get("skill_handoff", {}) or {}) if isinstance(result, dict) else {}
+             print("# Portable topology state: " + str(result.get("portable_agent_state", "unknown")))
+             print("# Topology support reason: " + str(result.get("portable_agent_reason", "unknown")))
++            ctx = result.get("dynamic_context", {}) or {}
++            print("# Dynamic context: " + str(ctx.get("context", "unknown")))
++            print("# Context reason: " + str(ctx.get("reason", "unknown")))
++            sq = ctx.get("structural_query", {}) or {}
++            if sq.get("route"):
++                print("# Structural route: " + str(sq["route"]))
+             print("# Target state: " + str(target.get("state", "unknown")))
+             ui_handoff = result.get("ui_source_handoff", {}) or {}
+             if ui_handoff.get("status") != "NOT_APPLICABLE":

@@ -112,6 +112,10 @@ apply_reviewable_overlay "codesearch_engine_v1"
 grep -Fq 'codesearch-engine-v1' core/codesearch_engine.py
 grep -Fq 'def cmd_ast(' plw_cli.py
 grep -Fq '"codesearch_engine"' core/portable_agent.py
+apply_reviewable_overlay "codesearch_engine_v2"
+grep -Fq 'plw-dynamic-context-v1' core/portable_agent.py
+grep -Fq 'def dynamic_context(' core/portable_agent.py
+grep -Fq '"dynamic_context"' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
 grep -Fq '"plw-version-v1"' plw_cli.py
