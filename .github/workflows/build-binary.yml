@@ -128,6 +128,41 @@ jobs:
             artifacts/plw-linux-x86_64.sha256
           if-no-files-found: error
 
+  codesearch-go-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+
+      - name: Build codesearch-go (gofmt gate, vet, test, build)
+        env:
+          CGO_ENABLED: "0"
+        run: bash codesearch-go/build.sh
+
+      - name: Package release binary
+        run: |
+          mkdir -p artifacts
+          cp codesearch-go/codesearch-go artifacts/codesearch-go-linux-x86_64
+          chmod +x artifacts/codesearch-go-linux-x86_64
+          (cd artifacts && sha256sum codesearch-go-linux-x86_64 > codesearch-go-linux-x86_64.sha256)
+          artifacts/codesearch-go-linux-x86_64 --version
+          cat artifacts/codesearch-go-linux-x86_64.sha256
+
+      - name: Upload binary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codesearch-go-linux-x86_64
+          path: |
+            artifacts/codesearch-go-linux-x86_64
+            artifacts/codesearch-go-linux-x86_64.sha256
+          if-no-files-found: error
+
   browser-x86_64:
     needs: linux-x86_64
     runs-on: ubuntu-24.04
@@ -222,9 +257,35 @@ jobs:
           chmod +x artifacts/plw-linux-x86_64
           bash scripts/smoke_real_target_agent.sh artifacts/plw-linux-x86_64 external/vite
 
+  codesearch-engine-smoke:
+    needs: [linux-x86_64, codesearch-go-x86_64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download validated PLW binary
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: artifacts
+
+      - name: Download codesearch-go binary
+        uses: actions/download-artifact@v4
+        with:
+          name: codesearch-go-linux-x86_64
+          path: artifacts
+
+      - name: Run codesearch engine smoke (paired binaries)
+        shell: bash
+        run: |
+          (cd artifacts && sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256)
+          chmod +x artifacts/plw-linux-x86_64 artifacts/codesearch-go-linux-x86_64
+          CODESEARCH_BIN="$PWD/artifacts/codesearch-go-linux-x86_64" bash scripts/smoke_codesearch_engine.sh artifacts/plw-linux-x86_64
+
   release-version:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent]
+    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent, codesearch-go-x86_64, codesearch-engine-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -253,10 +314,27 @@ jobs:
           name: plw-linux-x86_64
           path: release
 
+      - name: Download validated codesearch-go artifact
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: codesearch-go-linux-x86_64
+          path: release
+
       - name: Verify release checksum file
         if: steps.version.outputs.publish == 'true'
         working-directory: release
-        run: sha256sum --check plw-linux-x86_64.sha256
+        run: sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
+
+      - name: Resolve engine version
+        if: steps.version.outputs.publish == 'true'
+        id: engine
+        shell: bash
+        run: |
+          chmod +x release/codesearch-go-linux-x86_64
+          engine_version="$(release/codesearch-go-linux-x86_64 --version)"
+          echo "engine_version=$engine_version" >> "$GITHUB_OUTPUT"
+          echo "$engine_version"
 
       - name: Publish immutable version release
         if: steps.version.outputs.publish == 'true'
@@ -264,6 +342,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          ENGINE_VERSION: ${{ steps.engine.outputs.engine_version }}
         shell: bash
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -274,13 +353,15 @@ jobs:
           gh release create "$RELEASE_TAG" \
             release/plw-linux-x86_64 \
             release/plw-linux-x86_64.sha256 \
+            release/codesearch-go-linux-x86_64 \
+            release/codesearch-go-linux-x86_64.sha256 \
             --target "$GITHUB_SHA" \
             --title "PLW $RELEASE_TAG" \
-            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification."
+            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification. Tree-sitter engine (codesearch-go): $ENGINE_VERSION, paired with this binary and covered by the codesearch engine smoke test."
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent]
+    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent, codesearch-go-x86_64, codesearch-engine-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -294,9 +375,15 @@ jobs:
           name: plw-linux-x86_64
           path: release
 
+      - name: Download validated codesearch-go artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codesearch-go-linux-x86_64
+          path: release
+
       - name: Verify release checksum file
         working-directory: release
-        run: sha256sum --check plw-linux-x86_64.sha256
+        run: sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
 
       - name: Publish GitHub Release
         env:
@@ -306,11 +393,15 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" \
               release/plw-linux-x86_64 \
               release/plw-linux-x86_64.sha256 \
+              release/codesearch-go-linux-x86_64 \
+              release/codesearch-go-linux-x86_64.sha256 \
               --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
               release/plw-linux-x86_64 \
               release/plw-linux-x86_64.sha256 \
+              release/codesearch-go-linux-x86_64 \
+              release/codesearch-go-linux-x86_64.sha256 \
               --title "PLW $GITHUB_REF_NAME" \
               --generate-notes
           fi
