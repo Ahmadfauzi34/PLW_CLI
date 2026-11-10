@@ -2,22 +2,34 @@
 # check_engine_contract.sh — G13: the engine's schemaV and the
 # adapter's KNOWN_SCHEMA must agree, and ENGINE_CONTRACT.md must
 # name the current schema. Run in CI (build-binary workflow, job
-# codesearch-go) so a mismatch is caught at push time, not at
-# runtime in a user's hands. If this goes red, the fix is a schema
+# codesearch-engine-smoke) so a mismatch is caught at push time, not
+# at runtime in a user's hands. If this goes red, the fix is a schema
 # bump (engine) or a SUPPORTED_SCHEMAS update (adapter) — never a
 # change to this script.
+#
+# NOTE: the adapter's KNOWN_SCHEMA is read from the overlay patch
+# (runtime_overlay/engine_state_v1/change.patch), NOT from
+# core/codesearch_engine.py — that file only exists after the
+# capsule is unpacked, and this job runs on the bare repo checkout
+# (a grep of core/ here fails with "No such file", CI run
+# 42868246692). The patch is the repo-resident source of truth for
+# the adapter: post-image lines are '+' (added) and ' ' (context);
+# '-' lines are the pre-image and are excluded. If a later overlay
+# moves KNOWN_SCHEMA, update ADAPTER_PATCH below — the script then
+# fails closed with "could not read KNOWN_SCHEMA".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v1/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
-ADAPTER_SCHEMA="$(grep -E '^KNOWN_SCHEMA = ' "$ROOT/core/codesearch_engine.py" | sed -E 's/^KNOWN_SCHEMA = "([^"]+)".*/\1/')"
+ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 
 fail=0
 if [ -z "$ENGINE_SCHEMA" ]; then
   echo "check_engine_contract: could not read schemaV from codesearch-go/index.go" >&2
   fail=1
 elif [ -z "$ADAPTER_SCHEMA" ]; then
-  echo "check_engine_contract: could not read KNOWN_SCHEMA from core/codesearch_engine.py" >&2
+  echo "check_engine_contract: could not read KNOWN_SCHEMA from $ADAPTER_PATCH" >&2
   fail=1
 elif [ "$ENGINE_SCHEMA" != "$ADAPTER_SCHEMA" ]; then
   echo "check_engine_contract: MISMATCH engine schemaV=$ENGINE_SCHEMA adapter KNOWN_SCHEMA=$ADAPTER_SCHEMA" >&2
