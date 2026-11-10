@@ -1,0 +1,97 @@
+{
+  "schema_version": "plw-js-ts-v2-bounded-mutation-evidence-synthesis-current-state-v1",
+  "development_version": "0.2.1-dev",
+  "accepted_evidence_source": {
+    "schema": "plw-js-ts-v2-experiment-evidence-acceptance-v1",
+    "committed_acceptance_ledger_present": true,
+    "current_sealed_accepted_record_count": 2,
+    "ledger_path": "qualification/js_ts_v2_accepted_mutation_evidence.jsonl",
+    "repository_count": 2,
+    "candidate_count": 2,
+    "repositories": [
+      "prettier/prettier",
+      "vitejs/vite"
+    ],
+    "acceptance_record_digests": [
+      "sha256:611f2faa1cbbea8c9a9774acc8a480b5423cdddbbc7bb3ec26477da28312656c",
+      "sha256:1edb3876d2824abded6ac2b9adc54d6f195224dfbe1ec2f3c3ec86aeddd225dc"
+    ]
+  },
+  "historical_context": {
+    "source": "qualification/js_ts_v2_local_rule_evidence.json",
+    "record_count": 4,
+    "counts_toward_sealed_acceptance": false,
+    "rules": {
+      "js_redundant_else_after_terminal": {
+        "historical_record_count": 1,
+        "historical_repositories": [
+          "reduxjs/redux-toolkit"
+        ]
+      },
+      "js_boolean_guard_return": {
+        "historical_record_count": 2,
+        "historical_repositories": [
+          "prettier/prettier",
+          "vitejs/vite"
+        ]
+      },
+      "js_terminal_expression_temporary": {
+        "historical_record_count": 1,
+        "historical_repositories": [
+          "prettier/prettier"
+        ]
+      }
+    }
+  },
+  "current_review": {
+    "stage": "CROSS_REPOSITORY_SEALED_ACCEPTED_EVIDENCE_READY",
+    "reason": "THRESHOLD_SATISFIED_REVIEW_ONLY",
+    "promotion_review_ready": true,
+    "next_gate": "BOUNDED_MUTATION_CAPABILITY_PROMOTION_REVIEW"
+  },
+  "promotion_threshold": {
+    "minimum_accepted_records": 2,
+    "minimum_distinct_repositories": 2,
+    "minimum_distinct_candidates": 2,
+    "required_evidence_class": "BOUNDED_POSTCONDITION_VALIDATION_EVIDENCE",
+    "historical_records_may_not_satisfy_threshold": true
+  },
+  "authority": {
+    "review_only": true,
+    "mutation_capability_granted": false,
+    "automatic_patch_authority_granted": false,
+    "generic_mutation_authority_granted": false,
+    "upstream_mutation_authorized": false,
+    "truth_commit": false
+  },
+  "interactive_adjudication": {
+    "latest_repository": "vitejs/vite",
+    "latest_candidate_id": "sha256:d4d1da6c55c80079b4761ae51b1593c8b051e8c3ff276fb78fd6542ab2bfdef0",
+    "status": "INTERACTIVE_VITE_SEALED_EVIDENCE_ADJUDICATION_PASSED",
+    "artifact_digest": "sha256:74f3d76ccac00e199ee2aec2c06e44054a3273db09e4d22074c8e583d60bc2e7",
+    "acceptance_record_digest": "sha256:1edb3876d2824abded6ac2b9adc54d6f195224dfbe1ec2f3c3ec86aeddd225dc"
+  },
+  "promotion_review": {
+    "status": "BOUNDED_MUTATION_CAPABILITY_PROMOTION_APPROVED_FOR_IMPLEMENTATION",
+    "capability_id": "js_boolean_guard.strict_equality_string.temp_worktree.v1",
+    "implementation_authorized": true,
+    "runtime_capability_enabled": false,
+    "scope": {
+      "source_extensions": [
+        ".js",
+        ".ts"
+      ],
+      "condition_operator": "===",
+      "left_operand": "IDENT_OR_MEMBER_CHAIN",
+      "right_operand": "STRING_LITERAL",
+      "transformations": [
+        "positive",
+        "inverse"
+      ],
+      "comparison_operator_complement_folding": false,
+      "disposable_temp_worktree_only": true
+    },
+    "interactive_audit_status": "INTERACTIVE_BOUNDED_MUTATION_CAPABILITY_PROMOTION_AUDIT_PASSED",
+    "next_gate": "BOUNDED_BOOLEAN_GUARD_MUTATION_CAPABILITY_IMPLEMENTATION"
+  }
+}

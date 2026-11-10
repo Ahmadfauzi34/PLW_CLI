@@ -1,0 +1,316 @@
+name: Build PLW binary
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plw-binary-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unpack verified runtime source
+        run: bash scripts/unpack_runtime_source.sh
+
+      - name: Candidate selection provenance contract
+        run: python scripts/check_js_ts_candidate_provenance.py
+
+      - name: Candidate selection agent handoff contract
+        run: python scripts/check_candidate_selection_agent_handoff.py
+
+      - name: Candidate semantic affordance projection contract
+        run: python scripts/check_candidate_semantic_affordance_projection.py
+
+      - name: Candidate operation contract reference
+        run: python scripts/check_candidate_operation_contract.py
+
+      - name: Shared-graph signature determinism
+        run: python scripts/check_shared_graph_signature_determinism.py
+
+      - name: Candidate provenance receipt binding
+        run: python scripts/check_js_ts_candidate_provenance_receipt_binding.py
+
+      - name: Binary-safety guard
+        run: python scripts/check_binary_safety.py
+
+      - name: Source smoke before freeze
+        run: |
+          python plw_cli.py help >/dev/null
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/src"
+          printf 'export const value = 1;\n' > "$tmp/src/value.ts"
+          printf 'import { value } from "./value";\nconsole.log(value);\n' > "$tmp/src/main.ts"
+          HOME="$tmp/home" XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" \
+            python plw_cli.py topology "$tmp" --json > "$tmp/topology.json"
+          python - "$tmp/topology.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          if payload.get("error"):
+              raise SystemExit(payload["error"])
+          print("SOURCE_SMOKE: PASS")
+          PY
+
+      - name: Build standalone executable
+        shell: bash
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/plw-build-home \
+            -e PYINSTALLER_CONFIG_DIR=/tmp/plw-pyinstaller \
+            -e PLW_BUILD_PYTHON=py3.13 \
+            -v "$PWD:/work" -w /work \
+            ghcr.io/yt-dlp/manylinux2014_x86_64-shared@sha256:4faf3be022c04a457f9176ede4d086f0a8f5794cc6dc267bcb16ad6b903ec294 \
+            /bin/bash -c 'mkdir -p "$HOME" && test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17" && bash scripts/build_binary.sh'
+
+      - name: Verify ELF GLIBC symbol ceiling
+        run: bash scripts/check_binary_glibc.sh artifacts/plw-linux-x86_64 2.17
+
+      - name: Standalone topology and impact smoke
+        run: bash scripts/smoke_binary.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone portable agent smoke
+        run: bash scripts/smoke_portable_agent.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone readiness and version smoke
+        run: bash scripts/smoke_readiness_version.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone candidate semantic affordance smoke
+        run: bash scripts/smoke_candidate_semantic_affordance.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone candidate operation contract smoke
+        run: bash scripts/smoke_candidate_operation_contract.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone operation plan preflight smoke
+        run: bash scripts/smoke_operation_plan.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone dirty revision byte binding smoke
+        run: bash scripts/smoke_dirty_snapshot.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone JS/TS simplification smoke
+        run: bash scripts/smoke_simplify_js_ts.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone UI smoke
+        run: bash scripts/smoke_binary_ui.sh artifacts/plw-linux-x86_64
+
+      - name: Standalone browserless Angular UI smoke
+        run: bash scripts/smoke_ui_static.sh artifacts/plw-linux-x86_64
+
+      - name: Upload binary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: |
+            artifacts/plw-linux-x86_64
+            artifacts/plw-linux-x86_64.sha256
+          if-no-files-found: error
+
+  browser-x86_64:
+    needs: linux-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download validated binary
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: artifacts
+
+      - name: Run required Chromium/CDP proof
+        shell: bash
+        run: |
+          (cd artifacts && sha256sum --check plw-linux-x86_64.sha256)
+          chmod +x artifacts/plw-linux-x86_64
+          chrome="$(command -v google-chrome || command -v google-chrome-stable || true)"
+          test -n "$chrome"
+          PLW_REQUIRE_BROWSER=1 PLW_BROWSER_EXECUTABLE="$chrome" \
+            bash scripts/smoke_binary_ui.sh artifacts/plw-linux-x86_64
+
+  older-glibc-compat:
+    needs: linux-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download validated binary
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: artifacts
+
+      - name: Execute binary with GLIBC 2.17 and Ubuntu 20.04
+        shell: bash
+        run: |
+          (cd artifacts && sha256sum --check plw-linux-x86_64.sha256)
+          chmod +x artifacts/plw-linux-x86_64
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/artifacts:/bin-artifacts:ro" \
+            centos:7.9.2009 \
+            /bin/bash -euc '
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"
+              mkdir -p /tmp/plw-target/src
+              printf "export const value = 1;\n" > /tmp/plw-target/src/value.ts
+              /bin-artifacts/plw-linux-x86_64 help >/dev/null
+              /bin-artifacts/plw-linux-x86_64 topology /tmp/plw-target --json >/tmp/plw-topology.json
+              test -s /tmp/plw-topology.json
+              echo "GLIBC_2_17_BINARY: PASS"
+            '
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/artifacts:/bin-artifacts:ro" \
+            ubuntu:20.04 \
+            /bin/bash -euc '
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
+              mkdir -p /tmp/plw-target/src
+              printf "export const value = 1;\n" > /tmp/plw-target/src/value.ts
+              /bin-artifacts/plw-linux-x86_64 help >/dev/null
+              /bin-artifacts/plw-linux-x86_64 topology /tmp/plw-target --json >/tmp/plw-topology.json
+              test -s /tmp/plw-topology.json
+              echo "UBUNTU_20_04_BINARY: PASS glibc=2.31"
+            '
+
+  real-target-agent:
+    needs: linux-x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout PLW
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned Vite target
+        uses: actions/checkout@v4
+        with:
+          repository: vitejs/vite
+          ref: 1544bb1b7ac92f775e9d0dea97954c99cc6cbd43
+          path: external/vite
+          persist-credentials: false
+
+      - name: Download validated binary
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: artifacts
+
+      - name: Run real target agent workflow
+        shell: bash
+        run: |
+          (cd artifacts && sha256sum --check plw-linux-x86_64.sha256)
+          chmod +x artifacts/plw-linux-x86_64
+          bash scripts/smoke_real_target_agent.sh artifacts/plw-linux-x86_64 external/vite
+
+  release-version:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "VERSION=$version is a development/non-release version; publication skipped."
+          fi
+
+      - name: Download validated binary artifact
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: release
+
+      - name: Verify release checksum file
+        if: steps.version.outputs.publish == 'true'
+        working-directory: release
+        run: sha256sum --check plw-linux-x86_64.sha256
+
+      - name: Publish immutable version release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to replace published assets."
+            exit 0
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            release/plw-linux-x86_64 \
+            release/plw-linux-x86_64.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "PLW $RELEASE_TAG" \
+            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification."
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+
+      - name: Download validated binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plw-linux-x86_64
+          path: release
+
+      - name: Verify release checksum file
+        working-directory: release
+        run: sha256sum --check plw-linux-x86_64.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              release/plw-linux-x86_64 \
+              release/plw-linux-x86_64.sha256 \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              release/plw-linux-x86_64 \
+              release/plw-linux-x86_64.sha256 \
+              --title "PLW $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

@@ -1,0 +1,437 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -0,0 +1,282 @@
++"""codesearch-go as PLW's tree-sitter engine (codesearch-engine-v1).
++
++PLW has no tree-sitter: its Python parsing is stdlib ``ast.parse`` and
++its JS/TS parsing is the hand-written ``js_structural_v2`` frontend,
++which PLW itself declares is not a full parser, and its topology
++outline is regex.  codesearch-go already carries a real tree-sitter
++engine (gotreesitter v0.55.1, pure Go, no cgo) with AST chunking for
++Go, Rust, Python, JS, TS, TSX and JSX, plus structural queries
++(``--defs-only``, ``--callers``, ``--related``).
++
++Contract
++--------
++* Read-only.  Nothing is written into the target root.  codesearch
++  keeps its own gob index cache under ``~/.cache/codesearch-go``
++  (outside the target), which is PLW's own rule for mutable state.
++* Subprocess only, list argv, no shell.  stdout is parsed as JSON;
++  codesearch writes its proof lines and summaries to stderr, so
++  stdout stays machine-readable.
++* Fail-closed.  A missing binary, an unparsable version, a schema
++  other than the known-good ``go9``, a timeout, a non-zero exit, or
++  an unparsable JSON response all raise ``EngineError``.  No partial
++  result is ever presented as success.
++* Discovery.  Explicit path, then the ``CODESEARCH_BIN``
++  environment variable, then ``PATH``.  The engine is an external
++  binary supplied by the agent harness, like any other external
++  tool: it is never bundled into the PLW executable and there is no
++  fallback to a build-machine path.
++* Authority.  codesearch ``--callers`` is name-based (callee
++  normalised to its trailing identifier), not type-resolved.  Its
++  rows are leads: PLW must still read the cited file before
++  treating a call as proven.  That is stated in every envelope as
++  ``authority_note``.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++CODESEARCH_ENGINE_VERSION = "codesearch-engine-v1"
++SCHEMA_VERSION = "plw-codesearch-engine-v1"
++KNOWN_SCHEMA = "go9"
++DEFAULT_TIMEOUT_S = 120
++VERSION_TIMEOUT_S = 10
++
++TREE_SITTER_LANGUAGES = ["go", "rust", "python", "javascript", "typescript", "tsx", "jsx"]
++
++AUTHORITY_NOTE = (
++    "codesearch --callers/--related is name-based (trailing identifier), "
++    "not type-resolved. Rows are leads: read the cited file before treating "
++    "a call or relation as proven. Topology is not causality; candidate is not patch."
++)
++
++_VERSION_RE = re.compile(
++    r"schema=(?P<schema>\S+)\s+commit=(?P<commit>\S+)"
++    r"(?:\s+built=(?P<built>\S+))?(?:\s+go=(?P<go>\S+))?"
++)
++
++
++class EngineError(Exception):
++    """Fail-closed engine failure: nothing usable was produced."""
++
++
++def discover_codesearch(explicit: Optional[str] = None) -> Tuple[Path, str]:
++    """Find the codesearch binary. Returns (path, discovered_via)."""
++    if explicit:
++        path = Path(explicit)
++        if not path.is_file():
++            raise EngineError(f"codesearch binary not found at explicit path: {explicit}")
++        return path, "explicit"
++    env = os.environ.get("CODESEARCH_BIN")
++    if env:
++        path = Path(env)
++        if not path.is_file():
++            raise EngineError(f"codesearch binary not found at CODESEARCH_BIN: {env}")
++        return path, "CODESEARCH_BIN"
++    on_path = shutil.which("codesearch")
++    if on_path:
++        return Path(on_path), "PATH"
++    raise EngineError(
++        "codesearch binary not found: set CODESEARCH_BIN or put it on PATH "
++        "(the engine is supplied by the agent harness, not bundled with PLW)"
++    )
++
++
++def version_info(binary: Path) -> Dict[str, Any]:
++    """Run `codesearch --version` and parse it. Fail-closed on anything odd."""
++    try:
++        proc = subprocess.run(
++            [str(binary), "--version"],
++            check=False,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            timeout=VERSION_TIMEOUT_S,
++            shell=False,
++        )
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        raise EngineError(f"codesearch --version failed to run: {exc}") from exc
++    if proc.returncode != 0:
++        raise EngineError(
++            f"codesearch --version exited {proc.returncode}: "
++            f"{proc.stderr.strip()[:300]}"
++        )
++    match = _VERSION_RE.search(proc.stdout)
++    if not match:
++        raise EngineError(
++            f"codesearch --version output unparsable: {proc.stdout.strip()[:300]!r}"
++        )
++    info: Dict[str, Any] = {"raw": proc.stdout.strip(), **match.groupdict()}
++    if info["schema"] != KNOWN_SCHEMA:
++        raise EngineError(
++            f"codesearch index schema {info['schema']!r} is not the known-good "
++            f"{KNOWN_SCHEMA!r}; refusing to use this engine build"
++        )
++    return info
++
++
++def engine_status(binary: Path, discovered_via: str) -> Dict[str, Any]:
++    """Provenance block carried by every envelope."""
++    info = version_info(binary)
++    return {
++        "name": "codesearch-go",
++        "binary": str(binary),
++        "discovered_via": discovered_via,
++        "version": info,
++        "schema": info["schema"],
++        "tree_sitter_ready": True,
++        "tree_sitter_languages": list(TREE_SITTER_LANGUAGES),
++        "tree_sitter_library": "gotreesitter v0.55.1 (pure Go, no cgo)",
++    }
++
++
++def doctor_status(explicit: Optional[str] = None) -> Dict[str, Any]:
++    """Engine availability for `plw doctor`. Never raises."""
++    try:
++        binary, discovered_via = discover_codesearch(explicit)
++        status = engine_status(binary, discovered_via)
++        return {
++            "available": True,
++            "tree_sitter_ready": True,
++            "binary": str(binary),
++            "discovered_via": discovered_via,
++            "schema": status["schema"],
++            "commit": status["version"].get("commit"),
++            "languages": list(TREE_SITTER_LANGUAGES),
++        }
++    except EngineError as exc:
++        return {
++            "available": False,
++            "tree_sitter_ready": False,
++            "binary": None,
++            "discovered_via": None,
++            "schema": None,
++            "commit": None,
++            "languages": list(TREE_SITTER_LANGUAGES),
++            "reason": str(exc),
++        }
++
++
++def _run_codesearch(
++    binary: Path, root: Path, argv: List[str], timeout_s: int
++) -> Dict[str, Any]:
++    """Run one codesearch invocation, parse stdout JSON, fail-closed."""
++    if not root.is_dir():
++        raise EngineError(f"root is not a directory: {root}")
++    cmd = [str(binary), "--root", str(root), *argv, "--json"]
++    try:
++        proc = subprocess.run(
++            cmd,
++            check=False,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            timeout=timeout_s,
++            shell=False,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise EngineError(
++            f"codesearch timed out after {timeout_s}s: {' '.join(cmd)}"
++        ) from exc
++    except OSError as exc:
++        raise EngineError(f"codesearch failed to run: {exc}") from exc
++    if proc.returncode != 0:
++        raise EngineError(
++            f"codesearch exited {proc.returncode}: "
++            f"{(proc.stderr or proc.stdout).strip()[:500]}"
++        )
++    try:
++        return json.loads(proc.stdout)
++    except json.JSONDecodeError as exc:
++        raise EngineError(
++            f"codesearch stdout is not JSON ({exc}): {proc.stdout[:300]!r}"
++        ) from exc
++
++
++def envelope(mode: str, root: Path, query: str, engine: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
++    total = result.get("total")
++    if total is None and isinstance(result.get("calls"), list):
++        total = len(result["calls"])
++    if total is None and isinstance(result.get("related"), list):
++        total = len(result["related"])
++    return {
++        "ok": True,
++        "schema_version": SCHEMA_VERSION,
++        "mode": mode,
++        "root": str(root),
++        "query": query,
++        "engine": engine,
++        "engine_result": result,
++        "summary": {
++            "total": total,
++            "shown": result.get("shown"),
++        },
++        "authority_note": AUTHORITY_NOTE,
++    }
++
++
++def error_envelope(mode: str, root: str, query: str, error: str) -> Dict[str, Any]:
++    return {
++        "ok": False,
++        "schema_version": SCHEMA_VERSION,
++        "mode": mode,
++        "root": root,
++        "query": query,
++        "engine": None,
++        "engine_result": None,
++        "summary": {"total": None, "shown": None},
++        "error": error,
++        "authority_note": AUTHORITY_NOTE,
++    }
++
++
++def doctor_envelope(root: Path, explicit: Optional[str] = None) -> Dict[str, Any]:
++    """Availability envelope for `plw ast doctor`. Never raises."""
++    status = doctor_status(explicit)
++    result: Dict[str, Any] = {
++        "ok": bool(status.get("available")),
++        "schema_version": SCHEMA_VERSION,
++        "mode": "doctor",
++        "root": str(root),
++        "query": "",
++        "engine": status,
++        "engine_result": {"tree_sitter_ready": bool(status.get("tree_sitter_ready"))},
++        "summary": {"total": None, "shown": None},
++        "authority_note": AUTHORITY_NOTE,
++    }
++    if not status.get("available"):
++        result["error"] = str(status.get("reason") or "codesearch engine unavailable")
++    return result
++
++
++def run_query(
++    mode: str,
++    root: Path,
++    query: str,
++    binary: Path,
++    discovered_via: str,
++    timeout_s: int,
++    limit: Optional[int] = None,
++) -> Dict[str, Any]:
++    """One engine query end to end: engine check, then the structural call."""
++    engine = engine_status(binary, discovered_via)
++    if mode == "defs":
++        argv = ["--defs-only", query]
++    elif mode == "callers":
++        argv = ["--callers", query]
++    elif mode == "related":
++        argv = ["--related", query]
++    elif mode == "search":
++        argv = [query]
++        if limit is not None:
++            argv = ["--limit", str(limit), query]
++    else:
++        raise EngineError(f"unknown mode: {mode}")
++    result = _run_codesearch(binary, root, argv, timeout_s)
++    return envelope(mode, root, query, engine, result)
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -212,6 +212,29 @@
+     return {"available": False, "executable": None, "required_for_static": False}
+ 
+ 
++def _codesearch_engine_status() -> Dict[str, Any]:
++    """Tree-sitter engine availability for `plw doctor`. Never raises.
++
++    The engine module is imported lazily so a missing or broken engine
++    can never take `doctor` (or the rest of the CLI) down with it:
++    doctor reports the engine as unavailable instead.
++    """
++    try:
++        from core.codesearch_engine import doctor_status
++    except Exception:
++        return {
++            "available": False,
++            "tree_sitter_ready": False,
++            "binary": None,
++            "discovered_via": None,
++            "schema": None,
++            "commit": None,
++            "languages": [],
++            "reason": "codesearch engine module unavailable",
++        }
++    return doctor_status()
++
++
+ def target_topology_support(root: str = ".") -> Dict[str, Any]:
+     """Describe the stable shared-graph source scope for one target root."""
+     target = Path(root).expanduser().resolve()
+@@ -275,6 +298,7 @@
+             "state_root": str(state_root),
+             "cache_root": str(cache_root),
+             "browser": _browser(),
++            "codesearch_engine": _codesearch_engine_status(),
+         },
+         "agent": {
+             "first_contact": "plw agent orient <root> --task <task> --json",
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4423,6 +4423,8 @@
+             print(f"# {name}: {'PASS' if passed else 'FAIL'}")
+         browser = ((result.get("runtime") or {}).get("browser") or {})
+         print("# Chromium: " + (str(browser.get("executable")) if browser.get("available") else "optional / not found"))
++        engine = ((result.get("runtime") or {}).get("codesearch_engine") or {})
++        print("# Tree-sitter engine: " + (str(engine.get("binary")) + " schema=" + str(engine.get("schema")) if engine.get("available") else "optional / not found"))
+         print("# First contact: " + str((result.get("agent") or {}).get("first_contact")))
+         return code
+     if "capabilities" in result:
+@@ -4442,6 +4444,82 @@
+     return code
+ 
+ 
++def cmd_ast(args: List[str]) -> int:
++    """Tree-sitter structural queries via the codesearch-go engine.
++
++    Read-only discovery over the target root: where a symbol is
++    defined, who calls it, what it relates to, or a ranked search.
++    The engine is an external binary (explicit --binary, CODESEARCH_BIN,
++    or PATH) supplied by the agent harness; a missing or incompatible
++    engine fails closed with exit 3 and an error envelope.  Callers are
++    name-based leads, not type-resolved proof: read the cited file
++    before claiming a call.
++    """
++    import argparse
++    parser = argparse.ArgumentParser(prog="plw ast")
++    parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor"))
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("query", nargs="?")
++    parser.add_argument("--binary", default=None)
++    parser.add_argument("--timeout", type=int, default=120)
++    parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument("--json", action="store_true", dest="as_json")
++    opts = parser.parse_args(args)
++    root = Path(opts.root).expanduser().resolve()
++    try:
++        from core.codesearch_engine import (
++            DEFAULT_TIMEOUT_S,
++            discover_codesearch,
++            doctor_envelope,
++            error_envelope,
++            run_query,
++            EngineError,
++        )
++    except Exception as exc:  # engine module must never take the CLI down
++        result: Dict[str, Any] = error_envelope(
++            opts.operation, str(root), opts.query or "",
++            f"codesearch engine module unavailable: {exc}",
++        )
++        print(json.dumps(result, indent=2, ensure_ascii=False))
++        return 3
++    timeout_s = opts.timeout if opts.timeout is not None else DEFAULT_TIMEOUT_S
++    try:
++        if opts.operation == "doctor":
++            result = doctor_envelope(root, opts.binary)
++        else:
++            if not opts.query:
++                parser.error("plw ast defs|callers|related|search requires <query>")
++            binary, discovered_via = discover_codesearch(opts.binary)
++            result = run_query(
++                opts.operation, root, opts.query,
++                binary, discovered_via, timeout_s, opts.limit,
++            )
++    except EngineError as exc:
++        result = error_envelope(opts.operation, str(root), opts.query or "", str(exc))
++    if opts.as_json:
++        print(json.dumps(result, indent=2, ensure_ascii=False))
++    else:
++        print("# [PLW AST]")
++        if not result.get("ok"):
++            print("# Error: " + str(result.get("error")))
++        else:
++            engine = result.get("engine") or {}
++            print("# Mode: " + str(result.get("mode")))
++            print("# Engine: " + str(engine.get("binary")) + " schema=" + str(engine.get("schema")))
++            print("# Total: " + str((result.get("summary") or {}).get("total")))
++            rows = ((result.get("engine_result") or {}).get("hits")
++                    or (result.get("engine_result") or {}).get("calls")
++                    or (result.get("engine_result") or {}).get("related") or [])
++            for row in rows:
++                if "snippet" in row:
++                    print(f"{row.get('path')}:{row.get('start')}\t{row.get('kind')}\t{row.get('snippet')}")
++                elif "caller" in row:
++                    print(f"{row.get('path')}:{row.get('line')}\tcaller={row.get('caller')}\t{row.get('text', '').strip()}")
++                else:
++                    print(f"{row.get('path')}:{row.get('line')}\t{row.get('kind')}\t{row.get('detail')}")
++    return 0 if result.get("ok") else 3
++
++
+ def cmd_doctor(args: List[str]) -> int:
+     """Verify standalone portable-agent readiness without touching target source."""
+     import argparse
+@@ -4598,6 +4676,8 @@
+ Usage:
+   plw doctor [root] [--json]
+       -> Verifies standalone binary/embedded skill readiness; Chromium is optional for static capabilities
++  plw ast <defs|callers|related|search|doctor> [root] [query] [--binary PATH] [--timeout N] [--limit N] [--json]
++      -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); callers are name-based leads, not proof
+   plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--json]
+       -> Official target-first agent entrypoint; orientation only, no runtime/source mutation authority
+   plw capability list [--json]
+@@ -4734,6 +4814,8 @@
+ 
+     if cmd == "doctor":
+         sys.exit(cmd_doctor(sub_args))
++    elif cmd in ("ast", "codesearch", "tree-sitter", "tree_sitter"):
++        sys.exit(cmd_ast(sub_args))
+     elif cmd == "agent":
+         sys.exit(cmd_agent(sub_args))
+     elif cmd in ("capability", "capabilities"):
