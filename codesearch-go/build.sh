@@ -11,10 +11,22 @@
 #      changing source during a build)
 #   2. go vet ./...
 #   3. go test ./...
-# Then the binary is built with ldflags that inject the source tree hash
-# and the UTC build time, so --version identifies exactly this source:
-#   codesearch schema=go9 commit=<tree-hash> built=<UTC> go=<version>
-# Without ldflags those fields honestly print "unknown" (see TestVersionLine).
+# Then the binary is built with ldflags that inject the source tree hash,
+# so --version identifies exactly this source:
+#   codesearch schema=go9 commit=<tree-hash> built=unknown go=<version>
+#
+# REPRODUCIBLE BUILD (G2): the build is byte-identical for the same
+# source + toolchain — `-trimpath` strips the local build directory,
+# `-buildvcs=false` strips the git stamp (a checkout's revision /
+# dirty flag would otherwise change the bytes: measured 2026-11-11,
+# same source built inside a git repo gave a different SHA256), and
+# NO wall-clock build date is injected (a date alone changes the
+# binary bytes, so any digest pin would go stale on the next build;
+# measured 2026-11-11: two builds differing only in buildDate gave
+# different SHA256). `built` honestly prints `unknown`; the build date
+# belongs to release metadata, not to the binary. Verify: build twice
+# from different directories and compare sha256 — they must match.
+# Without ldflags the commit also prints "unknown" (see TestVersionLine).
 #
 # Go lookup: PATH first, then the local install at ~/.local/go/bin
 # (the sandbox default PATH does not include it — see REBUILD_LOG.md
@@ -52,7 +64,6 @@ echo "== go test =="
 
 echo "== go build =="
 COMMIT="$( (find . -name '*.go' -not -name '*_test.go' | sort | xargs sha256sum; sha256sum go.mod go.sum) | sha256sum | cut -c1-12 )"
-DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-"$GO" build -ldflags "-X main.buildCommit=$COMMIT -X main.buildDate=$DATE" -o codesearch-go .
+"$GO" build -trimpath -buildvcs=false -ldflags "-X main.buildCommit=$COMMIT" -o codesearch-go .
 echo "built ./codesearch-go"
 ./codesearch-go --version

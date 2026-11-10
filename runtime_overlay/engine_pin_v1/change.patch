@@ -1,0 +1,153 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -42,10 +42,21 @@
+   the engine's ``schemaV`` and this module's ``KNOWN_SCHEMA``
+   disagree — so the mismatch is caught at push time, not at
+   runtime.
++* Digest pin (G2).  The binary itself is verified by SHA256, not
++  just its self-reported ``--version`` line: ``version_info``
++  rejects any binary whose digest is not in
++  ``PINNED_ENGINE_DIGESTS`` (rejection order: parse → schema →
++  digest, so a go10 engine still fails with the schema message).
++  The pin covers the reproducible ``build.sh`` output (same source
++  + toolchain = byte-identical, ``built=unknown``) and the v0.2.5
++  release asset.  An unpinned binary can only run with the
++  explicit opt-out ``CODESEARCH_ALLOW_UNPINNED=1``, which is
++  recorded in every envelope as ``pinned: false`` — never silent.
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import re
+@@ -68,6 +79,25 @@
+ # black-box suite and the G9/G13 battery re-run — never a bare
+ # constant change.
+ SUPPORTED_SCHEMAS = {"go9": "plw-codesearch-engine-v1"}
++# G2: digest pin. Keys are SHA256 hex digests of engine binaries PLW
++# trusts, values name what each digest is. A binary whose digest is
++# not listed here is refused by version_info unless the explicit
++# opt-out CODESEARCH_ALLOW_UNPINNED=1 is set (recorded as
++# pinned: false, never silent). The pin only works because build.sh
++# builds reproducibly (-trimpath, no wall-clock build date): the same
++# source + toolchain is byte-identical, so the digest is computable
++# locally before pushing. Adding a pin: rebuild with build.sh, take
++# the sha256, add one line here IN THE SAME COMMIT as the engine
++# change; the CI pin check fails the build otherwise. The v0.2.5
++# entry pins the published release asset (verified against its
++# published .sha256), so the old engine keeps working.
++PINNED_ENGINE_DIGESTS = {
++    "ef9a5653df2add49a4807e43476c6cf8db57d4d5187d9a7ca967b2f4821b2972":
++        "go9 d81e06b64a49 (reproducible build.sh)",
++    "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
++        "go9 8c5d6ffe8685 (v0.2.5 release asset)",
++}
++ALLOW_UNPINNED_ENV = "CODESEARCH_ALLOW_UNPINNED"
+ DEFAULT_TIMEOUT_S = 120
+ VERSION_TIMEOUT_S = 10
+ PROBE_TIMEOUT_S = 5
+@@ -139,8 +169,47 @@
+     )
+ 
+ 
++_DIGEST_CACHE: Dict[Tuple[str, int, int], Optional[str]] = {}
++
++
++def _engine_digest(binary: Path) -> Optional[str]:
++    """SHA256 hex digest of the engine binary file (G2).
++
++    Cached per process by (path, mtime_ns, size): the binary is
++    ~36 MB and version_info runs on every engine call, so hashing
++    it every time would be pure waste. Returns None when the file
++    cannot be read (e.g. executable without read permission) —
++    callers treat that as unpinned, never as pinned.
++    """
++    try:
++        st = binary.stat()
++    except OSError:
++        return None
++    key = (str(binary), st.st_mtime_ns, st.st_size)
++    if key in _DIGEST_CACHE:
++        return _DIGEST_CACHE[key]
++    try:
++        h = hashlib.sha256()
++        with open(binary, "rb") as f:
++            for chunk in iter(lambda: f.read(1 << 20), b""):
++                h.update(chunk)
++        digest = h.hexdigest()
++    except OSError:
++        digest = None
++    _DIGEST_CACHE[key] = digest
++    return digest
++
++
+ def version_info(binary: Path) -> Dict[str, Any]:
+-    """Run `codesearch --version` and parse it. Fail-closed on anything odd."""
++    """Run `codesearch --version` and parse it. Fail-closed on anything odd.
++
++    Rejection order (G2/G13): unparsable output → schema mismatch →
++    digest not pinned. The schema check comes first so a go10 engine
++    still fails with the schema message (G9 W5), and the digest check
++    is what closes G2: a binary that merely *claims* go9 — a stub
++    printing a pinned commit included — is refused unless its bytes
++    match a pinned digest or the explicit opt-out is set.
++    """
+     try:
+         proc = subprocess.run(
+             [str(binary), "--version"],
+@@ -187,7 +256,32 @@
+             f"codesearch index schema {info['schema']!r} is not the known-good "
+             f"{KNOWN_SCHEMA!r}; refusing to use this engine build{direction}"
+         )
+-    return info
++    # G2: digest pin. The --version line is self-reported — a stub can
++    # print any commit, including a pinned one — so the bytes are what
++    # is trusted. An unpinned binary runs only with the explicit
++    # opt-out, and that fact is recorded on the returned info.
++    digest = _engine_digest(binary)
++    info["digest"] = digest
++    if digest is not None and digest in PINNED_ENGINE_DIGESTS:
++        info["pinned"] = True
++        info["pin_label"] = PINNED_ENGINE_DIGESTS[digest]
++        return info
++    if os.environ.get(ALLOW_UNPINNED_ENV) == "1":
++        info["pinned"] = False
++        info["pin_warning"] = (
++            "engine binary digest is not pinned "
++            f"({(digest or 'unreadable')[:12]}...); running only because "
++            f"{ALLOW_UNPINNED_ENV}=1 is set"
++        )
++        return info
++    raise EngineError(
++        "codesearch binary digest "
++        f"{(digest or 'unreadable')[:12]}... is not pinned; refusing to use "
++        "this engine build (a stub or a build from other sources has this "
++        "digest). Rebuild the engine with codesearch-go/build.sh and add "
++        f"its digest to PINNED_ENGINE_DIGESTS, or set {ALLOW_UNPINNED_ENV}=1 "
++        "to run an unpinned engine explicitly"
++    )
+ 
+ 
+ def _cache_dir_supported(binary: Path, cache_dir: Path) -> bool:
+@@ -239,6 +333,9 @@
+         "discovered_via": discovered_via,
+         "version": info,
+         "schema": info["schema"],
++        "pinned": info.get("pinned", False),
++        "engine_digest": (info.get("digest") or "")[:12] or None,
++        "pin_label": info.get("pin_label"),
+         "tree_sitter_ready": True,
+         "tree_sitter_languages": list(TREE_SITTER_LANGUAGES),
+         "tree_sitter_library": "gotreesitter v0.55.1 (pure Go, no cgo)",
+@@ -270,6 +367,9 @@
+             "discovered_via": discovered_via,
+             "schema": status["schema"],
+             "commit": status["version"].get("commit"),
++            "pinned": status["pinned"],
++            "engine_digest": status["engine_digest"],
++            "pin_label": status["pin_label"],
+             "languages": list(TREE_SITTER_LANGUAGES),
+             "cache_dir": str(resolved_cache),
+             "cache_dir_supported": status["cache_dir_supported"],

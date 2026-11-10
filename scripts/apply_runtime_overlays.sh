@@ -129,6 +129,10 @@ grep -Fq 'def run_index_command(' core/codesearch_engine.py
 grep -Fq 'def resolve_cache_dir(' core/codesearch_engine.py
 grep -Fq 'SUPPORTED_SCHEMAS' core/codesearch_engine.py
 grep -Fq '"index"' plw_cli.py
+apply_reviewable_overlay "engine_pin_v1"
+grep -Fq 'PINNED_ENGINE_DIGESTS' core/codesearch_engine.py
+grep -Fq 'def _engine_digest(' core/codesearch_engine.py
+grep -Fq 'CODESEARCH_ALLOW_UNPINNED' core/codesearch_engine.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
 grep -Fq '"plw-version-v1"' plw_cli.py

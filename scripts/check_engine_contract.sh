@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# check_engine_contract.sh — G13: the engine's schemaV and the
-# adapter's KNOWN_SCHEMA must agree, and ENGINE_CONTRACT.md must
-# name the current schema. Run in CI (build-binary workflow, job
-# codesearch-engine-smoke) so a mismatch is caught at push time, not
-# at runtime in a user's hands. If this goes red, the fix is a schema
-# bump (engine) or a SUPPORTED_SCHEMAS update (adapter) — never a
-# change to this script.
+# check_engine_contract.sh — G13 + G2: the engine's schemaV and the
+# adapter's KNOWN_SCHEMA must agree, ENGINE_CONTRACT.md must name
+# the current schema, and the just-built engine binary's digest must
+# be in the adapter's PINNED_ENGINE_DIGESTS. Run in CI (build-binary
+# workflow, job codesearch-engine-smoke) so a mismatch is caught at
+# push time, not at runtime in a user's hands. If this goes red, the
+# fix is a schema bump (engine), a SUPPORTED_SCHEMAS update
+# (adapter), or a pin update (adapter) — never a change to this
+# script.
 #
-# NOTE: the adapter's KNOWN_SCHEMA is read from the overlay patch
-# (runtime_overlay/engine_state_v1/change.patch), NOT from
-# core/codesearch_engine.py — that file only exists after the
-# capsule is unpacked, and this job runs on the bare repo checkout
-# (a grep of core/ here fails with "No such file", CI run
-# 42868246692). The patch is the repo-resident source of truth for
-# the adapter: post-image lines are '+' (added) and ' ' (context);
-# '-' lines are the pre-image and are excluded. If a later overlay
-# moves KNOWN_SCHEMA, update ADAPTER_PATCH below — the script then
-# fails closed with "could not read KNOWN_SCHEMA".
+# NOTE: the adapter's KNOWN_SCHEMA and PINNED_ENGINE_DIGESTS are
+# read from the overlay patches (runtime_overlay/engine_state_v1/
+# and engine_pin_v1/change.patch), NOT from core/codesearch_engine.py
+# — that file only exists after the capsule is unpacked, and this
+# job runs on the bare repo checkout (a grep of core/ here fails
+# with "No such file", CI run 42868246692). The patches are the
+# repo-resident source of truth for the adapter: post-image lines
+# are '+' (added) and ' ' (context); '-' lines are the pre-image
+# and are excluded. If a later overlay moves either constant,
+# update the patch paths below — the script then fails closed with
+# "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v1/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v1/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 
@@ -44,6 +48,28 @@ if ! grep -q "Current schema: \`$ENGINE_SCHEMA\`" "$ROOT/codesearch-go/ENGINE_CO
   fail=1
 else
   echo "check_engine_contract: ENGINE_CONTRACT.md names schema $ENGINE_SCHEMA"
+fi
+
+# G2: the just-built engine binary's digest must be pinned. The
+# binary lives at artifacts/ in the smoke job (downloaded artifact)
+# or at codesearch-go/ in the build job (fresh build). If neither
+# exists (e.g. a local run without a build), the pin check is
+# skipped with a visible note — the schema checks above still run.
+BIN=""
+for candidate in "$ROOT/artifacts/codesearch-go-linux-x86_64" "$ROOT/codesearch-go/codesearch-go"; do
+  if [ -f "$candidate" ]; then BIN="$candidate"; break; fi
+done
+if [ -z "$BIN" ]; then
+  echo "check_engine_contract: pin check skipped (no engine binary found at artifacts/ or codesearch-go/)"
+else
+  BIN_DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
+  if grep -qE "^[+ ] *\"$BIN_DIGEST\":" "$PIN_PATCH" 2>/dev/null; then
+    echo "check_engine_contract: binary digest $BIN_DIGEST is pinned ($BIN)"
+  else
+    echo "check_engine_contract: PIN MISSING binary digest $BIN_DIGEST ($BIN) is not in PINNED_ENGINE_DIGESTS ($PIN_PATCH)" >&2
+    echo "  Fix: rebuild with codesearch-go/build.sh and add the digest to PINNED_ENGINE_DIGESTS in the same commit" >&2
+    fail=1
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

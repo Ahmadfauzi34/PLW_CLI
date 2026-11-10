@@ -261,3 +261,21 @@ what go9 guarantees, compatibility rule, upgrade procedure.
 `go vet` bersih, `go test` OK (+4 unit test indexcmd),
 black-box 91/91 (+3 TestIndexModes). Binary commit `d81e06b64a49`,
 schema tetap go9.
+
+## G2 reproducible build (2026-11-11, PLW G2)
+`build.sh` now builds byte-identically for the same source +
+toolchain: `-trimpath` strips the local build directory,
+`-buildvcs=false` strips the git stamp, and NO wall-clock
+`buildDate` is injected anymore (`--version` honestly prints
+`built=unknown`). Measured: two builds differing only in
+buildDate gave different SHA256 (`558fcbc6…` vs `f384feb3…`), so
+no digest pin could ever hold; and the same source built inside
+a git repo gave yet another digest (`d532c8d4…` — the checkout's
+revision/dirty flag is stamped into the binary unless
+`-buildvcs=false`). With all three, two builds from different
+directories — one inside a git repo, one outside — are identical
+(`ef9a5653df2add49a4807e43476c6cf8db57d4d5187d9a7ca967b2f4821b2972`).
+The build date belongs to release metadata, not to the binary.
+`go vet` bersih, `go test` OK (TestVersionLine unchanged — it
+tests versionLine(), not build.sh), black-box 91/91. Binary
+commit `d81e06b64a49` (same source as before), schema tetap go9.

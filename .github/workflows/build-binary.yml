@@ -357,8 +357,10 @@ jobs:
         run: |
           chmod +x release/codesearch-go-linux-x86_64
           engine_version="$(release/codesearch-go-linux-x86_64 --version)"
+          engine_digest="$(sha256sum release/codesearch-go-linux-x86_64 | cut -d' ' -f1)"
           echo "engine_version=$engine_version" >> "$GITHUB_OUTPUT"
-          echo "$engine_version"
+          echo "engine_digest=$engine_digest" >> "$GITHUB_OUTPUT"
+          echo "$engine_version $engine_digest"
 
       - name: Publish immutable version release
         if: steps.version.outputs.publish == 'true'
@@ -367,6 +369,7 @@ jobs:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           ENGINE_VERSION: ${{ steps.engine.outputs.engine_version }}
+          ENGINE_DIGEST: ${{ steps.engine.outputs.engine_digest }}
         shell: bash
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -381,7 +384,7 @@ jobs:
             release/codesearch-go-linux-x86_64.sha256 \
             --target "$GITHUB_SHA" \
             --title "PLW $RELEASE_TAG" \
-            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification. Tree-sitter engine (codesearch-go): $ENGINE_VERSION, paired with this binary and covered by the codesearch engine smoke test."
+            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification. Tree-sitter engine (codesearch-go): $ENGINE_VERSION (digest $ENGINE_DIGEST), paired with this binary and covered by the codesearch engine smoke test."
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
