@@ -237,3 +237,14 @@ ditemukan; dipulihkan dengan restore-env.sh (RESTORE_OK 11/11), lalu
 `codesearch --version` menunjukkan commit baru. Biner baru: commit
 `8c5d6ffe8685`, built `2026-10-31T19:05:43Z` (02:05 WIB 2026-11-01),
 skema tetap go9.
+
+## G8 batch (2026-11-10, PLW G8)
+`--callers a,b,c` / `--related a,b,c`: one fresh AST scan answers all names
+(`splitBatchNames`, comma-split, dedup, blank-drop). Flat envelope unchanged;
+JSON adds `"batch":true` when >1 name; related rows gain additive `"symbol"`.
+Single-name output byte-identical (callers) / identical except `symbol`
+(related). `go vet` bersih, `go test` OK (+unit TestSplitBatchNames),
+black-box 88/88 (+4 TestBatchModes). Binary commit `57178abf1063`, schema
+tetap go9. Terukur tree PLW: batch callers 7 nama 3.7 dtk vs individual
+28.7 dtk, himpunan baris identik; 20 simbol via `plw ast callers` 3.9 dtk
+vs 78.2 dtk. Backup biner lama: codesearch-go.bak-pre-g8-batch.

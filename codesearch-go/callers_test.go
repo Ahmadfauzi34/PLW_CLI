@@ -162,3 +162,31 @@ func TestExtractCallsJSReferenceNotCall(t *testing.T) {
 		t.Errorf("calls = %v, want none", callSummary(sites))
 	}
 }
+
+func TestSplitBatchNames(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"Greet", []string{"Greet"}},
+		{"Greet,main", []string{"Greet", "main"}},
+		{"Greet, main,,Run", []string{"Greet", "main", "Run"}},
+		{"Greet,Greet,main", []string{"Greet", "main"}},
+		{"", nil},
+		{",,,", nil},
+		{"  ", nil},
+	}
+	for _, c := range cases {
+		got := splitBatchNames(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("splitBatchNames(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("splitBatchNames(%q) = %v, want %v", c.in, got, c.want)
+				break
+			}
+		}
+	}
+}

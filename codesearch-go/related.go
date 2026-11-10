@@ -78,6 +78,7 @@ type relEntry struct {
 	Line   int
 	Kind   string // "def", "re-export", "ffi"
 	Detail string
+	Symbol string // the queried name this row answers (batch attribution)
 }
 
 type relEntryJSON struct {
@@ -85,10 +86,12 @@ type relEntryJSON struct {
 	Line   int    `json:"line"`
 	Kind   string `json:"kind"`
 	Detail string `json:"detail"`
+	Symbol string `json:"symbol"`
 }
 
 type relatedEnvelope struct {
 	Query   string         `json:"query"`
+	Batch   bool           `json:"batch,omitempty"`
 	Total   int            `json:"total"`
 	Related []relEntryJSON `json:"related"`
 }
@@ -689,6 +692,7 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 	var entries []relEntry
 	seen := map[string]bool{}
 	add := func(e relEntry) {
+		e.Symbol = want
 		k := fmt.Sprintf("%s:%d:%s:%s", e.Path, e.Line, e.Kind, e.Detail)
 		if !seen[k] {
 			seen[k] = true
@@ -809,7 +813,8 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 // symbol: local defs, re-export chains, and the wasm_bindgen bridge.
 // Returns a process exit code.
 func runRelated(o options, root string, cfg *ScanConfig) int {
-	if o.related == "" {
+	names := splitBatchNames(o.related)
+	if len(names) == 0 {
 		fmt.Fprintln(os.Stderr, "codesearch: --related requires a non-empty name")
 		return 2
 	}
@@ -869,12 +874,15 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 	skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
 	fmt.Fprintf(os.Stderr, "(related: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
 		parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
-	entries := resolveRelated(o.related, defs, edges, bridges, fileSet)
+	entries := []relEntry{}
+	for _, name := range names {
+		entries = append(entries, resolveRelated(name, defs, edges, bridges, fileSet)...)
+	}
 	if o.jsonOut {
-		env := relatedEnvelope{Query: o.related, Total: len(entries), Related: []relEntryJSON{}}
+		env := relatedEnvelope{Query: o.related, Batch: len(names) > 1, Total: len(entries), Related: []relEntryJSON{}}
 		for _, en := range entries {
 			env.Related = append(env.Related, relEntryJSON{
-				Path: en.Path, Line: en.Line, Kind: en.Kind, Detail: en.Detail,
+				Path: en.Path, Line: en.Line, Kind: en.Kind, Detail: en.Detail, Symbol: en.Symbol,
 			})
 		}
 		enc := json.NewEncoder(os.Stdout)

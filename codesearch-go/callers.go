@@ -302,6 +302,7 @@ func extractCalls(relPath, text string) ([]callSite, bool) {
 // JSON; the human summary goes to stderr like the BM25 envelope.
 type callersEnvelope struct {
 	Query string         `json:"query"`
+	Batch bool           `json:"batch,omitempty"`
 	Total int            `json:"total"`
 	Calls []callSiteJSON `json:"calls"`
 }
@@ -325,9 +326,33 @@ func extOf(path string) string {
 	return ""
 }
 
+// splitBatchNames splits a --callers/--related flag value on commas:
+// "a, b,,c" -> ["a" "b" "c"]. Empty segments are dropped and duplicates
+// removed, so the batch is deterministic for a given flag value. Names
+// cannot contain commas, so the split is unambiguous.
+func splitBatchNames(s string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
 func runCallers(o options, root string, cfg *ScanConfig) int {
-	want := calleeBase(o.callers)
-	if want == "" {
+	names := splitBatchNames(o.callers)
+	wants := map[string]bool{}
+	for _, name := range names {
+		if base := calleeBase(name); base != "" {
+			wants[base] = true
+		}
+	}
+	if len(wants) == 0 {
 		fmt.Fprintln(os.Stderr, "codesearch: --callers requires a non-empty name")
 		return 2
 	}
@@ -376,7 +401,7 @@ func runCallers(o options, root string, cfg *ScanConfig) int {
 		}
 		parsed++
 		for _, c := range calls {
-			if calleeBase(c.Callee) == want {
+			if wants[calleeBase(c.Callee)] {
 				sites = append(sites, c)
 			}
 		}
@@ -385,7 +410,7 @@ func runCallers(o options, root string, cfg *ScanConfig) int {
 	fmt.Fprintf(os.Stderr, "(callers: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
 		parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
 	if o.jsonOut {
-		env := callersEnvelope{Query: o.callers, Total: len(sites), Calls: []callSiteJSON{}}
+		env := callersEnvelope{Query: o.callers, Batch: len(names) > 1, Total: len(sites), Calls: []callSiteJSON{}}
 		for _, s := range sites {
 			env.Calls = append(env.Calls, callSiteJSON{
 				Path: s.Path, Line: s.Line, Caller: s.Caller, Callee: s.Callee, Text: s.Text,

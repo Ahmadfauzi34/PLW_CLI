@@ -105,6 +105,9 @@ Name-based, not type-resolved. Takes no positional query; incompatible with --de
 --all, --limit, --per-file-cap and --paths-only. The scan is always
 fresh (no BM25 index); --ext, --exclude and --no-gitignore apply, and
 --json selects {"query":...,"total":N,"calls":[...]} output.
+Comma-separated names (--callers Foo,Bar) answer all of them in one
+scan; JSON then adds "batch":true and each call row still carries its
+callee, so the batch is the union of the individual runs.
 
 --related NAME answers "where does NAME really live": local definitions,
 JS/TS re-export chains (export ... from, export * from, local export
@@ -116,7 +119,10 @@ path:line: kind: detail with kind def, re-export, or ffi. The generated
 source of truth. Same mode rules as --callers: no positional query,
 incompatible with --defs-only, --all, --limit, --per-file-cap and
 --paths-only, fresh scan, --json selects
-{"query":...,"total":N,"related":[...]} output.
+{"query":...,"total":N,"related":[...]} output. Comma-separated names
+(--related Foo,Bar) answer all of them in one scan; JSON then adds
+"batch":true and each row carries its "symbol", so the batch is the
+union of the individual runs.
 
 --exclude-term t1,t2 removes chunks containing the term(s): each
 comma-separated value is tokenized like query text (camelCase-aware); a

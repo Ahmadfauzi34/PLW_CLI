@@ -1,0 +1,514 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -280,3 +280,130 @@
+         raise EngineError(f"unknown mode: {mode}")
+     result = _run_codesearch(binary, root, argv, timeout_s)
+     return envelope(mode, root, query, engine, result)
++
++
++def _callee_base(expr: Any) -> str:
++    """Trailing identifier of a callee expression, mirroring the engine's
++    calleeBase (callers.go): cut at the first '<' or '[', replace '::'
++    with '.', return the last non-empty dot segment, or ''.
++
++    The engine's call rows carry the full callee expression
++    (``a.Run``), not the queried trailing name (``Run``), so batch
++    grouping must reduce it the same way the engine matches it —
++    grouping on the raw ``callee`` would strand qualified calls under
++    keys no query ever asked for (found by the dup-fixture smoke:
++    ``a.Run``/``b.Run`` rows never reached ``grouped["Run"]``).
++    """
++    if not isinstance(expr, str):
++        return ""
++    value = expr
++    for sep in ("<", "["):
++        idx = value.find(sep)
++        if idx >= 0:
++            value = value[:idx]
++    value = value.replace("::", ".")
++    for part in reversed(value.split(".")):
++        if part:
++            return part
++    return ""
++
++
++def run_batch_query(
++    mode: str,
++    root: Path,
++    queries: List[str],
++    binary: Path,
++    discovered_via: str,
++    timeout_s: int,
++) -> Dict[str, Any]:
++    """Many engine queries in one scan (G8).
++
++    ``defs`` uses the engine's positional-query batch (one index build,
++    envelope ``{"queries": [{query, total, hits}]}``).  ``callers`` and
++    ``related`` use the comma-joined flag value: one fresh AST scan,
++    one flat envelope carrying a ``"batch": true`` marker, each row
++    carrying its symbol (``callee`` for calls, ``symbol`` for related).
++
++    The result envelope is the ``run_query`` envelope plus two keys:
++    ``"batch_mode"`` (``"batch"`` or ``"fallback"``) and ``"grouped"``
++    (``{name: rows}`` — hits for defs, calls for callers, related rows
++    for related), so callers read per-symbol results without regrouping.
++
++    Old engines (before batch) answer a comma-joined ``--callers``
++    value as one never-matching name and return zero rows with exit 0
++    — a silent empty result.  The ``batch`` marker tells the two apart:
++    a multi-name request whose envelope lacks the marker means an old
++    engine, and this function falls back to one ``run_query`` per name
++    (correct, just slow) instead of presenting the empty batch as truth.
++    """
++    if mode not in ("defs", "callers", "related"):
++        raise EngineError(f"run_batch_query does not support mode: {mode}")
++    names = list(dict.fromkeys(q for q in queries if q))
++    if not names:
++        raise EngineError("run_batch_query requires at least one query")
++    engine = engine_status(binary, discovered_via)
++    if mode == "defs":
++        argv = ["--defs-only", *names]
++    elif mode == "callers":
++        argv = ["--callers", ",".join(names)]
++    else:
++        argv = ["--related", ",".join(names)]
++    result = _run_codesearch(binary, root, argv, timeout_s)
++    batch_mode = "batch"
++    grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in names}
++    if mode == "defs":
++        per_query = result.get("queries")
++        if isinstance(per_query, list):
++            for entry in per_query:
++                if isinstance(entry, dict) and entry.get("query") in grouped:
++                    grouped[entry["query"]] = list(entry.get("hits") or [])
++        elif len(names) == 1 and isinstance(result.get("hits"), list):
++            grouped[names[0]] = list(result["hits"])
++        else:
++            batch_mode = "fallback"
++    else:
++        if len(names) > 1 and not result.get("batch"):
++            batch_mode = "fallback"
++        else:
++            key = "calls" if mode == "callers" else "related"
++            field = "callee" if mode == "callers" else "symbol"
++            for row in result.get(key) or []:
++                if not isinstance(row, dict):
++                    continue
++                owner = row.get(field)
++                if mode == "callers":
++                    owner = _callee_base(owner)
++                if owner in grouped:
++                    grouped[owner].append(row)
++                else:
++                    grouped.setdefault(str(owner), []).append(row)
++    if batch_mode == "fallback":
++        # The engine predates batch: rebuild the batch result from one
++        # run_query per name, so the envelope keeps exactly the shape a
++        # batch engine would have returned (the equivalence W1/W2 prove
++        # for batch engines). batch_mode records that it was assembled.
++        merged: Dict[str, Any] = {"query": ",".join(names)}
++        if mode == "defs":
++            merged["queries"] = []
++            for name in names:
++                single = run_query(mode, root, name, binary, discovered_via, timeout_s)
++                hits = list(single["engine_result"].get("hits") or [])
++                grouped[name] = hits
++                merged["queries"].append(
++                    {"query": name, "total": len(hits), "hits": hits})
++        else:
++            key = "calls" if mode == "callers" else "related"
++            rows: List[Dict[str, Any]] = []
++            for name in names:
++                single = run_query(mode, root, name, binary, discovered_via, timeout_s)
++                batch_rows = list(single["engine_result"].get(key) or [])
++                grouped[name] = batch_rows
++                rows.extend(batch_rows)
++            merged[key] = rows
++            merged["total"] = len(rows)
++        result = merged
++    out = envelope(mode, root, names, engine, result)
++    out["batch_mode"] = batch_mode
++    out["grouped"] = grouped
++    out["summary"]["total"] = sum(len(rows) for rows in grouped.values())
++    return out
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -24,12 +24,16 @@
+   (or partial) layer on every failure, so topology keeps working without
+   an engine.  A per-symbol engine failure is recorded and the remaining
+   symbols are still queried.
+-* Bounded.  The engine has no enumerate-all-definitions mode, so v1 is
+-  target-grounded: candidates come from the target files' imports and
+-  usages plus definition patterns in engine-language files, capped at
+-  ``MAX_SYMBOLS_DEFAULT`` symbols (whole-repo coverage waits for the
+-  batch mode of a later step).  All candidate lists are sorted, so the
+-  layer is deterministic for a fixed target.
++* Bounded.  The engine has no enumerate-all-definitions mode, so
++  candidates come from the target files' imports and usages plus
++  definition patterns in engine-language files.  Since G8 the queries
++  run as three batch calls (defs, callers, related) — one engine scan
++  each — so the default has no symbol cap (``max_symbols=None``) and
++  the layer covers the whole repo; an explicit ``max_symbols`` still
++  caps it.  All candidate lists are sorted, so the layer is
++  deterministic for a fixed target.  On a pre-batch engine the adapter
++  falls back to one query per symbol (correct, just slow); the layer
++  reports that in ``coverage.batch_mode``.
+ * Authority.  Every node/edge carries ``authority`` (``definition`` for
+   AST-verified definitions, ``lead-name-based`` for calls/relations) and
+   ``provenance`` (engine binary, schema, commit, query).  Same-named
+@@ -49,7 +53,7 @@
+     DEFAULT_TIMEOUT_S,
+     EngineError,
+     doctor_status,
+-    run_query,
++    run_batch_query,
+ )
+ from core.shared_graph import DEFAULT_IGNORE_DIRS, parse_imports_with_nature
+ from language_semantics import normalize_path as _normalize_path
+@@ -88,8 +92,6 @@
+ 
+ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ 
+-MAX_SYMBOLS_DEFAULT = 20
+-
+ 
+ def unavailable_layer(reason: str) -> Dict[str, Any]:
+     """The explicit no-engine layer. Never raises."""
+@@ -109,6 +111,8 @@
+             "symbol_nodes": 0,
+             "symbol_edges": 0,
+             "scope": "target-grounded",
++            "symbols_total": 0,
++            "batch_mode": None,
+             "symbols_queried": [],
+             "symbols_without_definition": [],
+             "symbols_failed": [],
+@@ -213,7 +217,7 @@
+     graph: Optional[Dict[str, Any]] = None,
+     *,
+     target_files: Optional[List[str]] = None,
+-    max_symbols: int = MAX_SYMBOLS_DEFAULT,
++    max_symbols: Optional[int] = None,
+     timeout_s: int = DEFAULT_TIMEOUT_S,
+     binary: Optional[str] = None,
+ ) -> Dict[str, Any]:
+@@ -221,6 +225,7 @@
+ 
+     root is the scan root; graph is the SharedGraph dict (or None);
+     target_files, when given, restricts the layer to those files.
++    max_symbols caps the candidate list (None = whole repo, G8).
+     """
+     root_path = Path(root)
+     if not root_path.is_dir():
+@@ -241,7 +246,7 @@
+     graph: Optional[Dict[str, Any]],
+     *,
+     target_files: Optional[List[str]],
+-    max_symbols: int,
++    max_symbols: Optional[int],
+     timeout_s: int,
+     binary: Optional[str],
+ ) -> Dict[str, Any]:
+@@ -291,28 +296,39 @@
+         except OSError:
+             continue
+ 
+-    symbols = sorted(candidates)[: max(0, int(max_symbols))]
++    symbols = sorted(candidates)
++    truncated = False
++    if max_symbols is not None:
++        capped = symbols[: max(0, int(max_symbols))]
++        truncated = len(capped) < len(symbols)
++        symbols = capped
+ 
+     symbol_nodes: List[Dict[str, Any]] = []
+     symbol_edges: List[Dict[str, Any]] = []
+-    symbols_queried: List[str] = []
++    symbols_queried: List[str] = list(symbols)
+     symbols_without_definition: List[str] = []
+     symbols_failed: List[str] = []
+     languages: Set[str] = {lang for lang in engine_files.values()}
++    batch_modes: Set[str] = set()
++
++    # G8: three batch calls for the whole candidate list — one engine
++    # scan each — instead of three subprocesses per symbol.
++    defs_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
++    defs_batch_failed = False
++    try:
++        defs = run_batch_query("defs", root_path, symbols, binary_path, discovered_via, timeout_s)
++        batch_modes.add(str(defs.get("batch_mode") or "batch"))
++        defs_by_symbol = defs.get("grouped") or {}
++    except EngineError:
++        symbols_failed.extend(symbols)
++        defs_batch_failed = True
+ 
++    defs_for: Dict[str, List[Dict[str, Any]]] = {}
+     for symbol in symbols:
+-        symbols_queried.append(symbol)
+-        try:
+-            defs = run_query("defs", root_path, symbol, binary_path, discovered_via, timeout_s)
+-        except EngineError:
+-            symbols_failed.append(symbol)
++        if defs_batch_failed:
+             continue
+-        hits = (defs.get("engine_result") or {}).get("hits") or []
+-        if not hits:
+-            symbols_without_definition.append(symbol)
+-            continue
+-        defs_for_symbol: List[Dict[str, Any]] = []
+-        for hit in hits:
++        nodes: List[Dict[str, Any]] = []
++        for hit in defs_by_symbol.get(symbol) or []:
+             if not isinstance(hit, dict):
+                 continue
+             rel = _relpath(str(hit.get("path", "")), root_abs)
+@@ -332,75 +348,84 @@
+                     "query": symbol,
+                 },
+             }
+-            defs_for_symbol.append(node)
++            nodes.append(node)
+             languages.add(node["language"])
+-        if not defs_for_symbol:
++        if not nodes:
+             symbols_without_definition.append(symbol)
+             continue
+-        symbol_nodes.extend(defs_for_symbol)
++        defs_for[symbol] = nodes
++        symbol_nodes.extend(nodes)
++
++    with_defs = sorted(defs_for)
++    calls_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
++    related_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
++    if with_defs:
+         try:
+-            callers = run_query("callers", root_path, symbol, binary_path, discovered_via, timeout_s)
++            callers = run_batch_query("callers", root_path, with_defs, binary_path, discovered_via, timeout_s)
++            batch_modes.add(str(callers.get("batch_mode") or "batch"))
++            calls_by_symbol = callers.get("grouped") or {}
+         except EngineError:
+-            symbols_failed.append(symbol)
+-            callers = None
+-        if callers is not None:
+-            for call in (callers.get("engine_result") or {}).get("calls") or []:
+-                if not isinstance(call, dict):
+-                    continue
+-                rel = _relpath(str(call.get("path", "")), root_abs)
+-                if not rel:
+-                    continue
+-                symbol_edges.append({
+-                    "kind": "calls",
+-                    "caller": {
+-                        "file": rel,
+-                        "line": call.get("line"),
+-                        "symbol": call.get("caller"),
+-                    },
+-                    "callee": {
+-                        "symbol": symbol,
+-                        "candidates": [
+-                            {"file": n["file"], "line": n["line"], "kind": n["kind"]}
+-                            for n in defs_for_symbol
+-                        ],
+-                    },
+-                    "authority": "lead-name-based",
+-                    "evidence": {"text": call.get("text")},
+-                    "provenance": {
+-                        "engine": "codesearch-go",
+-                        "schema": status.get("schema"),
+-                        "commit": status.get("commit"),
+-                        "query": symbol,
+-                    },
+-                })
++            symbols_failed.extend(with_defs)
+         try:
+-            related = run_query("related", root_path, symbol, binary_path, discovered_via, timeout_s)
++            related = run_batch_query("related", root_path, with_defs, binary_path, discovered_via, timeout_s)
++            batch_modes.add(str(related.get("batch_mode") or "batch"))
++            related_by_symbol = related.get("grouped") or {}
+         except EngineError:
+-            symbols_failed.append(symbol)
+-            related = None
+-        if related is not None:
+-            for row in (related.get("engine_result") or {}).get("related") or []:
+-                if not isinstance(row, dict):
+-                    continue
+-                if row.get("kind") == "def":
+-                    continue  # already a definition node
+-                rel = _relpath(str(row.get("path", "")), root_abs)
+-                if not rel:
+-                    continue
+-                symbol_edges.append({
+-                    "kind": "related",
+-                    "relation": row.get("kind"),
++            symbols_failed.extend(with_defs)
++
++    for symbol in with_defs:
++        defs_for_symbol = defs_for[symbol]
++        for call in calls_by_symbol.get(symbol) or []:
++            if not isinstance(call, dict):
++                continue
++            rel = _relpath(str(call.get("path", "")), root_abs)
++            if not rel:
++                continue
++            symbol_edges.append({
++                "kind": "calls",
++                "caller": {
+                     "file": rel,
++                    "line": call.get("line"),
++                    "symbol": call.get("caller"),
++                },
++                "callee": {
+                     "symbol": symbol,
+-                    "authority": "lead-name-based",
+-                    "evidence": {},
+-                    "provenance": {
+-                        "engine": "codesearch-go",
+-                        "schema": status.get("schema"),
+-                        "commit": status.get("commit"),
+-                        "query": symbol,
+-                    },
+-                })
++                    "candidates": [
++                        {"file": n["file"], "line": n["line"], "kind": n["kind"]}
++                        for n in defs_for_symbol
++                    ],
++                },
++                "authority": "lead-name-based",
++                "evidence": {"text": call.get("text")},
++                "provenance": {
++                    "engine": "codesearch-go",
++                    "schema": status.get("schema"),
++                    "commit": status.get("commit"),
++                    "query": symbol,
++                },
++            })
++        for row in related_by_symbol.get(symbol) or []:
++            if not isinstance(row, dict):
++                continue
++            if row.get("kind") == "def":
++                continue  # already a definition node
++            rel = _relpath(str(row.get("path", "")), root_abs)
++            if not rel:
++                continue
++            symbol_edges.append({
++                "kind": "related",
++                "relation": row.get("kind"),
++                "file": rel,
++                "symbol": symbol,
++                "authority": "lead-name-based",
++                "evidence": {},
++                "provenance": {
++                    "engine": "codesearch-go",
++                    "schema": status.get("schema"),
++                    "commit": status.get("commit"),
++                    "query": symbol,
++                },
++            })
+ 
+     symbol_nodes.sort(key=lambda n: (n["file"], n["line"] or 0, n["symbol"]))
+     symbol_edges.sort(key=lambda e: (
+@@ -433,6 +458,16 @@
+         error = (
+             "engine queries failed for symbols: " + ", ".join(sorted(set(symbols_failed)))
+         )
++    if batch_modes == {"batch"} and not truncated:
++        scope = "whole-repo"
++    else:
++        scope = "target-grounded"
++    if "fallback" in batch_modes:
++        batch_mode = "fallback"
++    elif batch_modes:
++        batch_mode = "batch"
++    else:
++        batch_mode = "failed"
+     return {
+         "schema_version": ENGINE_LAYER_SCHEMA_VERSION,
+         "available": True,
+@@ -448,7 +483,9 @@
+             "target_files": target_file_count,
+             "symbol_nodes": len(symbol_nodes),
+             "symbol_edges": len(symbol_edges),
+-            "scope": "target-grounded",
++            "scope": scope,
++            "symbols_total": len(candidates),
++            "batch_mode": batch_mode,
+             "symbols_queried": symbols_queried,
+             "symbols_without_definition": sorted(set(symbols_without_definition)),
+             "symbols_failed": sorted(set(symbols_failed)),
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4480,6 +4480,7 @@
+             discover_codesearch,
+             doctor_envelope,
+             error_envelope,
++            run_batch_query,
+             run_query,
+             EngineError,
+         )
+@@ -4498,15 +4499,31 @@
+             if not opts.query:
+                 parser.error("plw ast defs|callers|related|search requires <query>")
+             binary, discovered_via = discover_codesearch(opts.binary)
+-            result = run_query(
+-                opts.operation, root, opts.query,
+-                binary, discovered_via, timeout_s, opts.limit,
+-            )
++            # G8: a comma-separated query answers all names in one scan.
++            names = [n.strip() for n in opts.query.split(",") if n.strip()] \
++                if opts.operation in ("defs", "callers", "related") else []
++            if len(names) > 1:
++                result = run_batch_query(
++                    opts.operation, root, names,
++                    binary, discovered_via, timeout_s,
++                )
++            else:
++                result = run_query(
++                    opts.operation, root, opts.query,
++                    binary, discovered_via, timeout_s, opts.limit,
++                )
+     except EngineError as exc:
+         result = error_envelope(opts.operation, str(root), opts.query or "", str(exc))
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+     else:
++        def _print_row(row):
++            if "snippet" in row:
++                print(f"{row.get('path')}:{row.get('start')}\t{row.get('kind')}\t{row.get('snippet')}")
++            elif "caller" in row:
++                print(f"{row.get('path')}:{row.get('line')}\tcaller={row.get('caller')}\t{row.get('text', '').strip()}")
++            else:
++                print(f"{row.get('path')}:{row.get('line')}\t{row.get('kind')}\t{row.get('detail')}")
+         print("# [PLW AST]")
+         if not result.get("ok"):
+             print("# Error: " + str(result.get("error")))
+@@ -4515,16 +4532,20 @@
+             print("# Mode: " + str(result.get("mode")))
+             print("# Engine: " + str(engine.get("binary")) + " schema=" + str(engine.get("schema")))
+             print("# Total: " + str((result.get("summary") or {}).get("total")))
+-            rows = ((result.get("engine_result") or {}).get("hits")
+-                    or (result.get("engine_result") or {}).get("calls")
+-                    or (result.get("engine_result") or {}).get("related") or [])
+-            for row in rows:
+-                if "snippet" in row:
+-                    print(f"{row.get('path')}:{row.get('start')}\t{row.get('kind')}\t{row.get('snippet')}")
+-                elif "caller" in row:
+-                    print(f"{row.get('path')}:{row.get('line')}\tcaller={row.get('caller')}\t{row.get('text', '').strip()}")
+-                else:
+-                    print(f"{row.get('path')}:{row.get('line')}\t{row.get('kind')}\t{row.get('detail')}")
++            grouped = result.get("grouped")
++            if isinstance(grouped, dict):
++                print("# Batch: " + str(result.get("batch_mode")) +
++                      " (" + str(len(grouped)) + " symbols)")
++                for name in grouped:
++                    print("# " + str(name) + ":")
++                    for row in grouped[name]:
++                        _print_row(row)
++            else:
++                rows = ((result.get("engine_result") or {}).get("hits")
++                        or (result.get("engine_result") or {}).get("calls")
++                        or (result.get("engine_result") or {}).get("related") or [])
++                for row in rows:
++                    _print_row(row)
+     return 0 if result.get("ok") else 3
+ 
+ 
