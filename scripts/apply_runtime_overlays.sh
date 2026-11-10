@@ -124,6 +124,11 @@ apply_reviewable_overlay "batch_engine_v1"
 grep -Fq 'def run_batch_query(' core/codesearch_engine.py
 grep -Fq 'batch_mode' core/topology_engine.py
 grep -Fq 'run_batch_query' plw_cli.py
+apply_reviewable_overlay "engine_state_v1"
+grep -Fq 'def run_index_command(' core/codesearch_engine.py
+grep -Fq 'def resolve_cache_dir(' core/codesearch_engine.py
+grep -Fq 'SUPPORTED_SCHEMAS' core/codesearch_engine.py
+grep -Fq '"index"' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
 grep -Fq '"plw-version-v1"' plw_cli.py

@@ -55,6 +55,7 @@ func usage() string {
                   [--no-gitignore] [--once] [--json] [--plain]
                   [--per-file-cap N] [--all] [--defs-only] [--full]
                   [--callers NAME] [--related NAME] [--version]
+                  [--cache-dir DIR] [--index-status | --index-warm | --index-clean]
                   query [query ...]
 
 --version prints the index schema and build identity and exits; it needs
@@ -123,6 +124,17 @@ incompatible with --defs-only, --all, --limit, --per-file-cap and
 (--related Foo,Bar) answer all of them in one scan; JSON then adds
 "batch":true and each row carries its "symbol", so the batch is the
 union of the individual runs.
+
+Index state (G9): the BM25 gob index lives under a cache base dir —
+--cache-dir DIR, else $CODESEARCH_CACHE_DIR, else $XDG_CACHE_HOME /
+codesearch-go, else $HOME/.cache/codesearch-go — one file per (root,
+scan config), named by a hash of both. --index-status reports it
+(cache_dir, index_path, exists, schema, files, chunks, size_bytes,
+newest, and a stale count of changed/added/removed files, probed
+read-only without touching the index). --index-warm builds or syncs
+and saves it, then reports the same shape. --index-clean deletes
+that root's index file. All three take no query and no other mode,
+and accept --json for the machine-readable shape.
 
 --exclude-term t1,t2 removes chunks containing the term(s): each
 comma-separated value is tokenized like query text (camelCase-aware); a
@@ -269,6 +281,18 @@ func parseArgs(args []string) (options, error) {
 			o.once = true
 		case "--version":
 			o.version = true
+		case "--cache-dir":
+			v, err := getVal()
+			if err != nil {
+				return o, err
+			}
+			o.cacheDir = v
+		case "--index-status":
+			o.indexStatus = true
+		case "--index-warm":
+			o.indexWarm = true
+		case "--index-clean":
+			o.indexClean = true
 		case "-h", "--help", "-help", "help":
 			o.help = true
 		default:
@@ -380,6 +404,46 @@ func run(args []string) int {
 		fmt.Println(versionLine())
 		return 0
 	}
+	// Index commands (G9) are their own modes: they take no query and
+	// must be dispatched before checkQueryAndFlags (which would reject
+	// the missing query). Exactly one may be set.
+	if o.indexStatus || o.indexWarm || o.indexClean {
+		modes := 0
+		mode := ""
+		if o.indexStatus {
+			modes++
+			mode = "index-status"
+		}
+		if o.indexWarm {
+			modes++
+			mode = "index-warm"
+		}
+		if o.indexClean {
+			modes++
+			mode = "index-clean"
+		}
+		if modes > 1 {
+			fmt.Fprintln(os.Stderr, "codesearch: --index-status, --index-warm and --index-clean are mutually exclusive")
+			return 2
+		}
+		if err := checkIndexFlags(o, mode); err != nil {
+			fmt.Fprintln(os.Stderr, "codesearch:", err)
+			return 2
+		}
+		root, cfg, err := resolveRootAndConfig(o)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "codesearch:", err)
+			return 2
+		}
+		switch mode {
+		case "index-status":
+			return runIndexStatus(o, root, cfg)
+		case "index-warm":
+			return runIndexWarm(o, root, cfg)
+		default:
+			return runIndexClean(o, root, cfg)
+		}
+	}
 	if err := checkQueryAndFlags(o); err != nil {
 		fmt.Fprintln(os.Stderr, "codesearch:", err)
 		return 2
@@ -490,7 +554,7 @@ func loadIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
 	if o.once {
 		return loadOnceIndex(root, cfg)
 	}
-	return loadCachedIndex(root, cfg)
+	return loadCachedIndex(o, root, cfg)
 }
 
 func loadOnceIndex(root string, cfg *ScanConfig) (*memIndex, error) {
@@ -501,8 +565,8 @@ func loadOnceIndex(root string, cfg *ScanConfig) (*memIndex, error) {
 	return ix, nil
 }
 
-func loadCachedIndex(root string, cfg *ScanConfig) (*memIndex, error) {
-	db := cachePath(root, cfg.key())
+func loadCachedIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
+	db := cachePath(root, cfg.key(), cacheBaseDir(o.cacheDir))
 	lock := db + ".lock"
 	var ix *memIndex
 	err := withLock(lock, func() error {

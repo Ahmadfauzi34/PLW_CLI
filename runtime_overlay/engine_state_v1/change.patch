@@ -1,0 +1,499 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -11,8 +11,11 @@
+ Contract
+ --------
+ * Read-only.  Nothing is written into the target root.  codesearch
+-  keeps its own gob index cache under ``~/.cache/codesearch-go``
+-  (outside the target), which is PLW's own rule for mutable state.
++  keeps its own gob index cache under the cache dir (G9): by default
++  PLW's own cache root (``cache_path("codebase", "codesearch")``),
++  overridable with ``--cache-dir`` or ``CODESEARCH_CACHE_DIR``.
++  The engine's standalone default (``$HOME/.cache/codesearch-go``)
++  is only used when the engine runs without PLW.
+ * Subprocess only, list argv, no shell.  stdout is parsed as JSON;
+   codesearch writes its proof lines and summaries to stderr, so
+   stdout stays machine-readable.
+@@ -30,6 +33,15 @@
+   rows are leads: PLW must still read the cited file before
+   treating a call as proven.  That is stated in every envelope as
+   ``authority_note``.
++* Version contract (G13).  The adapter accepts exactly the schemas
++  listed in ``SUPPORTED_SCHEMAS``; the engine's schema is reported
++  by ``codesearch --version``.  What each schema guarantees is
++  written in ``codesearch-go/ENGINE_CONTRACT.md``.  A mismatch is
++  reported with its direction (engine newer vs older), and the CI
++  script ``scripts/check_engine_contract.sh`` fails the build when
++  the engine's ``schemaV`` and this module's ``KNOWN_SCHEMA``
++  disagree — so the mismatch is caught at push time, not at
++  runtime.
+ """
+ 
+ from __future__ import annotations
+@@ -42,11 +54,24 @@
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+ 
++try:
++    from core.runtime_paths import cache_path
++except ImportError:  # type: ignore
++    from runtime_paths import cache_path  # type: ignore
++
+ CODESEARCH_ENGINE_VERSION = "codesearch-engine-v1"
+ SCHEMA_VERSION = "plw-codesearch-engine-v1"
+ KNOWN_SCHEMA = "go9"
++# G13: the adapter accepts exactly these schemas. The value names the
++# contract each schema implements (see ENGINE_CONTRACT.md); a schema
++# bump means a new entry here AND a new contract section, plus the
++# black-box suite and the G9/G13 battery re-run — never a bare
++# constant change.
++SUPPORTED_SCHEMAS = {"go9": "plw-codesearch-engine-v1"}
+ DEFAULT_TIMEOUT_S = 120
+ VERSION_TIMEOUT_S = 10
++PROBE_TIMEOUT_S = 5
++INDEX_TIMEOUT_S = 120
+ 
+ TREE_SITTER_LANGUAGES = ["go", "rust", "python", "javascript", "typescript", "tsx", "jsx"]
+ 
+@@ -60,12 +85,38 @@
+     r"schema=(?P<schema>\S+)\s+commit=(?P<commit>\S+)"
+     r"(?:\s+built=(?P<built>\S+))?(?:\s+go=(?P<go>\S+))?"
+ )
++_SCHEMA_NUM_RE = re.compile(r"^go(\d+)$")
+ 
+ 
+ class EngineError(Exception):
+     """Fail-closed engine failure: nothing usable was produced."""
+ 
+ 
++def default_cache_dir() -> Path:
++    """Where the engine's gob index lives under PLW's control (G9).
++
++    PLW's own cache root (``PLW_CACHE_HOME`` / ``PLW_HOME`` / XDG /
++    ``$HOME/.cache``), segment ``codebase/codesearch`` — the same root
++    the graph cache uses, so the index is state PLW owns, not a hidden
++    directory the engine chose on its own.
++    """
++    return Path(cache_path("codebase", "codesearch"))
++
++
++def resolve_cache_dir(explicit: Optional[str] = None) -> Path:
++    """Cache-dir precedence (G9): explicit flag > CODESEARCH_CACHE_DIR
++    env > PLW default. The resolved dir is passed to the engine with
++    ``--cache-dir`` on every invocation, so the engine never falls
++    back to its standalone default while running under PLW.
++    """
++    if explicit:
++        return Path(explicit).expanduser().resolve()
++    env = os.environ.get("CODESEARCH_CACHE_DIR")
++    if env:
++        return Path(env).expanduser().resolve()
++    return default_cache_dir()
++
++
+ def discover_codesearch(explicit: Optional[str] = None) -> Tuple[Path, str]:
+     """Find the codesearch binary. Returns (path, discovered_via)."""
+     if explicit:
+@@ -113,16 +164,74 @@
+             f"codesearch --version output unparsable: {proc.stdout.strip()[:300]!r}"
+         )
+     info: Dict[str, Any] = {"raw": proc.stdout.strip(), **match.groupdict()}
+-    if info["schema"] != KNOWN_SCHEMA:
++    if info["schema"] not in SUPPORTED_SCHEMAS:
++        # G13: say which direction the mismatch goes, when the label
++        # carries a number (go<N>). A newer engine means this PLW build
++        # is behind; an older engine means the binary is stale. An
++        # unnumbered label falls back to the generic message.
++        direction = ""
++        got = _SCHEMA_NUM_RE.match(str(info["schema"]))
++        known = _SCHEMA_NUM_RE.match(KNOWN_SCHEMA)
++        if got and known:
++            if int(got.group(1)) > int(known.group(1)):
++                direction = (
++                    f" (engine is newer than this PLW build: {info['schema']!r} > "
++                    f"{KNOWN_SCHEMA!r}; upgrade PLW or pin the engine)"
++                )
++            else:
++                direction = (
++                    f" (engine is older than this PLW build: {info['schema']!r} < "
++                    f"{KNOWN_SCHEMA!r}; rebuild the engine)"
++                )
+         raise EngineError(
+             f"codesearch index schema {info['schema']!r} is not the known-good "
+-            f"{KNOWN_SCHEMA!r}; refusing to use this engine build"
++            f"{KNOWN_SCHEMA!r}; refusing to use this engine build{direction}"
+         )
+     return info
+ 
+ 
+-def engine_status(binary: Path, discovered_via: str) -> Dict[str, Any]:
+-    """Provenance block carried by every envelope."""
++def _cache_dir_supported(binary: Path, cache_dir: Path) -> bool:
++    """Probe whether the engine accepts --cache-dir (G9).
++
++    Runs ``--version`` with the flag: new engines answer 0, engines
++    that predate the flag exit non-zero. Never raises: any failure —
++    non-zero exit, timeout, or spawn error — means 'not supported',
++    and the engine is used without the flag (its pre-G9 behaviour).
++    The query itself still fail-closes if the engine is genuinely
++    broken. Raising here would break minimal engines that only answer
++    a bare ``--version`` (the G6 V6 stub: ``$1`` is ``--cache-dir``,
++    not ``--version``) and timeout stubs (G6 V7: the probe would burn
++    the full version timeout before the query ever runs).
++    """
++    try:
++        proc = subprocess.run(
++            [str(binary), "--cache-dir", str(cache_dir), "--version"],
++            check=False,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            timeout=PROBE_TIMEOUT_S,
++            shell=False,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return False
++    return proc.returncode == 0
++
++
++def engine_status(
++    binary: Path,
++    discovered_via: str,
++    cache_dir: Optional[str] = None,
++) -> Dict[str, Any]:
++    """Provenance block carried by every envelope.
++
++    Also resolves the cache dir (G9) and probes whether the engine
++    accepts --cache-dir. Old engines (before G9) do not: they keep
++    answering queries with their standalone default location, exactly
++    as before G9 — the index commands are the only thing that
++    requires the new engine.
++    """
++    resolved_cache = resolve_cache_dir(cache_dir)
+     info = version_info(binary)
+     return {
+         "name": "codesearch-go",
+@@ -133,15 +242,28 @@
+         "tree_sitter_ready": True,
+         "tree_sitter_languages": list(TREE_SITTER_LANGUAGES),
+         "tree_sitter_library": "gotreesitter v0.55.1 (pure Go, no cgo)",
++        "cache_dir": str(resolved_cache),
++        "cache_dir_supported": _cache_dir_supported(binary, resolved_cache),
+     }
+ 
+ 
+-def doctor_status(explicit: Optional[str] = None) -> Dict[str, Any]:
+-    """Engine availability for `plw doctor`. Never raises."""
++def doctor_status(
++    explicit: Optional[str] = None,
++    root: Optional[Path] = None,
++    cache_dir: Optional[str] = None,
++) -> Dict[str, Any]:
++    """Engine availability for `plw doctor`. Never raises.
++
++    With a root, also probes the index (G9): where it lives and
++    whether it exists for that root. Without a root (portable-agent
++    doctor, topology layer) the index probe is skipped — the engine
++    is a per-root state, and doctor without a target has none.
++    """
++    resolved_cache = resolve_cache_dir(cache_dir)
+     try:
+         binary, discovered_via = discover_codesearch(explicit)
+-        status = engine_status(binary, discovered_via)
+-        return {
++        status = engine_status(binary, discovered_via, cache_dir)
++        out: Dict[str, Any] = {
+             "available": True,
+             "tree_sitter_ready": True,
+             "binary": str(binary),
+@@ -149,9 +271,14 @@
+             "schema": status["schema"],
+             "commit": status["version"].get("commit"),
+             "languages": list(TREE_SITTER_LANGUAGES),
++            "cache_dir": str(resolved_cache),
++            "cache_dir_supported": status["cache_dir_supported"],
+         }
++        if root is not None:
++            out["index"] = _probe_index(binary, root, status)
++        return out
+     except EngineError as exc:
+-        return {
++        out = {
+             "available": False,
+             "tree_sitter_ready": False,
+             "binary": None,
+@@ -159,17 +286,67 @@
+             "schema": None,
+             "commit": None,
+             "languages": list(TREE_SITTER_LANGUAGES),
++            "cache_dir": str(resolved_cache),
+             "reason": str(exc),
+         }
++        # G13: when the failure is a schema mismatch, report both
++        # sides instead of hiding the engine's schema behind None.
++        # The message already carries them; the fields make them
++        # machine-readable for doctor consumers.
++        match = re.search(r"schema '([^']+)' is not the known-good '([^']+)'", str(exc))
++        if match:
++            out["engine_schema"] = match.group(1)
++            out["known_schema"] = match.group(2)
++        return out
++
++
++def _probe_index(
++    binary: Path, root: Path, engine: Dict[str, Any],
++) -> Dict[str, Any]:
++    """Best-effort index summary for doctor (G9). Never raises: a
++    probe failure is reported as an error field, not an exception,
++    because doctor must not fail over a cache it does not own.
++    An engine that predates index management reports that plainly
++    instead of a probe error."""
++    if not engine.get("cache_dir_supported"):
++        return {"error": "engine predates index management (--index-status needs a newer codesearch-go build)"}
++    try:
++        result = _run_codesearch(
++            binary, root, ["--index-status"], INDEX_TIMEOUT_S,
++            Path(str(engine["cache_dir"])), True,
++        )
++        return {
++            "exists": bool(result.get("exists")),
++            "schema": result.get("schema"),
++            "files": result.get("files"),
++            "chunks": result.get("chunks"),
++            "size_bytes": result.get("size_bytes"),
++            "stale": result.get("stale"),
++            "index_path": result.get("index_path"),
++        }
++    except EngineError as exc:
++        return {"error": str(exc)}
+ 
+ 
+ def _run_codesearch(
+-    binary: Path, root: Path, argv: List[str], timeout_s: int
++    binary: Path, root: Path, argv: List[str], timeout_s: int,
++    cache_dir: Optional[Path] = None,
++    cache_dir_supported: bool = True,
+ ) -> Dict[str, Any]:
+-    """Run one codesearch invocation, parse stdout JSON, fail-closed."""
++    """Run one codesearch invocation, parse stdout JSON, fail-closed.
++
++    The cache dir is passed explicitly with ``--cache-dir`` (G9) when
++    the engine supports it, so the engine never falls back to its
++    standalone default while running under PLW. Old engines get the
++    flag omitted — they keep their pre-G9 behaviour for queries; the
++    index commands check support before calling and refuse plainly.
++    """
+     if not root.is_dir():
+         raise EngineError(f"root is not a directory: {root}")
+-    cmd = [str(binary), "--root", str(root), *argv, "--json"]
++    cmd = [str(binary), "--root", str(root)]
++    if cache_dir_supported and cache_dir is not None:
++        cmd += ["--cache-dir", str(cache_dir)]
++    cmd += [*argv, "--json"]
+     try:
+         proc = subprocess.run(
+             cmd,
+@@ -236,9 +413,9 @@
+     }
+ 
+ 
+-def doctor_envelope(root: Path, explicit: Optional[str] = None) -> Dict[str, Any]:
++def doctor_envelope(root: Path, explicit: Optional[str] = None, cache_dir: Optional[str] = None) -> Dict[str, Any]:
+     """Availability envelope for `plw ast doctor`. Never raises."""
+-    status = doctor_status(explicit)
++    status = doctor_status(explicit, root=root, cache_dir=cache_dir)
+     result: Dict[str, Any] = {
+         "ok": bool(status.get("available")),
+         "schema_version": SCHEMA_VERSION,
+@@ -263,9 +440,10 @@
+     discovered_via: str,
+     timeout_s: int,
+     limit: Optional[int] = None,
++    cache_dir: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """One engine query end to end: engine check, then the structural call."""
+-    engine = engine_status(binary, discovered_via)
++    engine = engine_status(binary, discovered_via, cache_dir)
+     if mode == "defs":
+         argv = ["--defs-only", query]
+     elif mode == "callers":
+@@ -278,10 +456,48 @@
+             argv = ["--limit", str(limit), query]
+     else:
+         raise EngineError(f"unknown mode: {mode}")
+-    result = _run_codesearch(binary, root, argv, timeout_s)
++    result = _run_codesearch(
++        binary, root, argv, timeout_s,
++        Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),
++    )
+     return envelope(mode, root, query, engine, result)
+ 
+ 
++def run_index_command(
++    operation: str,
++    root: Path,
++    binary: Path,
++    discovered_via: str,
++    timeout_s: int,
++    cache_dir: Optional[str] = None,
++) -> Dict[str, Any]:
++    """One index command end to end (G9): status, warm, or clean.
++
++    The engine check runs first; an engine that predates index
++    management is refused here with a plain message (fail-closed),
++    instead of letting the unknown flag surface as a generic exit-2
++    error. The envelope is the ``run_query`` envelope with
++    ``mode: "index"`` and an ``"operation"`` key, so callers read the
++    status JSON from ``engine_result`` exactly as they read query
++    results.
++    """
++    if operation not in ("status", "warm", "clean"):
++        raise EngineError(f"unknown index operation: {operation}")
++    engine = engine_status(binary, discovered_via, cache_dir)
++    if not engine["cache_dir_supported"]:
++        raise EngineError(
++            "codesearch engine predates index management "
++            f"(--index-{operation} needs a newer codesearch-go build)"
++        )
++    result = _run_codesearch(
++        binary, root, [f"--index-{operation}"], timeout_s,
++        Path(str(engine["cache_dir"])), True,
++    )
++    out = envelope("index", root, operation, engine, result)
++    out["operation"] = operation
++    return out
++
++
+ def _callee_base(expr: Any) -> str:
+     """Trailing identifier of a callee expression, mirroring the engine's
+     calleeBase (callers.go): cut at the first '<' or '[', replace '::'
+@@ -315,6 +531,7 @@
+     binary: Path,
+     discovered_via: str,
+     timeout_s: int,
++    cache_dir: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """Many engine queries in one scan (G8).
+ 
+@@ -341,14 +558,17 @@
+     names = list(dict.fromkeys(q for q in queries if q))
+     if not names:
+         raise EngineError("run_batch_query requires at least one query")
+-    engine = engine_status(binary, discovered_via)
++    engine = engine_status(binary, discovered_via, cache_dir)
+     if mode == "defs":
+         argv = ["--defs-only", *names]
+     elif mode == "callers":
+         argv = ["--callers", ",".join(names)]
+     else:
+         argv = ["--related", ",".join(names)]
+-    result = _run_codesearch(binary, root, argv, timeout_s)
++    result = _run_codesearch(
++        binary, root, argv, timeout_s,
++        Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),
++    )
+     batch_mode = "batch"
+     grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in names}
+     if mode == "defs":
+@@ -386,7 +606,7 @@
+         if mode == "defs":
+             merged["queries"] = []
+             for name in names:
+-                single = run_query(mode, root, name, binary, discovered_via, timeout_s)
++                single = run_query(mode, root, name, binary, discovered_via, timeout_s, None, cache_dir)
+                 hits = list(single["engine_result"].get("hits") or [])
+                 grouped[name] = hits
+                 merged["queries"].append(
+@@ -395,7 +615,7 @@
+             key = "calls" if mode == "callers" else "related"
+             rows: List[Dict[str, Any]] = []
+             for name in names:
+-                single = run_query(mode, root, name, binary, discovered_via, timeout_s)
++                single = run_query(mode, root, name, binary, discovered_via, timeout_s, None, cache_dir)
+                 batch_rows = list(single["engine_result"].get(key) or [])
+                 grouped[name] = batch_rows
+                 rows.extend(batch_rows)
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4461,14 +4461,18 @@
+     or PATH) supplied by the agent harness; a missing or incompatible
+     engine fails closed with exit 3 and an error envelope.  Callers are
+     name-based leads, not type-resolved proof: read the cited file
+-    before claiming a call.
++    before claiming a call.  `plw ast index <root> status|warm|clean`
++    reports, builds, or deletes the engine's gob index for that root
++    (G9); the index lives under PLW's cache root unless --cache-dir
++    or CODESEARCH_CACHE_DIR says otherwise.
+     """
+     import argparse
+     parser = argparse.ArgumentParser(prog="plw ast")
+-    parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor"))
++    parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor", "index"))
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("query", nargs="?")
+     parser.add_argument("--binary", default=None)
++    parser.add_argument("--cache-dir", default=None)
+     parser.add_argument("--timeout", type=int, default=120)
+     parser.add_argument("--limit", type=int, default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+@@ -4481,6 +4485,7 @@
+             doctor_envelope,
+             error_envelope,
+             run_batch_query,
++            run_index_command,
+             run_query,
+             EngineError,
+         )
+@@ -4494,7 +4499,15 @@
+     timeout_s = opts.timeout if opts.timeout is not None else DEFAULT_TIMEOUT_S
+     try:
+         if opts.operation == "doctor":
+-            result = doctor_envelope(root, opts.binary)
++            result = doctor_envelope(root, opts.binary, opts.cache_dir)
++        elif opts.operation == "index":
++            if (opts.query or "") not in ("status", "warm", "clean"):
++                parser.error("plw ast index requires status|warm|clean")
++            binary, discovered_via = discover_codesearch(opts.binary)
++            result = run_index_command(
++                opts.query, root, binary, discovered_via,
++                timeout_s, opts.cache_dir,
++            )
+         else:
+             if not opts.query:
+                 parser.error("plw ast defs|callers|related|search requires <query>")
+@@ -4506,11 +4519,13 @@
+                 result = run_batch_query(
+                     opts.operation, root, names,
+                     binary, discovered_via, timeout_s,
++                    opts.cache_dir,
+                 )
+             else:
+                 result = run_query(
+                     opts.operation, root, opts.query,
+                     binary, discovered_via, timeout_s, opts.limit,
++                    opts.cache_dir,
+                 )
+     except EngineError as exc:
+         result = error_envelope(opts.operation, str(root), opts.query or "", str(exc))
+@@ -4527,6 +4542,21 @@
+         print("# [PLW AST]")
+         if not result.get("ok"):
+             print("# Error: " + str(result.get("error")))
++        elif result.get("mode") == "index":
++            engine = result.get("engine") or {}
++            status = result.get("engine_result") or {}
++            print("# Operation: " + str(result.get("operation")))
++            print("# Engine: " + str(engine.get("binary")) + " schema=" + str(engine.get("schema")))
++            print("# Cache dir: " + str(status.get("cache_dir")))
++            print("# Index: " + str(status.get("index_path")))
++            print("# Exists: " + str(status.get("exists")) + " schema=" + str(status.get("schema")))
++            print("# Files: " + str(status.get("files")) + " chunks=" + str(status.get("chunks")) +
++                  " size_bytes=" + str(status.get("size_bytes")))
++            stale = status.get("stale") or {}
++            print("# Stale: changed=" + str(stale.get("changed")) + " added=" + str(stale.get("added")) +
++                  " removed=" + str(stale.get("removed")))
++            if status.get("removed") is not None:
++                print("# Removed: " + str(status.get("removed")))
+         else:
+             engine = result.get("engine") or {}
+             print("# Mode: " + str(result.get("mode")))

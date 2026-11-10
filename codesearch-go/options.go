@@ -31,4 +31,12 @@ type options struct {
 	queries       []string
 	help          bool
 	version       bool
+	// G9: index state control. cacheDir is the explicit --cache-dir
+	// value ("": resolve via cacheBaseDir). The three index modes are
+	// their own commands: status (read-only probe), warm (build/save),
+	// clean (delete this root's index file).
+	cacheDir    string
+	indexStatus bool
+	indexWarm   bool
+	indexClean  bool
 }

@@ -248,3 +248,16 @@ black-box 88/88 (+4 TestBatchModes). Binary commit `57178abf1063`, schema
 tetap go9. Terukur tree PLW: batch callers 7 nama 3.7 dtk vs individual
 28.7 dtk, himpunan baris identik; 20 simbol via `plw ast callers` 3.9 dtk
 vs 78.2 dtk. Backup biner lama: codesearch-go.bak-pre-g8-batch.
+
+## G9 index state + G13 contract (2026-11-10, PLW G9/G13)
+`--cache-dir` flag + `CODESEARCH_CACHE_DIR` / `XDG_CACHE_HOME` env
+(`cacheBaseDir`: flag > env > XDG > $HOME/.cache; default unchanged).
+`--index-status` (read-only freshness probe: changed/added/removed
+vs the manifest), `--index-warm` (build/sync + save), `--index-clean`
+(delete this root's index file) — JSON shape
+`{cache_dir, index_path, exists, schema, root, files, chunks,
+size_bytes, newest, stale, removed?}`. `ENGINE_CONTRACT.md` written:
+what go9 guarantees, compatibility rule, upgrade procedure.
+`go vet` bersih, `go test` OK (+4 unit test indexcmd),
+black-box 91/91 (+3 TestIndexModes). Binary commit `d81e06b64a49`,
+schema tetap go9.

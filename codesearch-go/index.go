@@ -167,10 +167,28 @@ func (ix *memIndex) avgPath() float64 {
 
 // --- persistence -------------------------------------------------------------
 
-func cachePath(root, cfgKey string) string {
+// cacheBaseDir resolves where gob indexes live. Precedence (G9):
+// explicit --cache-dir > CODESEARCH_CACHE_DIR env > XDG_CACHE_HOME env
+// (as $XDG_CACHE_HOME/codesearch-go) > $HOME/.cache/codesearch-go.
+// The default (all empty) is unchanged, so standalone use keeps its
+// existing indexes; PLW passes its own cache root explicitly.
+func cacheBaseDir(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if v := os.Getenv("CODESEARCH_CACHE_DIR"); v != "" {
+		return v
+	}
+	if v := os.Getenv("XDG_CACHE_HOME"); v != "" {
+		return filepath.Join(v, "codesearch-go")
+	}
+	return filepath.Join(homeDir(), ".cache", "codesearch-go")
+}
+
+func cachePath(root, cfgKey, base string) string {
 	abs, _ := filepath.Abs(root)
 	h := sha1.Sum([]byte(abs + "\x00" + cfgKey))
-	dir := filepath.Join(homeDir(), ".cache", "codesearch-go")
+	dir := base
 	_ = os.MkdirAll(dir, 0755)
 	return filepath.Join(dir, hex.EncodeToString(h[:])[:16]+".gob")
 }
