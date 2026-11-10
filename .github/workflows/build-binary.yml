@@ -288,6 +288,11 @@ jobs:
         run: |
           CODESEARCH_BIN="$PWD/artifacts/codesearch-go-linux-x86_64" bash scripts/smoke_orient_context.sh artifacts/plw-linux-x86_64
 
+      - name: Run topology engine smoke (paired binaries)
+        shell: bash
+        run: |
+          CODESEARCH_BIN="$PWD/artifacts/codesearch-go-linux-x86_64" bash scripts/smoke_topology_engine.sh artifacts/plw-linux-x86_64
+
   release-version:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [linux-x86_64, browser-x86_64, older-glibc-compat, real-target-agent, codesearch-go-x86_64, codesearch-engine-smoke]
