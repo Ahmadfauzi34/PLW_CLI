@@ -79,6 +79,19 @@ Required gates include:
 - ELF bootloader GLIBC symbol ceiling at 2.17, plus actual execution of the
   same artifact on GLIBC 2.17 (CentOS 7) and GLIBC 2.31 (Ubuntu 20.04).
 
+A release also ships the paired codesearch-go tree-sitter engine binary
+(`codesearch-go-linux-x86_64` + `.sha256`). Its gates are:
+
+- the engine artifact is built from the same commit by its own CI job
+  (gofmt, vet, and black-box test gates inside `codesearch-go/build.sh`);
+- both artifacts' SHA-256 values are verified before the engine smoke job;
+- the paired-binary engine smoke passes (defs/callers/related/search,
+  orient dynamic context, topology layer, batch, index state, and the
+  schema + digest-pin contract check);
+- the release notes record the engine version and digest, and the engine
+  binary is accepted at runtime only when its SHA-256 matches a pinned
+  digest (`PINNED_ENGINE_DIGESTS` in the adapter).
+
 The CI build runs PyInstaller with shared CPython 3.13 in a `manylinux2014`
 container. The host runner only executes tests and uploads artifacts. The
 ELF symbol check covers the one-file bootloader; actual older-GLIBC execution

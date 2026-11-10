@@ -10,13 +10,17 @@ Download the latest release assets:
 
 - `plw-linux-x86_64`
 - `plw-linux-x86_64.sha256`
+- `codesearch-go-linux-x86_64` (paired tree-sitter engine binary)
+- `codesearch-go-linux-x86_64.sha256`
 
 Verify and install:
 
 ```bash
 sha256sum --check plw-linux-x86_64.sha256
-chmod +x plw-linux-x86_64
+sha256sum --check codesearch-go-linux-x86_64.sha256
+chmod +x plw-linux-x86_64 codesearch-go-linux-x86_64
 sudo install plw-linux-x86_64 /usr/local/bin/plw
+sudo install codesearch-go-linux-x86_64 /usr/local/bin/codesearch
 ```
 
 Check the embedded version and the portable interface:
@@ -96,6 +100,51 @@ Geometry ≠ Behavior
 Runtime reproduction ≠ Root-cause proof
 Fix verified in one scenario ≠ global regression proof
 ```
+
+## Codesearch engine (tree-sitter)
+
+PLW analysis of Go, Rust, Python, JavaScript, and TypeScript uses an
+external tree-sitter engine binary, `codesearch-go`. It is **paired
+with the PLW binary, never bundled inside it**: the agent harness
+supplies it, and PLW discovers it via an explicit path,
+`CODESEARCH_BIN`, or `PATH`.
+
+```bash
+plw ast defs /path/to/project Greet --json
+plw ast callers /path/to/project Greet --json
+plw ast related /path/to/project Greet --json
+plw ast search /path/to/project "Greet" --json
+plw ast index /path/to/project status --json
+plw ast doctor /path/to/project --json
+plw doctor /path/to/project --json
+```
+
+What the engine adds:
+
+- **Definitions, callers, relations, search** — AST-verified
+  definitions plus name-based call/relation rows across Go, Rust,
+  Python, JS, TS, TSX, and JSX (`plw ast`).
+- **Topology symbol layer** — `plw topology` gains AST-verified
+  definition nodes and name-based lead edges, kept apart from the
+  import graph; without the engine the output is identical plus an
+  explicit unavailable block.
+- **Batch queries** — comma-separated `--callers`/`--related` names
+  and multi-query `--defs-only` in one scan.
+- **Index under PLW control** — the engine's search index lives under
+  PLW's cache root (`plw ast index status|warm|clean`); `plw doctor`
+  reports where it lives.
+- **Digest pin** — the engine binary is accepted only when its SHA-256
+  matches a pinned digest (reproducible `codesearch-go/build.sh`
+  output, plus the v0.2.5 release asset). Anything else is refused
+  unless `CODESEARCH_ALLOW_UNPINNED=1` is set explicitly, which is
+  recorded as `pinned: false`.
+
+Engine rows are leads, not proof: `--callers`/`--related` match on
+the trailing identifier, not on types. Read the cited file before
+treating a call or relation as proven. See
+[docs/CODESEARCH_ENGINE.md](docs/CODESEARCH_ENGINE.md) and the
+machine-checked contract in
+[codesearch-go/ENGINE_CONTRACT.md](codesearch-go/ENGINE_CONTRACT.md).
 
 ## TypeScript / JavaScript simplification
 
@@ -185,7 +234,11 @@ A release binary must pass from the **built executable**, not only from Python s
 11. required Chromium/CDP proof from a separate job;
 12. pinned Vite target-first agent flow consuming the same binary artifact;
 13. target-repository pollution checks;
-14. SHA-256 verification before release publication.
+14. SHA-256 verification before release publication;
+15. paired codesearch engine smoke (defs/callers/related/search,
+    orient dynamic context, topology layer, batch, index state, and
+    the schema + digest-pin contract check) from the exact release
+    artifacts.
 
 Pull requests produce temporary Actions artifacts. On `main`, a final semantic version in `VERSION` publishes exactly one validated GitHub Release from the same CI run; `*-dev` versions do not publish. Tag-triggered release remains available as a fallback.
 

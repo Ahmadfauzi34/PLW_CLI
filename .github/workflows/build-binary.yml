@@ -128,6 +128,26 @@ jobs:
             artifacts/plw-linux-x86_64.sha256
           if-no-files-found: error
 
+  adapter-unit-tests:
+    # G4: adapter unit tests run on the unpacked tree (the adapter only
+    # exists after overlay application), the same pattern as the
+    # check_*.py contract steps above. No binary build, no artifacts.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unpack verified runtime source
+        run: bash scripts/unpack_runtime_source.sh
+
+      - name: Run codesearch adapter unit tests
+        run: python3 -m unittest discover -s tests -v
+
   codesearch-go-x86_64:
     runs-on: ubuntu-24.04
     steps:

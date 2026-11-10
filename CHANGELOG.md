@@ -6,6 +6,21 @@ This file records user-facing changes in published PLW releases. Development wor
 
 ### Added
 
+- Codesearch tree-sitter engine (`codesearch-go`, paired binary, never
+  bundled): `plw ast defs|callers|related|search` across Go, Rust,
+  Python, JavaScript, and TypeScript, with a fail-closed schema gate
+  and SHA-256 digest pin (see `docs/CODESEARCH_ENGINE.md`).
+- Engine symbol layer for `plw topology` and `plw impact`: AST-verified
+  definition nodes plus name-based lead call/relation edges, kept apart
+  from the import graph, with an explicit unavailable block when the
+  engine is absent.
+- Batch engine queries: comma-separated `--callers`/`--related` names
+  and multi-query `--defs-only` in one scan, with per-symbol fallback
+  on pre-batch engines.
+- Engine index under PLW control: `plw ast index status|warm|clean`
+  and index reporting in `plw doctor`.
+- `plw agent orient` dynamic context: the engine-backed context matrix
+  (context A/B from target languages plus engine availability).
 - `plw ui static` now supplies digest-bound component/global CSS rule candidates,
   media contexts and missing-stylesheet status for Angular controls, without
   claiming an effective cascade or computed geometry.
