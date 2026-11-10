@@ -276,6 +276,14 @@ revision/dirty flag is stamped into the binary unless
 directories — one inside a git repo, one outside — are identical
 (`ef9a5653df2add49a4807e43476c6cf8db57d4d5187d9a7ca967b2f4821b2972`).
 The build date belongs to release metadata, not to the binary.
+**Fix 2026-11-11 (same day, after CI went red):** `build.sh` now
+also exports `CGO_ENABLED=0`. The CI job builds with CGO_ENABLED=0;
+a local build with the default CGO_ENABLED=1 gives the same size
+but different bytes — the CI binary's digest was `23719bda…` vs the
+local pin `ef9a5653…`, same source, same size — and the first G2 push
+went red in `codesearch-engine-smoke` on the pin for exactly that.
+A local CGO_ENABLED=0 build is byte-identical to the CI artifact
+(verified by downloading it). The pin is now `23719bda…`.
 `go vet` bersih, `go test` OK (TestVersionLine unchanged — it
 tests versionLine(), not build.sh), black-box 91/91. Binary
 commit `d81e06b64a49` (same source as before), schema tetap go9.

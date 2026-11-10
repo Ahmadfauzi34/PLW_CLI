@@ -19,13 +19,18 @@
 # source + toolchain — `-trimpath` strips the local build directory,
 # `-buildvcs=false` strips the git stamp (a checkout's revision /
 # dirty flag would otherwise change the bytes: measured 2026-11-11,
-# same source built inside a git repo gave a different SHA256), and
-# NO wall-clock build date is injected (a date alone changes the
-# binary bytes, so any digest pin would go stale on the next build;
-# measured 2026-11-11: two builds differing only in buildDate gave
-# different SHA256). `built` honestly prints `unknown`; the build date
-# belongs to release metadata, not to the binary. Verify: build twice
-# from different directories and compare sha256 — they must match.
+# same source built inside a git repo gave a different SHA256),
+# `CGO_ENABLED=0` (the CI job builds with CGO_ENABLED=0; a local
+# build with the default CGO_ENABLED=1 gives the same size but
+# different bytes — measured 2026-11-11: the CI binary's digest
+# 23719bda… vs the local pin ef9a5653…, same source, same size — and
+# CI went red on the pin because of it), and NO wall-clock build date
+# is injected (a date alone changes the binary bytes, so any digest
+# pin would go stale on the next build; measured 2026-11-11: two
+# builds differing only in buildDate gave different SHA256).
+# `built` honestly prints `unknown`; the build date belongs to
+# release metadata, not to the binary. Verify: build twice from
+# different directories and compare sha256 — they must match.
 # Without ldflags the commit also prints "unknown" (see TestVersionLine).
 #
 # Go lookup: PATH first, then the local install at ~/.local/go/bin
@@ -34,6 +39,7 @@
 # per user rule 2026-10-27, codesearch-android-arm64 is not a debt item
 # and is only rebuilt when the user explicitly requests Android work.
 set -euo pipefail
+export CGO_ENABLED=0
 cd "$(dirname "$0")"
 
 if command -v go >/dev/null 2>&1; then

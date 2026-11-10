@@ -39,7 +39,7 @@
 +# entry pins the published release asset (verified against its
 +# published .sha256), so the old engine keeps working.
 +PINNED_ENGINE_DIGESTS = {
-+    "ef9a5653df2add49a4807e43476c6cf8db57d4d5187d9a7ca967b2f4821b2972":
++    "23719bda3489ff856aeb4d4e2d9f1abb7e424bdf6f4e831c13a438ce73ac1b45":
 +        "go9 d81e06b64a49 (reproducible build.sh)",
 +    "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
 +        "go9 8c5d6ffe8685 (v0.2.5 release asset)",
