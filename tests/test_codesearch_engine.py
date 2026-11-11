@@ -70,9 +70,14 @@ STUB_SOURCE = textwrap.dedent(
         print("stub refuses the query", file=sys.stderr)
         sys.exit(int(env["STUB_QUERY_EXIT"]))
 
-    def hit(name):
-        return {"path": "a.go", "start": 1, "end": 3, "score": 1.0,
+    def hit(name, start=1):
+        return {"path": "a.go", "start": start, "end": start + 2, "score": 1.0,
                 "snippet": f"func {name}() {{}}"}
+
+    # STUB_ROWS=N repeats each row list N times (distinct line/start),
+    # so limit slicing has something to cut. Default 1: every
+    # pre-F3 test sees exactly one row per name, as before.
+    rows_n = int(env.get("STUB_ROWS", "1"))
 
     if has("--index-status"):
         print(json.dumps({"exists": True, "schema": "go9", "files": 3,
@@ -96,16 +101,18 @@ STUB_SOURCE = textwrap.dedent(
             if grab:
                 names.append(a)
         if env.get("STUB_DEFS_FLAT") == "1" and len(names) == 1:
-            print(json.dumps({"total": 1, "shown": 1, "hits": [hit(names[0])]}))
+            hits = [hit(names[0], 1 + i) for i in range(rows_n)]
+            print(json.dumps({"total": len(hits), "shown": len(hits), "hits": hits}))
         else:
             print(json.dumps({"queries": [
-                {"query": n, "total": 1, "hits": [hit(n)]} for n in names]}))
+                {"query": n, "total": rows_n,
+                 "hits": [hit(n, 1 + i) for i in range(rows_n)]} for n in names]}))
         sys.exit(0)
 
     if has("--callers"):
         names = value_after("--callers").split(",")
-        rows = [{"path": "a.go", "line": 10, "caller": "main",
-                 "callee": f"a.{n}"} for n in names if n]
+        rows = [{"path": "a.go", "line": 10 + i, "caller": "main",
+                 "callee": f"a.{n}"} for n in names if n for i in range(rows_n)]
         out = {"total": len(rows), "shown": len(rows), "calls": rows}
         if env.get("STUB_BATCH") == "1":
             out["batch"] = True
@@ -114,8 +121,8 @@ STUB_SOURCE = textwrap.dedent(
 
     if has("--related"):
         names = value_after("--related").split(",")
-        rows = [{"path": "a.go", "line": 4, "symbol": n, "kind": "def",
-                 "detail": f"defined in a.go"} for n in names if n]
+        rows = [{"path": "a.go", "line": 4 + i, "symbol": n, "kind": "def",
+                 "detail": f"defined in a.go"} for n in names if n for i in range(rows_n)]
         out = {"total": len(rows), "shown": len(rows), "related": rows}
         if env.get("STUB_BATCH") == "1":
             out["batch"] = True
@@ -380,6 +387,57 @@ class AdapterTestCase(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["engine_result"]["hits"][0]["path"], "a.go")
 
+    # -- T8b: F3 limit in the adapter ----------------------------------
+    def test_run_query_related_limit_slices_rows(self):
+        # The user's exact case shape: 20 related rows, --limit 3.
+        stub = self.stub(env={"STUB_ROWS": "20"})
+        with self.pinned(stub):
+            out = self._run("related", stub, limit=3)
+        self.assertEqual(len(out["engine_result"]["related"]), 3)
+        self.assertEqual(out["summary"]["total"], 20)
+        self.assertEqual(out["summary"]["shown"], 3)
+        # First rows kept, in engine order.
+        self.assertEqual([r["line"] for r in out["engine_result"]["related"]],
+                         [4, 5, 6])
+
+    def test_run_query_callers_limit(self):
+        stub = self.stub(env={"STUB_ROWS": "5"})
+        with self.pinned(stub):
+            out = self._run("callers", stub, limit=2)
+        self.assertEqual(len(out["engine_result"]["calls"]), 2)
+        self.assertEqual(out["summary"]["total"], 5)
+        self.assertEqual(out["summary"]["shown"], 2)
+
+    def test_run_query_defs_flat_limit(self):
+        stub = self.stub(env={"STUB_DEFS_FLAT": "1", "STUB_ROWS": "4"})
+        with self.pinned(stub):
+            out = self._run("defs", stub, limit=2)
+        self.assertEqual(len(out["engine_result"]["hits"]), 2)
+        self.assertEqual(out["summary"]["total"], 4)
+        self.assertEqual(out["summary"]["shown"], 2)
+
+    def test_run_query_no_limit_keeps_all_rows(self):
+        stub = self.stub(env={"STUB_ROWS": "5"})
+        with self.pinned(stub):
+            out = self._run("related", stub)
+        self.assertEqual(len(out["engine_result"]["related"]), 5)
+        self.assertEqual(out["summary"]["total"], 5)
+
+    def test_run_query_limit_zero(self):
+        stub = self.stub(env={"STUB_ROWS": "20"})
+        with self.pinned(stub):
+            out = self._run("related", stub, limit=0)
+        self.assertEqual(out["engine_result"]["related"], [])
+        self.assertEqual(out["summary"]["total"], 20)
+        self.assertEqual(out["summary"]["shown"], 0)
+
+    def test_run_query_negative_limit_rejected(self):
+        stub = self.stub()
+        with self.pinned(stub):
+            with self.assertRaises(ce.EngineError) as ctx:
+                self._run("related", stub, limit=-1)
+        self.assertIn("limit must be >= 0", str(ctx.exception))
+
     def test_run_query_unknown_mode(self):
         stub = self.stub()
         with self.pinned(stub):
@@ -463,6 +521,52 @@ class AdapterTestCase(unittest.TestCase):
         self.assertEqual(out["batch_mode"], "batch")
         self.assertEqual(out["grouped"]["Greet"][0]["symbol"], "Greet")
         self.assertEqual(out["grouped"]["Run"][0]["symbol"], "Run")
+
+    # -- T9b: F3 limit in batch ----------------------------------------
+    def test_batch_related_limit_slices_grouped_and_flat(self):
+        stub = self.stub(env={"STUB_BATCH": "1", "STUB_ROWS": "4"})
+        with self.pinned(stub):
+            out = ce.run_batch_query("related", self.fixture, ["Greet", "Run"],
+                                     stub, "explicit", 30, limit=3)
+        self.assertEqual(out["batch_mode"], "batch")
+        # Per-symbol lists sliced (4 -> 3 each); flat list sliced too.
+        self.assertEqual(len(out["grouped"]["Greet"]), 3)
+        self.assertEqual(len(out["grouped"]["Run"]), 3)
+        self.assertEqual(len(out["engine_result"]["related"]), 6)
+        self.assertEqual(out["summary"]["total"], 8)
+        self.assertEqual(out["summary"]["shown"], 6)
+
+    def test_batch_callers_limit_fallback_path(self):
+        # Old engine (no batch marker): fallback assembles grouped
+        # first, then the same slice applies.
+        stub = self.stub(env={"STUB_ROWS": "3"})
+        with self.pinned(stub):
+            out = ce.run_batch_query("callers", self.fixture, ["Run", "Greet"],
+                                     stub, "explicit", 30, limit=2)
+        self.assertEqual(out["batch_mode"], "fallback")
+        self.assertEqual(len(out["grouped"]["Run"]), 2)
+        self.assertEqual(len(out["grouped"]["Greet"]), 2)
+        self.assertEqual(out["summary"]["total"], 6)
+        self.assertEqual(out["summary"]["shown"], 4)
+
+    def test_batch_defs_limit(self):
+        stub = self.stub(env={"STUB_ROWS": "3"})
+        with self.pinned(stub):
+            out = ce.run_batch_query("defs", self.fixture, ["Greet", "Run"],
+                                     stub, "explicit", 30, limit=2)
+        self.assertEqual(len(out["grouped"]["Greet"]), 2)
+        self.assertEqual(len(out["grouped"]["Run"]), 2)
+        self.assertEqual(len(out["engine_result"]["queries"][0]["hits"]), 2)
+        self.assertEqual(out["summary"]["total"], 6)
+        self.assertEqual(out["summary"]["shown"], 4)
+
+    def test_batch_negative_limit_rejected(self):
+        stub = self.stub(env={"STUB_BATCH": "1"})
+        with self.pinned(stub):
+            with self.assertRaises(ce.EngineError) as ctx:
+                ce.run_batch_query("related", self.fixture, ["Greet", "Run"],
+                                   stub, "explicit", 30, limit=-2)
+        self.assertIn("limit must be >= 0", str(ctx.exception))
 
     # -- T10: index commands -------------------------------------------
     def test_index_status(self):

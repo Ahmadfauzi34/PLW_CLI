@@ -55,6 +55,20 @@ If none resolves, the engine is reported unavailable with the reason
 (`plw doctor` / `plw ast doctor`); commands that need it fail closed
 instead of guessing.
 
+## Limit
+
+`plw ast defs|callers|related|search <root> <query> --limit N`
+returns at most N rows per list. For `search` the limit is passed
+to the engine; for the structural modes the adapter slices the
+rows itself (the engine is untouched). In a batch query the limit
+applies per symbol, and the flat row list is filtered per symbol
+too, so it stays the union of the per-symbol lists.
+
+Every envelope reports both numbers: `summary.total` is the rows
+found before slicing, `summary.shown` the rows actually returned.
+A negative limit is rejected. Without `--limit`, `summary.shown`
+is null (except `search`, where the engine reports it).
+
 ## Schema contract
 
 The adapter accepts exactly the schemas listed in

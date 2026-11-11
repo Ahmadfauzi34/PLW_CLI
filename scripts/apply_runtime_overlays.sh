@@ -136,6 +136,10 @@ grep -Fq 'CODESEARCH_ALLOW_UNPINNED' core/codesearch_engine.py
 apply_reviewable_overlay "discovery_v1"
 grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
 grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py
+apply_reviewable_overlay "limit_v1"
+grep -Fq '_apply_limit' core/codesearch_engine.py
+grep -Fq '_apply_batch_limit' core/codesearch_engine.py
+grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
 grep -Fq '"plw-version-v1"' plw_cli.py

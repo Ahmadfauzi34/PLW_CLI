@@ -1,0 +1,174 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -55,6 +55,15 @@
+   release asset.  An unpinned binary can only run with the
+   explicit opt-out ``CODESEARCH_ALLOW_UNPINNED=1``, which is
+   recorded in every envelope as ``pinned: false`` — never silent.
++* Limit (F3).  ``--limit`` is enforced by the adapter, not the
++  engine — except ``search``, where it is passed through to the
++  engine's own ``--limit``.  ``run_query`` and
++  ``run_batch_query`` slice every row list (``hits``/``calls``/
++  ``related``, and every ``grouped`` list in a batch) to at most
++  ``limit`` rows; ``summary.total`` is the count before slicing
++  and ``summary.shown`` the count after, so a caller can tell a
++  truncated answer from a complete one.  A negative limit is
++  rejected (fail-closed).
+ """
+ 
+ from __future__ import annotations
+@@ -543,6 +552,76 @@
+     return result
+ 
+ 
++def _apply_limit(result: Dict[str, Any], mode: str, limit: Optional[int]) -> Tuple[Optional[int], Optional[int]]:
++    """Slice the row list of a single-query engine result in place (F3).
++
++    Returns (total, shown): total = rows before slicing, shown = rows
++    after. The engine is never asked to slice defs/callers/related:
++    PLW owns its CLI contract, and slicing here keeps the engine
++    untouched. ``search`` is the exception — its limit is passed to
++    the engine (see run_query) — so this helper leaves it alone.
++    """
++    if limit is None:
++        return None, None
++    key = {"defs": "hits", "callers": "calls", "related": "related"}.get(mode)
++    if key is None:
++        return None, None
++    rows = result.get(key)
++    if not isinstance(rows, list):
++        return None, None
++    total = len(rows)
++    result[key] = rows[:limit]
++    return total, len(result[key])
++
++
++def _apply_batch_limit(
++    result: Dict[str, Any], mode: str,
++    grouped: Dict[str, List[Dict[str, Any]]], limit: Optional[int],
++) -> Tuple[Optional[int], Optional[int]]:
++    """Slice every row list of a batch result in place (F3): the flat
++    list in the engine result and every per-symbol list in ``grouped``.
++
++    Returns (total, shown) over all grouped rows, same semantics as
++    _apply_limit. The fallback path assembles ``grouped`` first, so
++    one slice here covers both the batch and the fallback shape.
++    """
++    if limit is None:
++        return None, None
++    total = sum(len(rows) for rows in grouped.values())
++    for name in grouped:
++        grouped[name] = grouped[name][:limit]
++    if mode == "defs":
++        for entry in result.get("queries") or []:
++            if isinstance(entry, dict) and isinstance(entry.get("hits"), list):
++                entry["hits"] = entry["hits"][:limit]
++    else:
++        # The flat list is the union of the per-symbol rows, so it is
++        # filtered per symbol — not cut to ``limit`` total. A plain
++        # [:limit] here would leave the flat list (3 rows) disagreeing
++        # with grouped (3 rows per symbol), and a caller reading
++        # engine_result would see a different answer than one reading
++        # grouped. Non-dict rows are dropped, as in the grouping above.
++        key = "calls" if mode == "callers" else "related"
++        field = "callee" if mode == "callers" else "symbol"
++        rows = result.get(key)
++        if isinstance(rows, list):
++            kept: Dict[str, int] = {}
++            out_rows: List[Dict[str, Any]] = []
++            for row in rows:
++                if not isinstance(row, dict):
++                    continue
++                owner = row.get(field)
++                if mode == "callers":
++                    owner = _callee_base(owner)
++                count = kept.get(str(owner), 0)
++                if count < limit:
++                    out_rows.append(row)
++                    kept[str(owner)] = count + 1
++            result[key] = out_rows
++    shown = sum(len(rows) for rows in grouped.values())
++    return total, shown
++
++
+ def run_query(
+     mode: str,
+     root: Path,
+@@ -554,6 +633,8 @@
+     cache_dir: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """One engine query end to end: engine check, then the structural call."""
++    if limit is not None and limit < 0:
++        raise EngineError("limit must be >= 0")
+     engine = engine_status(binary, discovered_via, cache_dir)
+     if mode == "defs":
+         argv = ["--defs-only", query]
+@@ -571,7 +652,12 @@
+         binary, root, argv, timeout_s,
+         Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),
+     )
+-    return envelope(mode, root, query, engine, result)
++    total, shown = _apply_limit(result, mode, limit)
++    out = envelope(mode, root, query, engine, result)
++    if total is not None:
++        out["summary"]["total"] = total
++        out["summary"]["shown"] = shown
++    return out
+ 
+ 
+ def run_index_command(
+@@ -643,6 +729,7 @@
+     discovered_via: str,
+     timeout_s: int,
+     cache_dir: Optional[str] = None,
++    limit: Optional[int] = None,
+ ) -> Dict[str, Any]:
+     """Many engine queries in one scan (G8).
+ 
+@@ -663,7 +750,13 @@
+     a multi-name request whose envelope lacks the marker means an old
+     engine, and this function falls back to one ``run_query`` per name
+     (correct, just slow) instead of presenting the empty batch as truth.
++
++    ``limit`` (F3) slices every row list — flat and grouped — to at
++    most that many rows per list; ``summary.total`` is the count
++    before slicing and ``summary.shown`` the count after.
+     """
++    if limit is not None and limit < 0:
++        raise EngineError("limit must be >= 0")
+     if mode not in ("defs", "callers", "related"):
+         raise EngineError(f"run_batch_query does not support mode: {mode}")
+     names = list(dict.fromkeys(q for q in queries if q))
+@@ -733,8 +826,11 @@
+             merged[key] = rows
+             merged["total"] = len(rows)
+         result = merged
++    total, shown = _apply_batch_limit(result, mode, grouped, limit)
+     out = envelope(mode, root, names, engine, result)
+     out["batch_mode"] = batch_mode
+     out["grouped"] = grouped
+-    out["summary"]["total"] = sum(len(rows) for rows in grouped.values())
++    out["summary"]["total"] = total if total is not None else sum(len(rows) for rows in grouped.values())
++    if shown is not None:
++        out["summary"]["shown"] = shown
+     return out
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4519,7 +4519,7 @@
+                 result = run_batch_query(
+                     opts.operation, root, names,
+                     binary, discovered_via, timeout_s,
+-                    opts.cache_dir,
++                    opts.cache_dir, opts.limit,
+                 )
+             else:
+                 result = run_query(
+@@ -4562,6 +4562,9 @@
+             print("# Mode: " + str(result.get("mode")))
+             print("# Engine: " + str(engine.get("binary")) + " schema=" + str(engine.get("schema")))
+             print("# Total: " + str((result.get("summary") or {}).get("total")))
++            shown = (result.get("summary") or {}).get("shown")
++            if shown is not None:
++                print("# Shown: " + str(shown))
+             grouped = result.get("grouped")
+             if isinstance(grouped, dict):
+                 print("# Batch: " + str(result.get("batch_mode")) +

@@ -55,6 +55,8 @@ The `codesearch_engine_v1` readable, digest-pinned overlay adds the codesearch-g
 
 The `discovery_v1` overlay builds on it: PATH discovery tries `codesearch`, then `codesearch-go`, then `codesearch-go-linux-x86_64` in order, so a release-asset binary works without a symlink or `CODESEARCH_BIN`; the bare name stays first so existing setups keep working, and explicit paths plus `CODESEARCH_BIN` still name an exact file. Its tests are the discovery cases in `tests/test_codesearch_engine.py` (candidate order, first-match-wins, error naming all three candidates).
 
+The `limit_v1` overlay builds on it: `--limit` is enforced by the adapter, not the engine (except `search`, where it passes through to the engine's own `--limit`) — `run_query` and `run_batch_query` slice every row list (`hits`/`calls`/`related`, and every `grouped` list in a batch) to at most `limit` rows per list; the flat batch list is filtered per symbol so it stays the union of `grouped`; `summary.total` is the count before slicing and `summary.shown` the count after; a negative limit is rejected. `cmd_ast` passes `--limit` to the batch path too, and the non-JSON header prints `# Shown:` when known. Its tests are the F3 cases in `tests/test_codesearch_engine.py` (single-query related/callers/defs, batch + fallback, limit 0, negative rejection).
+
 Overlays are a transport/build mechanism only. They are never required beside the released `plw` executable and are never copied into target repositories.
 
 The long-term repository cleanup is to normalize the runtime source into ordinary browsable Git files after the binary contract is stable.
