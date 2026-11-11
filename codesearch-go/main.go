@@ -101,7 +101,8 @@ callee's trailing name matches NAME's trailing name, as
 path:line: caller: line-text (caller is "-" at top level). Structural,
 not textual: it uses the tree-sitter AST, so pkg.Foo() matches a query
 for Foo and the enclosing function is reported. Languages: Go, Rust,
-Python, JavaScript (.js/.mjs/.cjs), TypeScript (.ts/.mts/.cts/.tsx).
+Python, JavaScript (.js/.mjs/.cjs), TypeScript (.ts/.mts/.cts/.tsx),
+Kotlin (.kt).
 Name-based, not type-resolved. Takes no positional query; incompatible with --defs-only,
 --all, --limit, --per-file-cap and --paths-only. The scan is always
 fresh (no BM25 index); --ext, --exclude and --no-gitignore apply, and
@@ -112,9 +113,11 @@ callee, so the batch is the union of the individual runs.
 
 --related NAME answers "where does NAME really live": local definitions,
 JS/TS re-export chains (export ... from, export * from, local export
-{..} lists), and the Rust<->JS wasm_bindgen bridge (top-level
+{..} lists), the Rust<->JS wasm_bindgen bridge (top-level
 #[wasm_bindgen] functions; the JS name follows bindgen's default case
-conversion unless js_name overrides it). Output rows are
+conversion unless js_name overrides it), and Kotlin (.kt) local
+definitions (classes, functions, objects, type aliases) plus
+top-level properties. Output rows are
 path:line: kind: detail with kind def, re-export, or ffi. The generated
 .d.ts is not parsed (often absent); the Rust source is the bridge's
 source of truth. Same mode rules as --callers: no positional query,

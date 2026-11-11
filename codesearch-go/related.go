@@ -23,6 +23,11 @@
 //     def range; a heuristic — top-level blocks/loops may leak in).
 //     Only top-level Rust fns and methods of #[wasm_bindgen] impl
 //     blocks are bridged.
+//   - Kotlin (K4, 2026-11-12): local definitions from ktDefQuery
+//     (classes, functions, objects, type aliases) plus top-level
+//     properties (vals outside any def range). No re-export edges
+//     (Kotlin has no re-export syntax) and no JNI bridge yet
+//     (external fun <-> Java_... is a later stage).
 
 package main
 
@@ -131,7 +136,23 @@ var relVarLangs = []callLang{
 var (
 	relExportSpecStore = newSpecStore[callSpec]()
 	relVarSpecStore    = newSpecStore[callSpec]()
+	relKtVarSpecStore  = newSpecStore[callSpec]()
 )
+
+// relKtVarLangs captures every Kotlin property declaration; the
+// extractRelatedKotlin range filter keeps only those outside any def
+// range (top-level vals), mirroring relVarLangs for JS/TS. Member
+// properties sit inside their class def range and are skipped, the
+// same way JS class fields are not reported.
+var relKtVarLangs = []callLang{
+	{".kt", grammars.KotlinLanguage, `[(property_declaration (variable_declaration (simple_identifier) @name)) @decl]`},
+}
+
+func getRelKtVarSpec(ext string) (*callSpec, bool) {
+	return relKtVarSpecStore.get(ext, func() (*callSpec, bool) {
+		return compileCallSpec(lookupCallLang(relKtVarLangs, ext))
+	})
+}
 
 var relRustQuery = `[
 	(attribute_item) @attr
@@ -282,7 +303,104 @@ func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, boo
 	if ext == ".rs" {
 		return extractRelatedRust(relPath, src, li)
 	}
+	if ext == ".kt" {
+		return extractRelatedKotlin(relPath, src, li)
+	}
 	return nil, nil, nil, false
+}
+
+// extractRelatedKotlin returns Kotlin definitions (classes, functions,
+// objects, type aliases — the shared ktDefQuery) plus top-level
+// properties (vals outside every def range). Kotlin has no re-export
+// syntax, so there are no edges; the Kotlin<->Rust JNI bridge
+// (external fun <-> Java_...) is a later stage, not v1.
+func extractRelatedKotlin(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, bool) {
+	ext := extOf(relPath)
+	spec, ok := getSpec(ext)
+	if !ok {
+		return nil, nil, nil, false
+	}
+	dq := spec.query
+	parser := gotreesitter.NewParser(spec.lang)
+	tree, err := parser.Parse(src)
+	if err != nil {
+		return nil, nil, nil, false
+	}
+	var defs []relDef
+	var defRanges [][2]uint32
+	dcursor := dq.Exec(tree.RootNode(), spec.lang, src)
+	for {
+		m, ok := dcursor.NextMatch()
+		if !ok {
+			break
+		}
+		var sb, eb uint32
+		var name string
+		found := false
+		for _, c := range m.Captures {
+			if c.Name == "def" {
+				sb, eb = c.Node.StartByte(), c.Node.EndByte()
+				found = true
+			}
+			if c.Name == "name" {
+				name = string(src[c.Node.StartByte():c.Node.EndByte()])
+			}
+		}
+		if !found || name == "" {
+			continue
+		}
+		defs = append(defs, relDef{Path: relPath, Line: li.lineOf(sb), Name: name})
+		defRanges = append(defRanges, [2]uint32{sb, eb})
+	}
+	// Top-level properties: declarators outside every def range.
+	// (Member properties sit inside their class def range and are
+	// skipped, like JS class fields.)
+	if vs, ok := getRelKtVarSpec(ext); ok {
+		vcursor := vs.query.Exec(tree.RootNode(), vs.lang, src)
+		for {
+			m, ok := vcursor.NextMatch()
+			if !ok {
+				break
+			}
+			var sb uint32
+			var name string
+			found := false
+			for _, c := range m.Captures {
+				if c.Name == "decl" {
+					sb = c.Node.StartByte()
+					found = true
+				}
+				if c.Name == "name" {
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				}
+			}
+			if !found || name == "" {
+				continue
+			}
+			inside := false
+			for _, r := range defRanges {
+				if sb >= r[0] && sb < r[1] {
+					inside = true
+					break
+				}
+			}
+			if inside {
+				continue
+			}
+			defs = append(defs, relDef{Path: relPath, Line: li.lineOf(sb), Name: name})
+		}
+	}
+	seen := map[string]bool{}
+	uniq := defs[:0]
+	for _, d := range defs {
+		k := fmt.Sprintf("%s:%d:%s", d.Path, d.Line, d.Name)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		uniq = append(uniq, d)
+	}
+	return uniq, nil, nil, true
 }
 
 func extractRelatedJS(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, bool) {
@@ -931,7 +1049,7 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 			astOversize++
 			continue
 		}
-		if ext := extOf(rel); !relJSExts[ext] && ext != ".rs" {
+		if ext := extOf(rel); !relJSExts[ext] && ext != ".rs" && ext != ".kt" {
 			unsupported++
 			continue
 		}

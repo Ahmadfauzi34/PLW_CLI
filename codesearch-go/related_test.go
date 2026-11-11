@@ -190,6 +190,35 @@ func TestExtractRelatedJSTSClass(t *testing.T) {
 	}
 }
 
+func TestExtractRelatedKotlin(t *testing.T) {
+	// K1-K4 (2026-11-12): class/function/interface/enum/typealias defs
+	// plus the top-level val; member property "count" and enum entries
+	// are NOT defs.
+	text := "package a.b\n\nclass HostLauncher {\n    val count = 0\n" +
+		"    fun start(): Boolean { return true }\n}\n\n" +
+		"interface Shape { fun area(): Double }\n\n" +
+		"enum class Color { RED, GREEN }\n\n" +
+		"val appName = \"pipkin\"\n\nfun topLevel() {}\n"
+	defs, _, _, ok := extractRelated("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	names := map[string]bool{}
+	for _, d := range defs {
+		names[d.Name] = true
+	}
+	for _, want := range []string{"HostLauncher", "start", "Shape", "area", "Color", "appName", "topLevel"} {
+		if !names[want] {
+			t.Errorf("defs = %+v, want %s", defs, want)
+		}
+	}
+	for _, no := range []string{"count", "RED", "GREEN"} {
+		if names[no] {
+			t.Errorf("defs = %+v, must not contain %s", defs, no)
+		}
+	}
+}
+
 func TestResolveRelatedFFI(t *testing.T) {
 	defs := []relDef{{Path: "bind.mjs", Line: 5, Name: "getGraphParametersFlat"}}
 	bridges := []relBridge{

@@ -239,6 +239,63 @@ func TestASTChunkTSX(t *testing.T) {
 	assertFullCoverage(t, chunks, 4)
 }
 
+func TestASTChunkKotlin(t *testing.T) {
+	// K1-K4 (2026-11-12): Kotlin chunking. Lines: 1 package, 2 blank,
+	// 3 KDoc, 4-9 class HostLauncher, 5-8 fun start, 10 blank,
+	// 11-13 object HostRegistry, 14 blank, 15 typealias Handler,
+	// 16 blank, 17 fun topLevel (single-expression).
+	text := "package io.jeph.pipkin.host\n\n/** Starts the host. */\n" +
+		"class HostLauncher(private val client: RpcClient) {\n" +
+		"    fun start(): Boolean {\n" +
+		"        val ok = client.connect()\n" +
+		"        return ok\n" +
+		"    }\n" +
+		"}\n\nobject HostRegistry {\n    val count = 0\n}\n\n" +
+		"typealias Handler = (String) -> Unit\n\n" +
+		"fun topLevel(x: Int): String = x.toString()\n"
+	chunks, astOK := chunkFile("x.kt", text)
+	if !astOK {
+		t.Error("expected AST path for valid Kotlin")
+	}
+	// defs: HostLauncher(3-9, KDoc attached), start sig(5-5) + body(5-8),
+	// HostRegistry(11-13), Handler(15), topLevel(17); gaps: 1-2, 10, 14,
+	// 16, 18 (trailing).
+	wantStarts := []int{1, 3, 5, 5, 10, 11, 14, 15, 16, 17, 18}
+	if got := chunkStarts(chunks); !reflect.DeepEqual(got, wantStarts) {
+		t.Errorf("chunk starts = %v, want %v", got, wantStarts)
+	}
+	// The class body chunk carries its KDoc; start has a sig chunk.
+	var sawKDoc, sawSig bool
+	names := map[string]bool{}
+	for _, c := range chunks {
+		if c.name != "" {
+			names[c.name] = true
+		}
+		if c.startLine == 3 && c.kind == kindBody {
+			sawKDoc = len(c.lines) == 7 && strings.Contains(c.lines[0], "Starts the host")
+		}
+		if c.startLine == 5 && c.kind == kindSig {
+			sawSig = len(c.lines) == 1 && strings.Contains(c.lines[0], "fun start")
+		}
+	}
+	if !sawKDoc || !sawSig {
+		t.Errorf("Kotlin KDoc/sig chunks missing (kdoc=%v sig=%v)", sawKDoc, sawSig)
+	}
+	// Local val "ok" and member property "count" are NOT definitions
+	// (properties live in --related, not in chunk defs).
+	for _, want := range []string{"HostLauncher", "start", "HostRegistry", "Handler", "topLevel"} {
+		if !names[want] {
+			t.Errorf("def names = %v, want %s", names, want)
+		}
+	}
+	for _, no := range []string{"ok", "count"} {
+		if names[no] {
+			t.Errorf("def names = %v, must not contain %s", names, no)
+		}
+	}
+	assertFullCoverage(t, chunks, 18)
+}
+
 func TestASTChunkRustTypes(t *testing.T) {
 	text := "struct Point { x: i32, y: i32 }\n\nenum Shape { Circle, Square }\n\ntrait Drawable {\n    fn draw(&self);\n}\n\ntype Alias = Point;\n\nimpl Point {\n    fn new() -> Self { Point { x: 0, y: 0 } }\n}\n"
 	chunks, astOK := chunkFile("x.rs", text)

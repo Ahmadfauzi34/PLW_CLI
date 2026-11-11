@@ -235,7 +235,12 @@ type scoredChunk struct {
 // 2026-10-26: --defs-only "main" returned the "package main" window
 // chunk as a second "definition".)
 var defKeywords = []string{"fn", "struct", "enum", "trait", "impl", "class",
-	"def", "function", "const", "type", "interface", "func", "var"}
+	"def", "function", "const", "type", "interface", "func", "var",
+	// Kotlin (K1-K4, 2026-11-12): "fun" for functions, "object" for
+	// object declarations, "typealias" for type aliases, "val" for
+	// value bindings (mirrors "var"/"const": a local val inside a
+	// function body matches the same way a local const does).
+	"fun", "object", "typealias", "val"}
 
 // hasDefPattern is a fast hand-rolled check for definition patterns
 // ("keyword term" with optional Go receiver). It gates the expensive regex:

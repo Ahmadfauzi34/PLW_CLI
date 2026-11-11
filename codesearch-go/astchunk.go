@@ -2,8 +2,8 @@ package main
 
 // Function-aware chunking via tree-sitter (gotreesitter: pure Go, no cgo).
 //
-// For supported languages (Go, Rust, Python, JavaScript, TypeScript), a
-// file is chunked into one chunk per function/method/class/type
+// For supported languages (Go, Rust, Python, JavaScript, TypeScript,
+// Kotlin), a file is chunked into one chunk per function/method/class/type
 // definition instead of fixed 30-line windows, so a snippet never splits
 // a definition in half (cAST-style). A definition's doc comment
 // (contiguous doc-syntax lines directly above it, capped) is part of its
@@ -47,6 +47,8 @@ const (
 // arrow/function-expression declarators) plus TS-only type declarations;
 // TS uses tsDefQuery (callers.go), whose class pattern also accepts
 // type_identifier. The query strings concatenate as two pattern lists.
+// Kotlin uses ktDefQuery (class/function/object/type-alias; positional
+// names — the grammar has no "name"/"body" fields).
 type astLang struct {
 	ext   string
 	lang  func() *gotreesitter.Language
@@ -59,6 +61,27 @@ const tsChunkExtra = `[
 	(interface_declaration name: (type_identifier) @name) @def
 	(type_alias_declaration name: (type_identifier) @name) @def
 	(enum_declaration name: (identifier) @name) @def
+]`
+
+// ktDefQuery captures Kotlin definition units. Node names verified
+// against tree-sitter-kotlin by probe (2026-11-12, S-expression of a
+// real .kt file): class/interface/enum/data/sealed/annotation/
+// fun-interface are ALL class_declaration; typealias is type_alias.
+// Unlike Go/Rust/JS, Kotlin declarations carry NO "name" or "body"
+// field (ChildByFieldName returns nil), so names and bodies are
+// captured positionally: the first type_identifier/simple_identifier
+// child is the name (supertypes live in delegation_specifier, never
+// as a direct type_identifier child), and function_body is the
+// optional body child (single-expression functions wrap their
+// expression in a function_body too). Properties are deliberately
+// NOT here: a local val inside a function would become its own def
+// chunk, the way JS plain vars are not defs either — top-level vals
+// are found by --related instead (K4).
+const ktDefQuery = `[
+	(class_declaration (type_identifier) @name) @def
+	(function_declaration (simple_identifier) @name (function_body)? @body) @def
+	(object_declaration (type_identifier) @name) @def
+	(type_alias (type_identifier) @name) @def
 ]`
 
 var astLangs = []astLang{
@@ -88,6 +111,7 @@ var astLangs = []astLang{
 	{".cts", grammars.TypescriptLanguage, tsDefQuery + tsChunkExtra},
 	{".tsx", grammars.TsxLanguage, tsDefQuery + tsChunkExtra},
 	{".jsx", grammars.TsxLanguage, tsDefQuery + tsChunkExtra},
+	{".kt", grammars.KotlinLanguage, ktDefQuery},
 }
 
 type compiledSpec struct {
@@ -299,6 +323,9 @@ func docMarkers(ext string) []string {
 		return []string{"///", "/**", "/*", "*"}
 	case ".go":
 		return []string{"//", "/*", "*"}
+	case ".kt":
+		// Kotlin KDoc is /** ... */ like JSDoc.
+		return []string{"/**", "/*", "*"}
 	default: // JS/TS family
 		return []string{"/**", "/*", "*"}
 	}

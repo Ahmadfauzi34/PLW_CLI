@@ -151,6 +151,29 @@ func TestExtractCallsTS(t *testing.T) {
 	}
 }
 
+func TestExtractCallsKotlin(t *testing.T) {
+	// K1-K4 (2026-11-12): plain, qualified (client.connect),
+	// super/this calls, and a top-level constructor call.
+	text := "package a.b\n\nclass Foo {\n    fun run() {\n" +
+		"        helper()\n        client.connect()\n        super.toString()\n" +
+		"    }\n}\n\nfun helper() {}\n\nval made = Foo()\n"
+	sites, ok := extractCalls("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	// lines: 1 pkg, 2 blank, 3 class, 4 fun run, 5 helper(), 6 connect,
+	// 7 super, 8 }, 9 }, 10 blank, 11 fun helper, 12 blank, 13 Foo().
+	want := [][3]string{
+		{"helper", "run", "5"},
+		{"client.connect", "run", "6"},
+		{"super.toString", "run", "7"},
+		{"Foo", "", "13"},
+	}
+	if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
 func TestExtractCallsJSReferenceNotCall(t *testing.T) {
 	// Bare references and member access without () are not calls.
 	text := "const h = foo;\nfoo.bar;\n"

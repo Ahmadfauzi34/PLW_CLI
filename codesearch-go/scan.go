@@ -15,7 +15,7 @@ import (
 )
 
 var defaultExts = []string{".rs", ".js", ".mjs", ".ts", ".tsx", ".py", ".go",
-	".java", ".c", ".h", ".cpp", ".md", ".txt", ".rst", ".adoc"}
+	".java", ".kt", ".c", ".h", ".cpp", ".md", ".txt", ".rst", ".adoc"}
 
 var skipDirs = map[string]bool{
 	".git": true, "target": true, "node_modules": true,

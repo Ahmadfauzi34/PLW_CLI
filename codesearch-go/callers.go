@@ -29,13 +29,30 @@ import (
 
 // callLang pairs a file extension with its tree-sitter language and the
 // query capturing call expressions: the whole call as @call, its callee
-// expression as @callee. Field name "function" holds across Go, Rust and
-// Python call nodes.
+// expression as @callee. Field name "function" holds across Go, Rust,
+// Python and JS/TS call nodes. Kotlin has no "function" field (its
+// grammar carries no field names on call expressions at all), so the
+// Kotlin query captures the callee positionally instead: a bare
+// simple_identifier for plain calls, the whole navigation_expression
+// for qualified calls (client.connect(), super.foo(), this.bar()).
 type callLang struct {
 	ext   string
 	lang  func() *gotreesitter.Language
 	query string
 }
+
+// ktCallQuery captures Kotlin call expressions. Node names verified
+// against tree-sitter-kotlin by probe (2026-11-12): the callee is the
+// direct simple_identifier child for plain calls, or the whole
+// navigation_expression for qualified calls (client.connect(),
+// super.foo(), this.bar()) — the full expression, like Go's
+// "x.Method" and Rust's "foo::bar", so calleeBase reduces it to the
+// trailing name. Constructor calls (Foo()) are call_expressions too
+// and match the plain pattern.
+const ktCallQuery = `[
+	(call_expression (simple_identifier) @callee) @call
+	(call_expression (navigation_expression) @callee) @call
+]`
 
 var callLangs = []callLang{
 	{".go", grammars.GoLanguage, `[
@@ -68,6 +85,7 @@ var callLangs = []callLang{
 	{".tsx", grammars.TsxLanguage, `[
 		(call_expression function: (_) @callee) @call
 	]`},
+	{".kt", grammars.KotlinLanguage, ktCallQuery},
 }
 
 type callSpec struct {
