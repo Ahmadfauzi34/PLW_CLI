@@ -1,0 +1,25 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -92,6 +92,7 @@
+ import sys
+ import os
+ import json
++import signal
+ import subprocess
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+@@ -4729,6 +4730,14 @@
+     return code
+ 
+ def main() -> None:
++    # Unix: when stdout is piped to `head` (or any reader that exits
++    # early), die silently on SIGPIPE (exit 141) instead of raising
++    # BrokenPipeError with a traceback at the print call / shutdown
++    # flush. This covers every command that prints long output to a
++    # pipe, not just `agent orient`. Guarded: SIGPIPE does not exist
++    # on Windows.
++    if hasattr(signal, "SIGPIPE"):
++        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+     if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-V", "version"):
+         options = sys.argv[2:]
+         if options not in ([], ["--json"]):

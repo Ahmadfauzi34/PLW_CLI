@@ -142,6 +142,12 @@ grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py
 apply_reviewable_overlay "limit_v1"
 grep -Fq '_apply_limit' core/codesearch_engine.py
 grep -Fq '_apply_batch_limit' core/codesearch_engine.py
+apply_reviewable_overlay "brokenpipe_v1"
+grep -Fq 'signal.signal(signal.SIGPIPE, signal.SIG_DFL)' plw_cli.py
+apply_reviewable_overlay "topology_honesty_v1"
+grep -Fq 'reconvergent_dag' codebase/hott_analyzers.py
+grep -Fq 'hub_stabilization_and_contract_hardening' core/synthesizer.py
+grep -Fq 'intermediate_nodes' codebase/hott_analyzers.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

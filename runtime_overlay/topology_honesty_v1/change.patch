@@ -1,0 +1,172 @@
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -440,7 +440,37 @@
+                 })
+ 
+     # --- diamond_dependency ---
+-    seen_diamonds: Set[Tuple[str, str, str, str]] = set()
++    # One finding per (source, convergence) group, not one per path
++    # pair: a shared foundation imported by N modules otherwise
++    # explodes combinatorially (46 findings for 16 groups on the
++    # reference project). Barrel files (index.*) and test files are
++    # not diamond sources: a barrel only re-exports, it adds no
++    # design information of its own.
++    # Severity is "info" by default: in a layered DAG, reconverging
++    # on a shared foundation is normal modularity, not a defect.
++    # It escalates to "medium" only when the convergence file
++    # exports mutable shared state (mechanical check below), the
++    # one case where two paths can couple implicitly.
++    _BARREL_BASENAMES = {
++        "index.ts", "index.js", "index.tsx", "index.jsx",
++        "index.mts", "index.cts",
++    }
++    _MUTABLE_EXPORT_RE = re.compile(
++        r"^\s*export\s+(?:let|var)\s+\w+"
++        r"|^\s*export\s+const\s+\w+\s*=\s*new\s+\w+"
++        r"|^\s*export\s+const\s+\w+\s*=\s*(?:\{|\[)",
++        re.MULTILINE,
++    )
++
++    def _is_barrel_or_test(path: str) -> bool:
++        base = path.rsplit("/", 1)[-1]
++        return base in _BARREL_BASENAMES or ".spec." in base or ".test." in base
++
++    def _convergence_has_mutable_state(path: str) -> bool:
++        content = file_map.get(path, "")
++        return _MUTABLE_EXPORT_RE.search(content) is not None
++
++    diamond_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+ 
+     for node_d, importers in sorted(reverse.items()):
+         if len(importers) < 2:
+@@ -458,29 +488,39 @@
+                 common_a = dependents_b & dependents_c
+ 
+                 for node_a in sorted(common_a):
+-                    normalized_key = (
+-                        node_a,
+-                        min(node_b, node_c),
+-                        max(node_b, node_c),
+-                        node_d,
+-                    )
+-                    if normalized_key in seen_diamonds:
++                    if _is_barrel_or_test(node_a):
+                         continue
+-                    seen_diamonds.add(normalized_key)
+-
+-                    findings.append({
+-                        "type": "diamond_dependency",
+-                        "severity": "medium",
+-                        "source": node_a,
+-                        "path_one": [node_a, node_b, node_d],
+-                        "path_two": [node_a, node_c, node_d],
+-                        "convergence": node_d,
+-                        "observation": (
+-                            f"Two homotopic paths from '{node_a}' to '{node_d}': "
+-                            f"via '{node_b}' and via '{node_c}'."
+-                        ),
+-                        "invariant": "H1_multiple_paths",
+-                    })
++                    key = (node_a, node_d)
++                    pair = (min(node_b, node_c), max(node_b, node_c))
++                    pairs = diamond_groups.setdefault(key, [])
++                    if pair not in pairs:
++                        pairs.append(pair)
++
++    for (node_a, node_d), pairs in sorted(diamond_groups.items()):
++        pairs = sorted(pairs)
++        intermediates = sorted({x for pair in pairs for x in pair})
++        first_b, first_c = pairs[0]
++        severity = "medium" if _convergence_has_mutable_state(node_d) else "info"
++        findings.append({
++            "type": "diamond_dependency",
++            "severity": severity,
++            "source": node_a,
++            "path_one": [node_a, first_b, node_d],
++            "path_two": [node_a, first_c, node_d],
++            "intermediate_nodes": intermediates,
++            "diamond_count": len(pairs),
++            "convergence": node_d,
++            "observation": (
++                f"{len(pairs)} reconvergent path pair(s) from '{node_a}' to '{node_d}' "
++                f"via {', '.join(repr(x) for x in intermediates)}. "
++                + (
++                    "Convergence exports mutable shared state: treat as implicit coupling."
++                    if severity == "medium" else
++                    "Shared foundation in a layered DAG: normal modularity, not a defect."
++                )
++            ),
++            "invariant": "H1_multiple_paths",
++        })
+ 
+     # --- multi_importer_hub ---
+     HUB_THRESHOLD = 4
+@@ -525,8 +565,19 @@
+ def _classify_archetype(
+     beta_0: int, beta_1: int, beta_2: int,
+     average_degree: float, vertex_count: int,
++    directed_cycles: int = 0,
+ ) -> Tuple[str, str, float]:
+-    """Archetype classification TERKALIBRASI (avg_degree + fragmentasi)."""
++    """Archetype classification TERKALIBRASI (avg_degree + fragmentasi).
++
++    directed_cycles counts basis cycles with directed orientation
++    (topo.circular == 0 implies 0 here). beta_1 counts INDEPENDENT
++    cycles of the UNDERLYING UNDIRECTED graph, so a healthy layered
++    DAG full of diamonds has beta_1 > 0 with directed_cycles == 0:
++    labelling that "mixed_cyclic" misleads agents into breaking
++    cycles that do not exist. Pure reconvergence gets its own
++    labels (no "cyclic" in the name, so steer_decoder does not
++    pick cycle_breaking_and_layering for it).
++    """
+     if vertex_count == 0:
+         return "empty", "No topological structure", 1.0
+     if vertex_count == 1:
+@@ -541,6 +592,20 @@
+         else:
+             return "modular", f"{beta_0} disconnected acyclic components", 0.90
+ 
++    # Pure undirected reconvergence (diamonds): a DAG, not a cycle.
++    if directed_cycles == 0:
++        if is_fragmented:
++            return (
++                "fragmented_reconvergent_dag",
++                f"{beta_0} components with {beta_1} reconvergent path(s), no directed cycles",
++                0.85,
++            )
++        return (
++            "reconvergent_dag",
++            f"Connected DAG with {beta_1} reconvergent path(s), no directed cycles (avg degree {average_degree:.2f})",
++            0.90,
++        )
++
+     if is_fragmented:
+         if average_degree < 2.5:
+             return (
+@@ -631,8 +696,11 @@
+     }
+ 
+     # --- Archetype classification (TERKALIBRASI) ---
++    # directed_cycles gates the cyclic labels: beta_1 alone cannot
++    # tell a directed cycle from diamond reconvergence.
+     archetype, archetype_desc, archetype_conf = _classify_archetype(
+-        beta_0, beta_1, beta_2, average_degree, n_vertices
++        beta_0, beta_1, beta_2, average_degree, n_vertices,
++        directed_cycles=cycle_orientation_counts["directed"],
+     )
+ 
+     # --- Invariant vector (normalized) ---
+--- a/core/synthesizer.py
++++ b/core/synthesizer.py
+@@ -353,6 +353,11 @@
+     archetype = curr_fp.get("structural_archetype", "tree_like")
+     if archetype == "tree_like":
+         strategy = "hierarchical_traversal"
++    elif archetype in ("reconvergent_dag", "fragmented_reconvergent_dag"):
++        # DAG with diamond reconvergence but no directed cycles:
++        # there is nothing to break; stabilise the hubs and harden
++        # the layer contracts instead.
++        strategy = "hub_stabilization_and_contract_hardening"
+     elif "cyclic" in archetype:
+         strategy = "cycle_breaking_and_layering"
+     else:
