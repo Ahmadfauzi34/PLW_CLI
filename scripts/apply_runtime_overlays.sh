@@ -164,6 +164,10 @@ apply_reviewable_overlay "root_flag_v1"
 grep -Fq '_root_flag' plw_cli.py
 grep -Fq '_root_flag_from_argv' hott_kernel.py
 grep -Fq 'Every command that takes [root] also accepts --root DIR' plw_cli.py
+apply_reviewable_overlay "receipt_bias_v1"
+grep -Fq '_TASK_RECEIPT_SCHEMA' hott_kernel.py
+grep -Fq '_validate_task_receipt' plw_cli.py
+grep -Fq 'Receipts: every stage issues a receipt' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

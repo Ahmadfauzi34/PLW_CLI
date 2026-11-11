@@ -1,0 +1,377 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4297,12 +4297,88 @@
+     return code
+ 
+ 
++def _load_receipt_arg(value):
++    """Parse a --receipt value (JSON string or @path). Raises ValueError."""
++    raw = value
++    if value.startswith("@"):
++        raw = Path(value[1:]).read_text(encoding="utf-8")
++    data = json.loads(raw)
++    if not isinstance(data, dict):
++        raise ValueError("--receipt must be a JSON object")
++    return data
++
++
++def _receipt_arg_error(message, code="receipt_mismatch"):
++    print(json.dumps({"error": code, "detail": message}, ensure_ascii=False))
++    return 3
++
++
++def _validate_task_receipt(stage, task, scan_root, receipt):
++    """Check a previous stage's receipt against this invocation.
++
++    Returns None when the receipt chains here, else an error string.
++    """
++    if not isinstance(receipt, dict):
++        return "receipt must be a JSON object"
++    if receipt.get("schema_version") != hott_kernel._TASK_RECEIPT_SCHEMA:
++        return "receipt schema_version must be %s" % hott_kernel._TASK_RECEIPT_SCHEMA
++    prev_stage = receipt.get("stage")
++    allowed, _ = hott_kernel._TASK_PIPELINE[stage]
++    if prev_stage not in allowed:
++        return "stage %s cannot follow receipt stage %s (expected one of: %s)" % (
++            stage, prev_stage, ", ".join(allowed),
++        )
++    if receipt.get("task") != task:
++        return "receipt task %r does not match this task %r" % (receipt.get("task"), task)
++    prev_root = receipt.get("scan_root")
++    if prev_root is not None and scan_root is not None:
++        if os.path.abspath(prev_root) != os.path.abspath(scan_root):
++            return "receipt scan_root %r does not match this root %r" % (prev_root, scan_root)
++    expect = hott_kernel._task_receipt_fingerprint(prev_stage, receipt.get("task") or "", prev_root)
++    if receipt.get("fingerprint") != expect:
++        return "receipt fingerprint does not match its stage/task/root"
++    return None
++
++
++def _check_receipt_arg(value, stage, task, scan_root):
++    """Validate a --receipt value for a stage. Returns an exit code or None."""
++    if value is None:
++        return None
++    try:
++        receipt = _load_receipt_arg(value)
++    except (OSError, json.JSONDecodeError, ValueError) as exc:
++        print("[PLW Error] --receipt unreadable: %s" % exc, file=sys.stderr)
++        return 2
++    err = _validate_task_receipt(stage, task, scan_root, receipt)
++    if err is not None:
++        return _receipt_arg_error(err)
++    return None
++
++
++def _receipt_next_lines(result):
++    """Human-form lines for a result carrying receipt+next."""
++    lines = []
++    receipt = result.get("receipt") or {}
++    if receipt.get("fingerprint"):
++        lines.append("# Receipt: %s %s (task=%s, root=%s)" % (
++            receipt.get("stage"), str(receipt.get("fingerprint"))[:19],
++            receipt.get("task"), receipt.get("scan_root"),
++        ))
++    nxt = result.get("next")
++    if nxt:
++        lines.append("# Next: %s %s" % (nxt["command"], " ".join(nxt["args"])))
++    else:
++        lines.append("# Next: pipeline complete — no further stage.")
++    return lines
++
++
+ def _parse_target_task_args(args: List[str], prog: str):
+     import argparse
+     parser = argparse.ArgumentParser(prog=prog)
+     parser.add_argument("task")
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--receipt", default=None)
+     parser.add_argument("--target", action="append", default=[])
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+@@ -4315,10 +4391,14 @@
+ def cmd_resolve_target(args: List[str]) -> int:
+     """Resolve task-relevant graph nodes before capability selection."""
+     opts = _parse_target_task_args(args, "plw resolve-target")
++    rc = _check_receipt_arg(opts.receipt, "resolve-target", opts.task, opts.root)
++    if rc is not None:
++        return rc
+     result = hott_kernel.kernel_resolve_target(
+         opts.root, opts.task, target_files=opts.target or None,
+         top_n=opts.top, neighborhood_limit=opts.neighbors,
+     )
++    result = hott_kernel._attach_task_receipt(result, "resolve-target", opts.task, opts.root)
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4332,16 +4412,22 @@
+             print("# State: " + str(resolution.get("state")))
+             print("# Selected: " + ", ".join(resolution.get("selected_targets", []) or []))
+             print("# Next: derive unknown/evidence needs; do not select capability from task wording alone.")
++            for line in _receipt_next_lines(result):
++                print(line)
+     return code
+ 
+ 
+ def cmd_evidence_needs(args: List[str]) -> int:
+     """Derive known/unknown/evidence-needed after target grounding."""
+     opts = _parse_target_task_args(args, "plw evidence-needs")
++    rc = _check_receipt_arg(opts.receipt, "evidence-needs", opts.task, opts.root)
++    if rc is not None:
++        return rc
+     result = hott_kernel.kernel_evidence_needs(
+         opts.root, opts.task, target_files=opts.target or None,
+         top_n=opts.top, neighborhood_limit=opts.neighbors,
+     )
++    result = hott_kernel._attach_task_receipt(result, "evidence-needs", opts.task, opts.root)
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4356,16 +4442,22 @@
+             for row in deriv.get("evidence_needed", [])[:8]:
+                 print("# Need: " + str(row.get("need")))
+             print("# Next: match unsatisfied evidence needs to capability contracts in a separate stage.")
++            for line in _receipt_next_lines(result):
++                print(line)
+     return code
+ 
+ 
+ def cmd_capability_match(args: List[str]) -> int:
+     """Match target-grounded evidence classes to PLW capability contracts."""
+     opts = _parse_target_task_args(args, "plw capability-match")
++    rc = _check_receipt_arg(opts.receipt, "capability-match", opts.task, opts.root)
++    if rc is not None:
++        return rc
+     result = hott_kernel.kernel_capability_match(
+         opts.root, opts.task, target_files=opts.target or None,
+         top_n=opts.top, neighborhood_limit=opts.neighbors,
+     )
++    result = hott_kernel._attach_task_receipt(result, "capability-match", opts.task, opts.root)
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4385,6 +4477,8 @@
+                 ))
+             print("# Uncovered needs: " + str(len(selection.get("uncovered_needs", []) or [])))
+             print("# Next: agent inspects information gain and exact skill paths before choosing any call.")
++            for line in _receipt_next_lines(result):
++                print(line)
+     return code
+ 
+ 
+@@ -4443,14 +4537,20 @@
+     parser.add_argument("task")
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--receipt", default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    stage = "candidate-select" if opts.operation == "select" else "candidate-capability-match"
++    rc = _check_receipt_arg(opts.receipt, stage, opts.task, opts.root)
++    if rc is not None:
++        return rc
+     result = run_candidate_provenance(
+         opts.root,
+         opts.task,
+         include_capability_match=opts.operation == "capability-match",
+     )
++    result = hott_kernel._attach_task_receipt(result, stage, opts.task, opts.root)
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+     else:
+@@ -4470,6 +4570,8 @@
+             print("# Capability match: " + str(route.get("status")))
+             print("# Matched internal contract: " + str(route.get("matched_capability_id") or "-"))
+         print("# Authority: selection/match only; no authorization, execution, mutation, correctness, or evidence acceptance")
++        for line in _receipt_next_lines(result):
++            print(line)
+     return 0
+ 
+ 
+@@ -4753,8 +4855,13 @@
+     parser.add_argument("--goal", default="auto")
+     parser.add_argument("--depth", default="auto")
+     parser.add_argument("--json", action="store_true", dest="as_json")
++    parser.add_argument("--receipt", default=None)
+     opts = parser.parse_args(args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    if opts.receipt is not None:
++        return _receipt_arg_error(
++            "agent orient is an entry stage and takes no receipt; it issues the first receipt",
++            code="receipt_not_accepted")
+     result = hott_kernel.kernel_work(
+         scan_root=opts.root,
+         task=opts.task,
+@@ -4778,6 +4885,7 @@
+             portable_state = "TARGET_TOPOLOGY_UNAVAILABLE"
+         result["portable_agent_state"] = portable_state
+         result["portable_agent_reason"] = reason
++    result = hott_kernel._attach_task_receipt(result, "orient", opts.task, opts.root)
+     code = 0 if isinstance(result, dict) and not result.get("error") else 3
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4806,6 +4914,8 @@
+             print("# Action readiness: " + str(frame.get("action_readiness", "unknown")))
+             print("# Skill handoff: " + str(handoff.get("skill_path", "-")))
+             print("# Authority: orientation only; no runtime execution or source mutation granted")
++            for line in _receipt_next_lines(result):
++                print(line)
+     return code
+ 
+ 
+@@ -4816,13 +4926,25 @@
+     parser.add_argument("operation", choices=("describe", "route"))
+     parser.add_argument("value")
+     parser.add_argument("--goal", default="auto")
++    parser.add_argument("--receipt", default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    if opts.operation == "describe":
++        if opts.receipt is not None:
++            return _receipt_arg_error(
++                "semantic describe is not a pipeline stage and takes no receipt",
++                code="receipt_not_accepted")
++    else:
++        rc = _check_receipt_arg(opts.receipt, "semantic-route", opts.value, None)
++        if rc is not None:
++            return rc
+     result = (
+         describe_command(opts.value)
+         if opts.operation == "describe"
+         else route_task_semantics(opts.value, goal=opts.goal)
+     )
++    if opts.operation == "route" and result.get("route_found"):
++        result = hott_kernel._attach_task_receipt(result, "semantic-route", opts.value, None)
+     code = 0 if result.get("known", result.get("route_found", False)) else 3
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4841,6 +4963,8 @@
+             print("# Skill: " + str(result.get("skill_path", "-")))
+             print("# Canonical: " + ", ".join(result.get("canonical_concepts", [])[:4]))
+             print("# Information gain: " + "; ".join(result.get("information_gain", [])[:4]))
++            for line in _receipt_next_lines(result):
++                print(line)
+     return code
+ 
+ def main() -> None:
+@@ -4874,6 +4998,7 @@
+   Task pipeline, in order — each step reads the previous step's receipt:
+     orient -> resolve-target -> evidence-needs -> capability-match -> candidate select
+     (semantic route is the predictive side-branch: use it when a name stays opaque after topology.)
++  Receipts: every stage issues a receipt and names the next stage — pass it with --receipt <json|@file> to the next stage; a stage checks task, stage order and root, and refuses a mismatched receipt. Entry stages (orient, work) take no receipt.
+   Argument order: write the query/target first, root second (e.g. plw context <query> [root]).
+     Every command that takes [root] also accepts --root DIR; the flag wins over the positional.
+     plw ast accepts both orders; --root DIR is always explicit.
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -3826,6 +3826,73 @@
+     }
+ 
+ 
++# --- Task-pipeline receipts (B2-remainder: receipt bias) -------------------
++# Every task-routing stage issues a receipt and names the next stage, so an
++# agent can see the receipt exists and carry it forward. The next stage
++# accepts --receipt and validates it (task + stage order + root). Receipts
++# are deterministic (no timestamp): fingerprint = sha256 of
++# stage + "\n" + task + "\n" + (scan_root or "").
++
++_TASK_RECEIPT_SCHEMA = "plw-task-receipt-v1"
++
++# stage -> (allowed previous stages, next stage or None)
++_TASK_PIPELINE = {
++    "orient": ((), "resolve-target"),
++    "work": ((), "resolve-target"),
++    "resolve-target": (("orient", "work", "semantic-route"), "evidence-needs"),
++    "evidence-needs": (("resolve-target",), "capability-match"),
++    "capability-match": (("evidence-needs",), "candidate-select"),
++    "candidate-select": (("capability-match",), None),
++    "candidate-capability-match": (("capability-match",), None),
++    "semantic-route": (("orient", "work"), "resolve-target"),
++}
++
++_TASK_RECEIPT_COMMANDS = {
++    "orient": "plw agent orient",
++    "work": "plw work",
++    "resolve-target": "plw resolve-target",
++    "evidence-needs": "plw evidence-needs",
++    "capability-match": "plw capability-match",
++    "candidate-select": "plw candidate select",
++    "candidate-capability-match": "plw candidate capability-match",
++    "semantic-route": "plw semantic route",
++}
++
++
++def _task_receipt_fingerprint(stage, task, scan_root):
++    material = stage + "\n" + task + "\n" + (scan_root or "")
++    return "sha256:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
++
++
++def _task_receipt(stage, task, scan_root):
++    return {
++        "schema_version": _TASK_RECEIPT_SCHEMA,
++        "stage": stage,
++        "task": task,
++        "scan_root": scan_root,
++        "fingerprint": _task_receipt_fingerprint(stage, task, scan_root),
++    }
++
++
++def _task_next(stage, task, scan_root):
++    nxt = _TASK_PIPELINE[stage][1]
++    if nxt is None:
++        return None
++    cmd = _TASK_RECEIPT_COMMANDS[nxt]
++    args = [task] if scan_root is None else [task, scan_root]
++    return {"command": cmd, "args": args, "stage": nxt}
++
++
++def _attach_task_receipt(result, stage, task, scan_root):
++    """Add receipt+next to a successful stage result (new dict)."""
++    if not isinstance(result, dict) or result.get("error"):
++        return result
++    out = dict(result)
++    out["receipt"] = _task_receipt(stage, task, scan_root)
++    out["next"] = _task_next(stage, task, scan_root)
++    return out
++
++
+ def _root_flag_from_argv(default: str) -> str:
+     """--root DIR in sys.argv wins over the positional root (B1)."""
+     for index, argument in enumerate(sys.argv):
+@@ -3971,6 +4038,7 @@
+         proactive_truth = True
+         truth_scope = None
+         ui_selector = None
++        receipt_arg = None
+         parse_error = None
+         for i, arg in enumerate(sys.argv):
+             if arg in ("--target", "--targets", "--target-file", "--target-files") and i + 1 < len(sys.argv):
+@@ -4014,9 +4082,16 @@
+                 ui_selector = sys.argv[i + 1]
+             elif arg == "--no-proactive-truth":
+                 proactive_truth = False
++            elif arg == "--receipt" and i + 1 < len(sys.argv):
++                receipt_arg = sys.argv[i + 1]
++        if receipt_arg is not None:
++            _emit_cli_result(_kernel_error(
++                "receipt_not_accepted",
++                "plw work is an entry stage and takes no receipt; it issues the first receipt.",
++            ))
+         if parse_error:
+             _emit_cli_result(parse_error)
+-        _emit_cli_result(kernel_work(
++        work_result = kernel_work(
+             scan_root=root,
+             task=task,
+             target_files=targets or None,
+@@ -4029,7 +4104,8 @@
+             proactive_truth=proactive_truth,
+             truth_scope=truth_scope,
+             ui_selector=ui_selector,
+-        ))
++        )
++        _emit_cli_result(_attach_task_receipt(work_result, "work", task, root))
+ 
+     elif mode == "analyze":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
