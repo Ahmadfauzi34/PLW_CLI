@@ -201,6 +201,49 @@ class AdapterTestCase(unittest.TestCase):
                 ce.discover_codesearch()
         self.assertIn("not found", str(ctx.exception))
 
+    # -- T1b: F1 PATH candidates --------------------------------------
+    def test_discover_path_tries_release_names_in_order(self):
+        # Only codesearch-go on PATH: found (the user's exact case).
+        def which_go(name):
+            return "/opt/bin/codesearch-go" if name == "codesearch-go" else None
+        with mock.patch("core.codesearch_engine.shutil.which", side_effect=which_go):
+            path, via = ce.discover_codesearch()
+        self.assertEqual(str(path), "/opt/bin/codesearch-go")
+        self.assertEqual(via, "PATH")
+
+    def test_discover_path_tries_release_asset_name(self):
+        def which_asset(name):
+            return "/opt/bin/codesearch-go-linux-x86_64" \
+                if name == "codesearch-go-linux-x86_64" else None
+        with mock.patch("core.codesearch_engine.shutil.which", side_effect=which_asset):
+            path, via = ce.discover_codesearch()
+        self.assertEqual(str(path), "/opt/bin/codesearch-go-linux-x86_64")
+        self.assertEqual(via, "PATH")
+
+    def test_discover_path_bare_name_wins(self):
+        # All three present: the bare name stays first, so existing
+        # setups keep working.
+        def which_all(name):
+            return f"/opt/bin/{name}"
+        with mock.patch("core.codesearch_engine.shutil.which", side_effect=which_all):
+            path, via = ce.discover_codesearch()
+        self.assertEqual(str(path), "/opt/bin/codesearch")
+        self.assertEqual(via, "PATH")
+
+    def test_discover_path_error_names_all_candidates(self):
+        with mock.patch("core.codesearch_engine.shutil.which", return_value=None):
+            with self.assertRaises(ce.EngineError) as ctx:
+                ce.discover_codesearch()
+        msg = str(ctx.exception)
+        for name in ce.PATH_CANDIDATES:
+            self.assertIn(repr(name), msg)
+
+    def test_discover_candidates_constant(self):
+        self.assertEqual(
+            ce.PATH_CANDIDATES,
+            ("codesearch", "codesearch-go", "codesearch-go-linux-x86_64"),
+        )
+
     # -- T2/T3/T4/T5: version gate -----------------------------------
     def test_version_pinned_stub_accepted(self):
         stub = self.stub()

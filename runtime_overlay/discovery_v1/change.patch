@@ -1,0 +1,52 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -24,10 +24,13 @@
+   an unparsable JSON response all raise ``EngineError``.  No partial
+   result is ever presented as success.
+ * Discovery.  Explicit path, then the ``CODESEARCH_BIN``
+-  environment variable, then ``PATH``.  The engine is an external
+-  binary supplied by the agent harness, like any other external
+-  tool: it is never bundled into the PLW executable and there is no
+-  fallback to a build-machine path.
++  environment variable, then ``PATH`` — where the engine is looked
++  up under each of ``PATH_CANDIDATES`` in order (``codesearch``,
++  then ``codesearch-go``, then ``codesearch-go-linux-x86_64``), so
++  a release-asset binary works without a symlink or env var (F1).
++  The engine is an external binary supplied by the agent harness,
++  like any other external tool: it is never bundled into the PLW
++  executable and there is no fallback to a build-machine path.
+ * Authority.  codesearch ``--callers`` is name-based (callee
+   normalised to its trailing identifier), not type-resolved.  Its
+   rows are leads: PLW must still read the cited file before
+@@ -98,6 +101,12 @@
+         "go9 8c5d6ffe8685 (v0.2.5 release asset)",
+ }
+ ALLOW_UNPINNED_ENV = "CODESEARCH_ALLOW_UNPINNED"
++# F1: PATH lookup tries these names in order. The release asset is
++# named codesearch-go-linux-x86_64 (and users commonly rename it to
++# codesearch-go); the bare name codesearch stays first so existing
++# setups keep working. Explicit paths and CODESEARCH_BIN name an
++# exact file and are never expanded to candidates.
++PATH_CANDIDATES = ("codesearch", "codesearch-go", "codesearch-go-linux-x86_64")
+ DEFAULT_TIMEOUT_S = 120
+ VERSION_TIMEOUT_S = 10
+ PROBE_TIMEOUT_S = 5
+@@ -160,12 +169,14 @@
+         if not path.is_file():
+             raise EngineError(f"codesearch binary not found at CODESEARCH_BIN: {env}")
+         return path, "CODESEARCH_BIN"
+-    on_path = shutil.which("codesearch")
+-    if on_path:
+-        return Path(on_path), "PATH"
++    for name in PATH_CANDIDATES:
++        on_path = shutil.which(name)
++        if on_path:
++            return Path(on_path), "PATH"
+     raise EngineError(
+         "codesearch binary not found: set CODESEARCH_BIN or put it on PATH "
+-        "(the engine is supplied by the agent harness, not bundled with PLW)"
++        f"(looked for {', '.join(repr(n) for n in PATH_CANDIDATES)}; "
++        "the engine is supplied by the agent harness, not bundled with PLW)"
+     )
+ 
+ 

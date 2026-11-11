@@ -46,7 +46,10 @@ import graph.
 
 1. explicit `--binary` path (when the command accepts one);
 2. `CODESEARCH_BIN` environment variable;
-3. `codesearch` on `PATH`.
+3. `codesearch` on `PATH` — tried in order as `codesearch`,
+   `codesearch-go`, then `codesearch-go-linux-x86_64`, so a binary
+   downloaded from the GitHub release works as-is, without a
+   symlink or env var.
 
 If none resolves, the engine is reported unavailable with the reason
 (`plw doctor` / `plw ast doctor`); commands that need it fail closed

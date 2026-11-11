@@ -133,6 +133,9 @@ apply_reviewable_overlay "engine_pin_v1"
 grep -Fq 'PINNED_ENGINE_DIGESTS' core/codesearch_engine.py
 grep -Fq 'def _engine_digest(' core/codesearch_engine.py
 grep -Fq 'CODESEARCH_ALLOW_UNPINNED' core/codesearch_engine.py
+apply_reviewable_overlay "discovery_v1"
+grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
+grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
 grep -Fq '"plw-version-v1"' plw_cli.py
