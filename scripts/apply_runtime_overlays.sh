@@ -152,6 +152,10 @@ apply_reviewable_overlay "topology_honesty_v1"
 grep -Fq 'reconvergent_dag' codebase/hott_analyzers.py
 grep -Fq 'hub_stabilization_and_contract_hardening' core/synthesizer.py
 grep -Fq 'intermediate_nodes' codebase/hott_analyzers.py
+apply_reviewable_overlay "kotlin_topology_v1"
+grep -Fq 'KOTLIN_SOURCE_EXTENSIONS' language_semantics.py
+grep -Fq 'kotlin_symbol_index' core/shared_graph.py
+grep -Fq 'stable_shared_graph (.ts/.tsx/.js/.jsx/.kt)' core/portable_agent.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

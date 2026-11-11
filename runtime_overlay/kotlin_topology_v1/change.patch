@@ -1,0 +1,370 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -17,10 +17,15 @@
+ 
+ JS_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+ PYTHON_SOURCE_EXTENSIONS = (".py",)
+-SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS
++# K5: Kotlin joins the DEFAULT source contract (unlike Python, there is no
++# self-host hazard: PLW itself has no .kt files). Gradle scripts (.kts) stay
++# out on purpose — they are build configuration, not app source.
++KOTLIN_SOURCE_EXTENSIONS = (".kt",)
++SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + KOTLIN_SOURCE_EXTENSIONS
+ EXPERIMENTAL_SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS
+ JS_RESOLUTION_EXTENSIONS = JS_SOURCE_EXTENSIONS
+ PYTHON_RESOLUTION_EXTENSIONS = PYTHON_SOURCE_EXTENSIONS
++KOTLIN_RESOLUTION_EXTENSIONS = KOTLIN_SOURCE_EXTENSIONS
+ 
+ 
+ _TOOL_IMPLEMENTATION_ROOT = os.path.abspath(os.path.dirname(__file__))
+@@ -78,13 +83,19 @@
+ 
+ 
+ def source_language(path: str) -> str:
+-    return "python" if str(path).endswith(PYTHON_SOURCE_EXTENSIONS) else "javascript"
++    p = str(path)
++    if p.endswith(PYTHON_SOURCE_EXTENSIONS):
++        return "python"
++    if p.endswith(KOTLIN_SOURCE_EXTENSIONS):
++        return "kotlin"
++    return "javascript"
+ 
+ 
+ def source_extensions(*, include_python: bool = False) -> tuple[str, ...]:
+     """Return the active source-extension contract.
+ 
+-    Stable/default callers see the F85 TS/JS boundary. Python is exposed only
++    Stable/default callers see the TS/JS + Kotlin boundary (Kotlin joined the
++    default in K5; .kts Gradle scripts stay out). Python is exposed only
+     through an explicit experimental/self-host path.
+     """
+     return EXPERIMENTAL_SOURCE_EXTENSIONS if include_python else SOURCE_EXTENSIONS
+@@ -152,6 +163,12 @@
+             add(f"{resolved_base}/__init__.py")
+         return candidates
+ 
++    if language == "kotlin":
++        # Kotlin has no barrel/index files: only <base>.kt (K5).
++        if not resolved_base.endswith(KOTLIN_RESOLUTION_EXTENSIONS):
++            add(resolved_base + ".kt")
++        return candidates
++
+     if not any(resolved_base.endswith(ext) for ext in JS_RESOLUTION_EXTENSIONS):
+         for ext in JS_RESOLUTION_EXTENSIONS:
+             add(resolved_base + ext)
+@@ -363,9 +380,137 @@
+     return results
+ 
+ 
++# ---------------------------------------------------------------------------
++# Kotlin frontend (K5/K6). Stdlib-only, regex-based — mirroring the Python
++# frontend above. Kotlin imports are fully-qualified names, never relative
++# paths and never quoted: `import a.b.C`, `import a.b.C as D`,
++# `import a.b.*` (wildcard; 0 occurrences in the measured OOPBoT corpus).
++# ---------------------------------------------------------------------------
++
++KOTLIN_PACKAGE_REGEX = re.compile(r"^package\s+([\w.]+)\s*$", re.MULTILINE)
++
++KOTLIN_IMPORT_REGEX = re.compile(
++    r"^import\s+([\w.]+?)(\.\*)?(?:\s+as\s+(\w+))?\s*$", re.MULTILINE
++)
++
++# Top-level declarations only: anchored at column 0, so indented members
++# inside a class/object body never match. Tolerates same-line annotations,
++# modifiers (incl. `external` for JNI bridges), type parameters and
++# extension receivers (`val Context.appGraph`, `fun <T> Context.foo`).
++_KOTLIN_DECL_MODIFIERS = (
++    r"(?:public|internal|private|protected|open|abstract|data|sealed|final|"
++    r"expect|actual|inline|value|external|crossinline|noinline|tailrec|"
++    r"suspend|operator|infix|lateinit|const|companion|annotation)\s+"
++)
++KOTLIN_DECL_REGEX = re.compile(
++    r"^(?:@[\w.]+(?:\([^)]*\))?\s+)*"
++    + r"(?:" + _KOTLIN_DECL_MODIFIERS + r")*"
++    r"(?:class|interface|object|fun|val|var|typealias|enum)\s+"
++    r"(?:(?:class|interface)\s+)?(?:<[^>]*>\s+)?(?:[\w]+(?:<[^>]*>)?\??\.)?([A-Za-z_][\w]*)",
++    re.MULTILINE,
++)
++
++
++def kotlin_package_of(content: str) -> str:
++    """Return the declared `package a.b.c` of a Kotlin file, or ""."""
++    match = KOTLIN_PACKAGE_REGEX.search(strip_js_comments(content))
++    return match.group(1) if match else ""
++
++
++def kotlin_top_level_names(content: str) -> List[str]:
++    """Return top-level declaration names of a Kotlin file.
++
++    Column-0 anchor keeps class members out; annotation/modifier/receiver
++    tolerant so extension properties (`val Context.appGraph`) are indexed.
++    A declaration inside a function body that happens to sit at column 0
++    (unindented code) is indexed too — accepted noise, the resolver tries
++    FQN-as-path first and this index only second.
++    """
++    return KOTLIN_DECL_REGEX.findall(strip_js_comments(content))
++
++
++def kotlin_source_root(file_path: str, package: str) -> str:
++    """Derive the source root from a file path + its declared package (K5).
++
++    E.g. `src/main/kotlin/io/jeph/pipkin/host/Foo.kt` +
++    `io.jeph.pipkin.host` -> `src/main/kotlin`. Returns "" when the path
++    does not end with the package path. Works per file, so multi-module
++    layouts need no configuration.
++    """
++    if not package:
++        return ""
++    suffix = package.replace(".", "/") + "/" + os.path.basename(file_path)
++    norm = normalize_path(file_path)
++    if norm.endswith("/" + suffix):
++        return norm[: -len(suffix) - 1] or "."
++    if norm == suffix:
++        return "."
++    return ""
++
++
++def parse_kotlin_imports(content: str) -> List[Dict[str, Any]]:
++    """Parse Kotlin imports. Kotlin has no `import type`: every import is
++    runtime (K6), so `import_nature` is always "runtime"."""
++    clean = strip_js_comments(content)
++    results: List[Dict[str, Any]] = []
++    for match in KOTLIN_IMPORT_REGEX.finditer(clean):
++        fqn, wildcard, alias = match.group(1), bool(match.group(2)), match.group(3)
++        symbol = alias or fqn.rsplit(".", 1)[-1]
++        results.append({
++            "raw_import": fqn,
++            "import_nature": "runtime",
++            "statement": match.group(0).strip(),
++            "symbols": [symbol],
++            "semantic_usages": [],
++            "language": "kotlin",
++            "is_relative": False,
++            "alias": alias,
++            "wildcard": wildcard,
++        })
++    return results
++
++
++def kotlin_module_candidates(raw_import: str, roots: Iterable[str]) -> List[str]:
++    """Return FQN-as-path candidates under each Kotlin source root (K5)."""
++    candidates: List[str] = []
++    seen: Set[str] = set()
++
++    def add(candidate: str) -> None:
++        candidate = normalize_path(candidate)
++        if candidate and candidate not in seen:
++            seen.add(candidate)
++            candidates.append(candidate)
++
++    rel = raw_import.replace(".", "/")
++    for root in roots:
++        root_norm = normalize_path(str(root) or ".")
++        if root_norm in ("", "."):
++            continue
++        for candidate in candidate_targets(
++            normalize_path(os.path.join(root_norm, rel)), "kotlin"
++        ):
++            add(candidate)
++    return candidates
++
++
++def kotlin_is_internal_import(raw_import: str, packages: Iterable[str]) -> bool:
++    """True when a dotted prefix of the FQN is a package declared in the corpus."""
++    parts = raw_import.split(".")
++    pkg_set = set(packages)
++    return any(".".join(parts[:k]) in pkg_set for k in range(1, len(parts)))
++
++
++def kotlin_is_generated_import(raw_import: str, packages: Iterable[str]) -> bool:
++    """True for `<known-package>.R`: the Android generated R class, which has
++    no source file in the corpus and must not count as unresolved (K5)."""
++    return raw_import.endswith(".R") and raw_import[:-2] in set(packages)
++
++
+ __all__ = [
+     "JS_RESOLUTION_EXTENSIONS",
+     "JS_SOURCE_EXTENSIONS",
++    "KOTLIN_RESOLUTION_EXTENSIONS",
++    "KOTLIN_SOURCE_EXTENSIONS",
+     "PYTHON_RESOLUTION_EXTENSIONS",
+     "PYTHON_SOURCE_EXTENSIONS",
+     "SOURCE_EXTENSIONS",
+@@ -380,6 +525,13 @@
+     "load_alias_rules",
+     "normalize_path",
+     "parse_python_imports",
++    "kotlin_is_generated_import",
++    "kotlin_is_internal_import",
++    "kotlin_module_candidates",
++    "kotlin_package_of",
++    "kotlin_source_root",
++    "kotlin_top_level_names",
++    "parse_kotlin_imports",
+     "python_module_candidates",
+     "resolve_relative_import_path",
+     "source_language",
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -29,8 +29,15 @@
+     candidate_targets as _candidate_targets,
+     classify_js_import_nature as classify_import_nature,
+     is_source_file as _is_source_file,
++    kotlin_is_generated_import as _kotlin_is_generated,
++    kotlin_is_internal_import as _kotlin_is_internal,
++    kotlin_module_candidates as _kotlin_module_candidates,
++    kotlin_package_of as _kotlin_package_of,
++    kotlin_source_root as _kotlin_source_root,
++    kotlin_top_level_names as _kotlin_top_level_names,
+     load_alias_rules as _load_alias_rules,
+     normalize_path as _normalize_path,
++    parse_kotlin_imports as _parse_kotlin_imports,
+     parse_python_imports,
+     python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
+@@ -115,6 +122,14 @@
+ def parse_imports_with_nature(content: str, file_path: str = "") -> List[Dict[str, Any]]:
+     if source_language(file_path) == "python":
+         return parse_python_imports(content)
++    if source_language(file_path) == "kotlin":
++        items = _parse_kotlin_imports(content)
++        clean_content = _strip_comments(content)
++        for item in items:
++            item["semantic_usages"] = _find_semantic_usages(
++                item.get("symbols", []), clean_content
++            )
++        return items
+     clean_content = _strip_comments(content)
+     results: List[Dict[str, str]] = []
+ 
+@@ -162,8 +177,15 @@
+ )
+ 
+ 
+-def _is_test_file(filename: str) -> bool:
+-    return bool(TEST_FILE_REGEX.search(filename))
++def _is_test_file(file_path: str) -> bool:
++    # K6: Kotlin tests are `*Test.kt`, or live under a `src/test` source set.
++    # Takes the full path now (was basename-only); TEST_FILE_REGEX still
++    # anchors at the end, so passing a full path is safe for TS/JS too.
++    if TEST_FILE_REGEX.search(file_path):
++        return True
++    if os.path.basename(file_path).endswith("Test.kt"):
++        return True
++    return "/src/test/" in file_path.replace("\\", "/")
+ 
+ 
+ def _read_file(path: str) -> Optional[str]:
+@@ -657,6 +679,32 @@
+                 ]
+ 
+     # ============================================================
++    # PASS 1.5: Kotlin package/symbol index (K5)
++    # Built from the contents PASS 1 already read. Source roots are
++    # derived per file (path minus package path), so multi-module
++    # layouts need no configuration. Top-level declarations are indexed
++    # as (package, name) -> file, so imports of types declared in a
++    # differently-named file still resolve (Kotlin file names need not
++    # match the declared type). When a snapshot is supplied, file_map
++    # already holds its contents, so this pass works unchanged.
++    # ============================================================
++    kotlin_packages: Set[str] = set()
++    kotlin_roots: List[str] = []
++    kotlin_symbol_index: Dict[Tuple[str, str], str] = {}
++    for _fp in all_files:
++        if not _fp.endswith(".kt"):
++            continue
++        _content = file_map.get(_fp, "")
++        _pkg = _kotlin_package_of(_content)
++        if _pkg:
++            kotlin_packages.add(_pkg)
++            _root = _kotlin_source_root(_fp, _pkg)
++            if _root and _root not in kotlin_roots:
++                kotlin_roots.append(_root)
++            for _name in _kotlin_top_level_names(_content):
++                kotlin_symbol_index.setdefault((_pkg, _name), _fp)
++
++    # ============================================================
+     # PASS 2: Node metadata extraction
+     # ============================================================
+     node_metadata: Dict[str, Dict[str, Any]] = {}
+@@ -666,7 +714,7 @@
+         filename = os.path.basename(fp)
+ 
+         is_entrypoint, ep_kind, ep_conf = _detect_entrypoint(filename)
+-        is_test = _is_test_file(filename)
++        is_test = _is_test_file(fp)
+         node_type = _classify_node(fp, content)
+ 
+         node_metadata[fp] = {
+@@ -720,6 +768,59 @@
+                     })
+             else:
+                 language = item.get("language", source_language(fp))
++                if language == "kotlin":
++                    # K5: Kotlin imports are fully-qualified names. Resolve in
++                    # two stages — FQN-as-path under a derived source root,
++                    # then the (package, name) symbol index — so types declared
++                    # in a differently-named file still resolve. Unmatched
++                    # imports are classified, not silently dropped: generated
++                    # (`<pkg>.R`) and foreign packages are external, a known
++                    # package that does not resolve is unresolved.
++                    if item.get("wildcard"):
++                        unresolved_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "kotlin_wildcard",
++                        })
++                        continue
++                    matched = None
++                    for cand in _kotlin_module_candidates(raw_import, kotlin_roots):
++                        if cand in all_files_set:
++                            matched = cand
++                            break
++                    if not matched:
++                        parts = raw_import.split(".")
++                        for k in range(len(parts) - 1, 0, -1):
++                            cand_file = kotlin_symbol_index.get(
++                                (".".join(parts[:k]), parts[k])
++                            )
++                            if cand_file is not None and cand_file in all_files_set:
++                                matched = cand_file
++                                break
++                    if matched:
++                        edges.append((fp, matched))
++                        resolved_edge_natures.setdefault((fp, matched), []).append(nature)
++                        resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
++                        resolved_targets.append(matched)
++                    elif _kotlin_is_generated(raw_import, kotlin_packages):
++                        external_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "kotlin_generated",
++                        })
++                    elif _kotlin_is_internal(raw_import, kotlin_packages):
++                        unresolved_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "kotlin_unresolved",
++                        })
++                    else:
++                        external_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "kotlin_external",
++                        })
++                    continue
+                 if language == "python":
+                     python_candidates = python_module_candidates(raw_import, [scan_root_norm])
+                     matched = next((cand for cand in python_candidates if cand in all_files_set), None)
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -341,7 +341,7 @@
+         }
+     topology: Dict[str, Any] = {
+         "available": bool(support.get("topology_ready")),
+-        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx only)",
++        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx/.kt)",
+         "reason": str(support.get("reason") or ""),
+         "note": "the engine does not extend topology (G6)",
+     }
