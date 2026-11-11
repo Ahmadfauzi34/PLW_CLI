@@ -705,15 +705,44 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 				Detail: fmt.Sprintf("%s defined here", d.Name)})
 		}
 	}
+	// F2 phase 1/2: re-export rows are collected, not emitted, until
+	// liveness is known. A row is signal only when its chain ends at
+	// a found definition; rows on dead-end chains are noise — with a
+	// barrel of 20 `export *`, every star edge "exports" the name, so
+	// emitting eagerly produces 20 "(definition not found there)"
+	// rows even though the def sits in exactly one target.
+	// traceRow.node is the "file\x00name" the row points at ("" when
+	// the target is unknown); succ maps a node to the nodes its
+	// re-export edges point at, for the liveness fixpoint below.
+	type traceRow struct {
+		entry relEntry
+		node  string
+	}
+	var trace []traceRow
+	succ := map[string][]string{}
+	nkey := func(file, name string) string { return file + "\x00" + name }
+	// traceSeen is separate from `seen`: a trace row is deduped at
+	// collection time, but must NOT count as already-emitted — phase 2
+	// emits through `add`, which skips keys in `seen`. Sharing the map
+	// would silently drop every trace row at emission.
+	traceSeen := map[string]bool{}
+	traceAdd := func(e relEntry, node string) {
+		e.Symbol = want
+		k := fmt.Sprintf("%s:%d:%s:%s", e.Path, e.Line, e.Kind, e.Detail)
+		if !traceSeen[k] {
+			traceSeen[k] = true
+			trace = append(trace, traceRow{e, node})
+		}
+	}
 	// Re-export walk: queue of (file, exportedName) to explain.
 	type task struct {
 		file, name string
 	}
 	visited := map[string]bool{}
 	queue := []task{}
-	// processEdge explains one edge that exports exportedName: it adds
-	// the row and, when the target does not define the name itself,
-	// queues the target for further chain following.
+	// processEdge explains one edge that exports exportedName: it
+	// records the row and, when the target does not define the name
+	// itself, queues the target for further chain following.
 	processEdge := func(e relEdge, exportedName string) {
 		local := exportedName
 		if !e.Star {
@@ -728,20 +757,21 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 			target = resolveImport(e.From, e.Target, files)
 		}
 		if target == "" {
-			add(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-				Detail: fmt.Sprintf("re-exports %s from %q (target not in index)", exportedName, e.Target)})
+			traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+				Detail: fmt.Sprintf("re-exports %s from %q (target not in index)", exportedName, e.Target)}, "")
 			return
 		}
+		node := nkey(target, local)
+		succ[nkey(e.From, exportedName)] = append(succ[nkey(e.From, exportedName)], node)
 		if d, ok := findDef(target, local); ok {
-			add(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-				Detail: fmt.Sprintf("re-exports %s from %s (defined %s:%d)", exportedName, target, target, d.Line)})
+			traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+				Detail: fmt.Sprintf("re-exports %s from %s (defined %s:%d)", exportedName, target, target, d.Line)}, node)
 			return
 		}
-		add(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-			Detail: fmt.Sprintf("re-exports %s via %s (definition not found there)", exportedName, target)})
-		key := target + "\x00" + local
-		if !visited[key] {
-			visited[key] = true
+		traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+			Detail: fmt.Sprintf("re-exports %s via %s (definition not found there)", exportedName, target)}, node)
+		if !visited[node] {
+			visited[node] = true
 			queue = append(queue, task{target, local})
 		}
 	}
@@ -766,6 +796,59 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 				processEdge(e, t.name)
 			} else if _, ok := e.Names[t.name]; ok {
 				processEdge(e, t.name)
+			}
+		}
+	}
+	// F2 phase 2: emit only the trace rows on live chains. A node
+	// (file, name) is live when the file defines the name as it
+	// arrives there — the local name, which may differ from the
+	// queried name through an alias (`export {orig as alias}`) — or
+	// re-exports it onward to a live node; the fixpoint converges
+	// even with re-export cycles (each pass only adds nodes).
+	live := map[string]bool{}
+	for _, d := range defs {
+		live[nkey(d.Path, d.Name)] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for src, dsts := range succ {
+			if live[src] {
+				continue
+			}
+			for _, dst := range dsts {
+				if live[dst] {
+					live[src] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	// When no chain reaches a definition of `want` and there is no
+	// def row either, the trace is the only information ("looked
+	// here, here, not found"), so it is kept whole instead of
+	// emitting an empty answer.
+	anyLive, hasDef := false, false
+	for _, t := range trace {
+		if t.node != "" && live[t.node] {
+			anyLive = true
+			break
+		}
+	}
+	for _, d := range defs {
+		if d.Name == want {
+			hasDef = true
+			break
+		}
+	}
+	if !anyLive && !hasDef {
+		for _, t := range trace {
+			add(t.entry)
+		}
+	} else {
+		for _, t := range trace {
+			if t.node != "" && live[t.node] {
+				add(t.entry)
 			}
 		}
 	}

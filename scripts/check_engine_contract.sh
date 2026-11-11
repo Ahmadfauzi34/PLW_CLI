@@ -11,20 +11,22 @@
 #
 # NOTE: the adapter's KNOWN_SCHEMA and PINNED_ENGINE_DIGESTS are
 # read from the overlay patches (runtime_overlay/engine_state_v1/
-# and engine_pin_v1/change.patch), NOT from core/codesearch_engine.py
+# and engine_pin_v2/change.patch), NOT from core/codesearch_engine.py
 # — that file only exists after the capsule is unpacked, and this
 # job runs on the bare repo checkout (a grep of core/ here fails
 # with "No such file", CI run 42868246692). The patches are the
 # repo-resident source of truth for the adapter: post-image lines
 # are '+' (added) and ' ' (context); '-' lines are the pre-image
-# and are excluded. If a later overlay moves either constant,
-# update the patch paths below — the script then fails closed with
-# "could not read ...".
+# and are excluded. The pin moved from engine_pin_v1 to
+# engine_pin_v2 when F2 rotated the reproducible-build digest (the
+# v1 patch still holds the superseded digest); if a later overlay
+# moves either constant again, update the patch paths below — the
+# script then fails closed with "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v1/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v1/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v2/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 

@@ -133,6 +133,9 @@ apply_reviewable_overlay "engine_pin_v1"
 grep -Fq 'PINNED_ENGINE_DIGESTS' core/codesearch_engine.py
 grep -Fq 'def _engine_digest(' core/codesearch_engine.py
 grep -Fq 'CODESEARCH_ALLOW_UNPINNED' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v2"
+grep -Fq 'f7ef3778d9407a1daa5da223bc959d64ee85a7000597a9ca0fe3d228884dedca' core/codesearch_engine.py
+grep -Fq '05c7fa3a8e63' core/codesearch_engine.py
 apply_reviewable_overlay "discovery_v1"
 grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
 grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py

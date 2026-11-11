@@ -115,6 +115,81 @@ func TestResolveRelatedAliasCycleUnresolved(t *testing.T) {
 	}
 }
 
+// F2: a barrel of `export *` must not drown the answer in dead-end
+// traces. Only the row on the chain that ends at the definition is
+// signal; the rest is noise.
+func TestResolveRelatedBarrelDeadEnds(t *testing.T) {
+	defs := []relDef{{Path: "rag/holographic-memory.ts", Line: 1, Name: "HolographicMemoryField"}}
+	edges := []relEdge{
+		{From: "rag/index.ts", Line: 1, Target: "./holographic-memory", Star: true},
+		{From: "rag/index.ts", Line: 2, Target: "./base-indexer", Star: true},
+		{From: "rag/index.ts", Line: 3, Target: "./chunk-store", Star: true},
+	}
+	files := map[string]bool{
+		"rag/index.ts": true, "rag/holographic-memory.ts": true,
+		"rag/base-indexer.ts": true, "rag/chunk-store.ts": true,
+	}
+	rows := resolveRelated("HolographicMemoryField", defs, edges, nil, files)
+	if len(rows) != 2 {
+		t.Fatalf("barrel rows = %+v, want def + 1 live re-export", rows)
+	}
+	kinds := map[string]int{}
+	for _, r := range rows {
+		kinds[r.Kind]++
+		if strings.Contains(r.Detail, "not found there") {
+			t.Errorf("dead-end row kept: %+v", r)
+		}
+	}
+	if kinds["def"] != 1 || kinds["re-export"] != 1 {
+		t.Errorf("barrel kinds = %v, want 1 def + 1 re-export", kinds)
+	}
+	if !strings.Contains(rows[1].Detail, "defined rag/holographic-memory.ts:1") {
+		t.Errorf("live re-export wrong: %+v", rows[1])
+	}
+}
+
+// F2: when no definition is found anywhere, the trace is the only
+// information — it is kept whole, not filtered to empty.
+func TestResolveRelatedNoDefKeepsTrace(t *testing.T) {
+	defs := []relDef{{Path: "other.ts", Line: 1, Name: "Other"}}
+	edges := []relEdge{
+		{From: "index.ts", Line: 1, Target: "./a", Star: true},
+		{From: "index.ts", Line: 2, Target: "./b", Star: true},
+	}
+	files := map[string]bool{"index.ts": true, "a.ts": true, "b.ts": true}
+	rows := resolveRelated("Missing", defs, edges, nil, files)
+	if len(rows) != 2 {
+		t.Fatalf("no-def rows = %+v, want the full 2-row trace", rows)
+	}
+	for _, r := range rows {
+		if !strings.Contains(r.Detail, "not found there") {
+			t.Errorf("no-def row wrong: %+v", r)
+		}
+	}
+}
+
+// F2 (a): a TS class name is a type_identifier in the TS grammar,
+// not an identifier — the shared def query must accept both, or
+// --related never sees a class definition.
+func TestExtractRelatedJSTSClass(t *testing.T) {
+	text := "export class HolographicMemoryField {\n  constructor() {}\n}\n\n" +
+		"export interface FieldConfig {\n  dim: number;\n}\n\n" +
+		"export enum Color {\n  Red = 1,\n}\n"
+	defs, _, _, ok := extractRelated("rag/holographic-memory.ts", text)
+	if !ok {
+		t.Fatal("expected ok for valid TS")
+	}
+	names := map[string]bool{}
+	for _, d := range defs {
+		names[d.Name] = true
+	}
+	for _, want := range []string{"HolographicMemoryField", "FieldConfig", "Color"} {
+		if !names[want] {
+			t.Errorf("defs = %+v, want %s", defs, want)
+		}
+	}
+}
+
 func TestResolveRelatedFFI(t *testing.T) {
 	defs := []relDef{{Path: "bind.mjs", Line: 5, Name: "getGraphParametersFlat"}}
 	bridges := []relBridge{

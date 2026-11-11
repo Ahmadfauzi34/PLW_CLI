@@ -128,14 +128,24 @@ const jsDefQuery = `[
 	(variable_declarator name: (identifier) @name value: (function_expression body: (statement_block) @body) @def)
 ]`
 
+// tsDefQuery is jsDefQuery with the class-name pattern widened: in the
+// TypeScript grammar a class name is a type_identifier, not an
+// identifier (F2: --related never saw a TS class definition). The
+// alternation cannot live in jsDefQuery itself: tree-sitter-javascript
+// has no type_identifier node, so the shared query would fail to
+// compile for .js/.mjs/.cjs (caught by TestExtractRelatedJS).
+var tsDefQuery = strings.Replace(jsDefQuery,
+	"(class_declaration name: (identifier) @name)",
+	"(class_declaration name: [(identifier) (type_identifier)] @name)", 1)
+
 var callerDefLangs = []callLang{
 	{".js", grammars.JavascriptLanguage, jsDefQuery},
 	{".mjs", grammars.JavascriptLanguage, jsDefQuery},
 	{".cjs", grammars.JavascriptLanguage, jsDefQuery},
-	{".ts", grammars.TypescriptLanguage, jsDefQuery},
-	{".mts", grammars.TypescriptLanguage, jsDefQuery},
-	{".cts", grammars.TypescriptLanguage, jsDefQuery},
-	{".tsx", grammars.TsxLanguage, jsDefQuery},
+	{".ts", grammars.TypescriptLanguage, tsDefQuery},
+	{".mts", grammars.TypescriptLanguage, tsDefQuery},
+	{".cts", grammars.TypescriptLanguage, tsDefQuery},
+	{".tsx", grammars.TsxLanguage, tsDefQuery},
 }
 
 var callerDefSpecStore = newSpecStore[callSpec]()

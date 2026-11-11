@@ -287,3 +287,33 @@ A local CGO_ENABLED=0 build is byte-identical to the CI artifact
 `go vet` bersih, `go test` OK (TestVersionLine unchanged — it
 tests versionLine(), not build.sh), black-box 91/91. Binary
 commit `d81e06b64a49` (same source as before), schema tetap go9.
+
+## F2 related: TS class + barrel noise (2026-11-11, PLW F2)
+Two fixes in one engine change, schema stays go9. (a) `jsDefQuery`'s
+class pattern now accepts `type_identifier` as well as `identifier` —
+in the TS grammar a class name is a `type_identifier`, so `--related`
+never saw a TS class definition (interface/type-alias already used
+`type_identifier` in tsChunkExtra, enum's `(identifier)` verified
+correct empirically). The alternation cannot live in the shared query:
+tree-sitter-javascript has no `type_identifier` node, so the query
+would fail to compile for .js/.mjs/.cjs — hence `tsDefQuery`
+(callers.go, built from jsDefQuery by one string replacement) for
+TS/TSX grammars only; caught live by TestExtractRelatedJS going red,
+fixed by the split. (b) `resolveRelated` is now two-phase: re-export
+rows are collected with the node they point at, then only rows on
+live chains are emitted — a node is live when its file defines the
+name as it arrives there (local name, alias-aware) or re-exports it
+onward to a live node (fixpoint, cycle-safe). When no chain reaches a
+definition of the queried name and there is no def row, the whole
+trace is kept (it is the only information). Falsifier: a barrel of 20
+`export *` went from 20 "(definition not found there)" rows to def +
+1 live re-export; no-def query keeps its full 3-row trace.
+Real bug caught by the tests during this change: `traceAdd` shared
+the `seen` dedup map with `add`, so every trace row counted as
+already-emitted and phase 2 emitted nothing — now a separate
+`traceSeen` map (the first `go test` run after the change failed 5
+related tests on exactly this). `go vet` bersih, `go test` OK (+3
+unit test F2), black-box 91/91, F2 battery 7/7. Binary commit
+`05c7fa3a8e63`, digest
+`f7ef3778d9407a1daa5da223bc959d64ee85a7000597a9ca0fe3d228884dedca`,
+schema tetap go9.

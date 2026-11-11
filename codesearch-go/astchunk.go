@@ -45,7 +45,8 @@ const (
 // struct, enum, trait, impl, type alias), Python (def, class).
 // JS/TS reuse the callers def query (function, method, class,
 // arrow/function-expression declarators) plus TS-only type declarations;
-// the query strings concatenate as two pattern lists.
+// TS uses tsDefQuery (callers.go), whose class pattern also accepts
+// type_identifier. The query strings concatenate as two pattern lists.
 type astLang struct {
 	ext   string
 	lang  func() *gotreesitter.Language
@@ -82,11 +83,11 @@ var astLangs = []astLang{
 	{".js", grammars.JavascriptLanguage, jsDefQuery},
 	{".mjs", grammars.JavascriptLanguage, jsDefQuery},
 	{".cjs", grammars.JavascriptLanguage, jsDefQuery},
-	{".ts", grammars.TypescriptLanguage, jsDefQuery + tsChunkExtra},
-	{".mts", grammars.TypescriptLanguage, jsDefQuery + tsChunkExtra},
-	{".cts", grammars.TypescriptLanguage, jsDefQuery + tsChunkExtra},
-	{".tsx", grammars.TsxLanguage, jsDefQuery + tsChunkExtra},
-	{".jsx", grammars.TsxLanguage, jsDefQuery + tsChunkExtra},
+	{".ts", grammars.TypescriptLanguage, tsDefQuery + tsChunkExtra},
+	{".mts", grammars.TypescriptLanguage, tsDefQuery + tsChunkExtra},
+	{".cts", grammars.TypescriptLanguage, tsDefQuery + tsChunkExtra},
+	{".tsx", grammars.TsxLanguage, tsDefQuery + tsChunkExtra},
+	{".jsx", grammars.TsxLanguage, tsDefQuery + tsChunkExtra},
 }
 
 type compiledSpec struct {

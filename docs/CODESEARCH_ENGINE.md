@@ -96,8 +96,10 @@ To pin a new engine build:
 
 1. rebuild with `codesearch-go/build.sh`;
 2. take the SHA-256 of the built binary;
-3. add one line to `PINNED_ENGINE_DIGESTS` **in the same commit** as
-   the engine change (the CI pin check fails the build otherwise).
+3. **replace** the reproducible-build line in `PINNED_ENGINE_DIGESTS`
+   **in the same commit** as the engine change (the CI pin check
+   fails the build otherwise). Release-asset lines stay — they pin
+   published artifacts, so an old released engine keeps working.
 
 The escape hatch is explicit and recorded, never silent:
 `CODESEARCH_ALLOW_UNPINNED=1` runs an unpinned engine, and every
