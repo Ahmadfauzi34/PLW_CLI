@@ -160,6 +160,10 @@ apply_reviewable_overlay "agent_friendly_v1"
 grep -Fq '_top_check_findings' hott_kernel.py
 grep -Fq '_resolve_ast_positionals' plw_cli.py
 grep -Fq 'Task pipeline, in order' plw_cli.py
+apply_reviewable_overlay "root_flag_v1"
+grep -Fq '_root_flag' plw_cli.py
+grep -Fq '_root_flag_from_argv' hott_kernel.py
+grep -Fq 'Every command that takes [root] also accepts --root DIR' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

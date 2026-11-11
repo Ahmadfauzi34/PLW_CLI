@@ -1,0 +1,508 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -578,6 +578,19 @@
+     print("-" * 60)
+ 
+ 
++def _root_flag(args: List[str]) -> Optional[str]:
++    """Return the --root DIR value if present, else None.
++
++    B1: every command that takes a [root] positional also accepts --root DIR;
++    the flag wins over the positional. Manual parsers resolve it after their
++    positional scan; argparse parsers use dest="root_flag" for the same rule.
++    """
++    for i, arg in enumerate(args):
++        if arg == "--root" and i + 1 < len(args):
++            return args[i + 1]
++    return None
++
++
+ def cmd_context(args: List[str]) -> int:
+     if not args or args[0] in ("-h", "--help"):
+         print("Usage: plw context <query> [root] [--target file[,file]] [--budget N] [--max-hops N] [--cache-mode auto|refresh|off] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]")
+@@ -598,6 +611,7 @@
+     if i < len(args) and not args[i].startswith("-"):
+         root = args[i]
+         i += 1
++    root = _root_flag(args) or root
+ 
+     while i < len(args):
+         arg = args[i]
+@@ -695,6 +709,7 @@
+     if i < len(args) and not args[i].startswith("-"):
+         root = args[i]
+         i += 1
++    root = _root_flag(args) or root
+     while i < len(args):
+         arg = args[i]
+         if arg in ("--target", "--targets") and i + 1 < len(args):
+@@ -727,6 +742,9 @@
+             proactive_truth = False
+         elif arg == "--json":
+             as_json = True
++        elif arg == "--root" and i + 1 < len(args):
++            # Consumed here; resolved after the loop so --root wins over the positional.
++            i += 1
+         else:
+             print(f"[PLW Error] Unknown transitions argument: {arg}", file=sys.stderr)
+             return 2
+@@ -846,6 +864,7 @@
+     if i < len(args) and not args[i].startswith("-"):
+         root = args[i]
+         i += 1
++    root = _root_flag(args) or root
+ 
+     while i < len(args):
+         arg = args[i]
+@@ -920,6 +939,7 @@
+     if i < len(args) and not args[i].startswith("-"):
+         root = args[i]
+         i += 1
++    root = _root_flag(args) or root
+ 
+     while i < len(args):
+         arg = args[i]
+@@ -952,6 +972,7 @@
+     if i < len(args) and not args[i].startswith("-"):
+         root = args[i]
+         i += 1
++    root = _root_flag(args) or root
+ 
+     while i < len(args):
+         if args[i] == "--cache-mode" and i + 1 < len(args):
+@@ -1298,6 +1319,9 @@
+         arg = args[i]
+         if arg == "--json":
+             as_json = True
++        elif arg == "--root" and i + 1 < len(args):
++            # Consumed here; resolved after the loop so --root wins over the positional.
++            i += 1
+         elif arg == "--reference" and i + 1 < len(args):
+             reference = args[i + 1]
+             i += 1
+@@ -1312,6 +1336,7 @@
+         i += 1
+     if positional:
+         root = positional[0]
++    root = _root_flag(args) or root
+     try:
+         result = compare_simplification(reference, root) if reference else analyze_simplification(root)
+     except Exception as exc:
+@@ -2240,7 +2265,7 @@
+             read_resources = False
+             i += 1
+             continue
+-        if arg in ("--file", "--selector", "--cache-mode"):
++        if arg in ("--file", "--selector", "--cache-mode", "--root"):
+             if i + 1 >= len(args):
+                 print(f"[PLW Error] {arg} requires a value", file=sys.stderr)
+                 return 2
+@@ -2249,6 +2274,8 @@
+                 file_filter = value
+             elif arg == "--selector":
+                 selector_filter = value
++            elif arg == "--root":
++                pass  # consumed here; resolved below so --root wins over the positional
+             else:
+                 cache_mode = value
+             i += 2
+@@ -2263,6 +2290,7 @@
+         return 2
+     if positional:
+         root = positional[0]
++    root = _root_flag(args) or root
+     if cache_mode is not None:
+         cache_error = hott_kernel._set_graph_cache_mode(cache_mode)
+         if cache_error:
+@@ -2298,6 +2326,7 @@
+     store_dir: Optional[str] = None
+     as_json = False
+     read_resources = True
++    root_flag: Optional[str] = None
+     positional: List[str] = []
+     i = 0
+     value_flags = {"--cache-mode"}
+@@ -2313,6 +2342,13 @@
+             read_resources = False
+             i += 1
+             continue
++        if arg == "--root":
++            if i + 1 >= len(args):
++                print("[PLW Error] --root requires a value", file=sys.stderr)
++                return None
++            root_flag = args[i + 1]
++            i += 2
++            continue
+         if arg in value_flags:
+             if i + 1 >= len(args):
+                 print(f"[PLW Error] {arg} requires a value", file=sys.stderr)
+@@ -2333,6 +2369,7 @@
+         "store_dir": store_dir,
+         "as_json": as_json,
+         "read_resources": read_resources,
++        "root_flag": root_flag,
+         "positional": positional,
+     }
+ 
+@@ -2353,7 +2390,7 @@
+         print(f"[PLW Error] {command} requires <snapshot.json> and accepts at most one root path", file=sys.stderr)
+         return None
+     snapshot_path = positional[0]
+-    root = positional[1] if len(positional) == 2 else "."
++    root = parsed.get("root_flag") or (positional[1] if len(positional) == 2 else ".")
+     return snapshot_path, root, bool(parsed["as_json"])
+ 
+ 
+@@ -2368,14 +2405,14 @@
+     parsed: Dict[str, Any] = {
+         "as_json": False, "read_resources": True, "cache_mode": None,
+         "min_gap_px": 0.0, "max_elements": 200, "max_issues": 100,
+-        "positional": [],
++        "positional": [], "root_flag": None,
+     }
+     i = 0
+     while i < len(args):
+         arg = args[i]
+         if arg == "--json": parsed["as_json"] = True; i += 1; continue
+         if arg == "--no-resources": parsed["read_resources"] = False; i += 1; continue
+-        if arg in {"--min-gap", "--max-elements", "--max-issues", "--cache-mode"}:
++        if arg in {"--min-gap", "--max-elements", "--max-issues", "--cache-mode", "--root"}:
+             if i + 1 >= len(args):
+                 print(f"[PLW Error] {arg} requires a value", file=sys.stderr); return None
+             value = args[i+1]
+@@ -2383,6 +2420,7 @@
+                 if arg == "--min-gap": parsed["min_gap_px"] = float(value)
+                 elif arg == "--max-elements": parsed["max_elements"] = int(value)
+                 elif arg == "--max-issues": parsed["max_issues"] = int(value)
++                elif arg == "--root": parsed["root_flag"] = value
+                 else: parsed["cache_mode"] = value
+             except ValueError:
+                 print(f"[PLW Error] invalid value for {arg}: {value}", file=sys.stderr); return None
+@@ -2401,7 +2439,7 @@
+ def _build_practical_ui_map(parsed: Dict[str, Any], *, inspect_id: Optional[str] = None) -> Dict[str, Any]:
+     positional = parsed["positional"]
+     snapshot_path = positional[0]
+-    root = positional[2] if inspect_id is not None and len(positional) == 3 else (positional[1] if inspect_id is None and len(positional) == 2 else ".")
++    root = parsed.get("root_flag") or (positional[2] if inspect_id is not None and len(positional) == 3 else (positional[1] if inspect_id is None and len(positional) == 2 else "."))
+     if not _apply_ui_reference_cache_mode(parsed.get("cache_mode"), as_json=bool(parsed.get("as_json"))):
+         raise UIMapperError("invalid graph cache mode")
+     payload, graph, ownership = _load_ui_reference_inputs(snapshot_path, root, read_resources=bool(parsed["read_resources"]))
+@@ -2897,6 +2935,7 @@
+     import argparse
+     parser=argparse.ArgumentParser(prog="plw ui capture-script")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--revision", required=True)
+     parser.add_argument("--state", default="default")
+     parser.add_argument("--fixture", default="default")
+@@ -2904,6 +2943,7 @@
+     parser.add_argument("--no-resources", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts=parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     try:
+         graph=hott_kernel._build_kernel_graph(opts.root)
+         ownership=analyze_angular_ownership(graph, read_resources=not opts.no_resources)
+@@ -2937,10 +2977,12 @@
+     parser = argparse.ArgumentParser(prog="plw ui static")
+     parser.add_argument("query")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--selector")
+     parser.add_argument("--max-candidates", type=int, default=8)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     try:
+         graph = hott_kernel._build_kernel_graph(opts.root)
+         result = static_ui_reference(opts.query, graph,
+@@ -3036,7 +3078,7 @@
+         print("[PLW Error] runtime-ui-reference requires <lease-id> <snapshot.json> and accepts at most one root path", file=sys.stderr)
+         return 2
+     lease_id, snapshot_path = positional[0], positional[1]
+-    root = positional[2] if len(positional) == 3 else "."
++    root = parsed.get("root_flag") or (positional[2] if len(positional) == 3 else ".")
+     as_json = bool(parsed["as_json"])
+     if not _apply_ui_reference_cache_mode(parsed["cache_mode"], as_json=as_json):
+         return 2
+@@ -3076,9 +3118,10 @@
+         "cache_mode": None, "store_dir": None, "lease_id": None,
+         "constraints_path": None, "proximity_px": None, "focus_ui_ids": [],
+         "as_json": False, "read_resources": True, "positional": [],
++        "root_flag": None,
+     }
+     i = 0
+-    value_flags = {"--cache-mode", "--store-dir", "--lease-id", "--constraints", "--proximity", "--focus"}
++    value_flags = {"--cache-mode", "--store-dir", "--lease-id", "--constraints", "--proximity", "--focus", "--root"}
+     while i < len(args):
+         arg = args[i]
+         if arg == "--json":
+@@ -3108,6 +3151,8 @@
+                 parsed["lease_id"] = value
+             elif arg == "--store-dir":
+                 parsed["store_dir"] = value
++            elif arg == "--root":
++                parsed["root_flag"] = value
+             else:
+                 parsed["cache_mode"] = value
+             i += 2
+@@ -4170,6 +4215,7 @@
+     import argparse
+     parser = argparse.ArgumentParser(prog="plw fullstack-state")
+     parser.add_argument("root")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("behavior_json")
+     parser.add_argument("postcondition_json")
+     parser.add_argument("spec_json")
+@@ -4177,7 +4223,15 @@
+     parser.add_argument("--ui-reference", action="append", default=[])
+     parser.add_argument("--current-revision", required=True)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+-    opts = parser.parse_args(list(args))
++    # argparse cannot mix a nargs="?" leading positional with required
++    # positionals after it when an optional sits between them, so root stays
++    # required and a missing leading root is supplied here: --root alone
++    # (or any flag-first call) still works, and no-args still errors.
++    argv = list(args)
++    if argv and argv[0].startswith("-"):
++        argv.insert(0, ".")
++    opts = parser.parse_args(argv)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     try:
+         behavior = load_execution_backed_scenario_evidence(opts.behavior_json)
+         postcondition = load_full_stack_json_artifact(opts.postcondition_json)
+@@ -4209,10 +4263,12 @@
+     import argparse
+     parser = argparse.ArgumentParser(prog="plw topology")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--full-edges", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     result = hott_kernel.kernel_topology(
+         opts.root, top_n=opts.top, include_edges=opts.full_edges
+     )
+@@ -4246,11 +4302,14 @@
+     parser = argparse.ArgumentParser(prog=prog)
+     parser.add_argument("task")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--target", action="append", default=[])
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+-    return parser.parse_args(args)
++    opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    return opts
+ 
+ 
+ def cmd_resolve_target(args: List[str]) -> int:
+@@ -4383,8 +4442,10 @@
+     parser.add_argument("operation", choices=("select", "capability-match"))
+     parser.add_argument("task")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     result = run_candidate_provenance(
+         opts.root,
+         opts.task,
+@@ -4637,8 +4698,10 @@
+     import argparse
+     parser = argparse.ArgumentParser(prog="plw doctor")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     result = portable_doctor(opts.root)
+     return _print_portable_result(result, as_json=opts.as_json, title="PLW Doctor")
+ 
+@@ -4683,6 +4746,7 @@
+     parser = argparse.ArgumentParser(prog="plw agent")
+     parser.add_argument("operation", choices=("orient",))
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--task", required=True)
+     parser.add_argument("--target", action="append", default=[])
+     parser.add_argument("--ui-selector", default=None)
+@@ -4690,6 +4754,7 @@
+     parser.add_argument("--depth", default="auto")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     result = hott_kernel.kernel_work(
+         scan_root=opts.root,
+         task=opts.task,
+@@ -4810,6 +4875,7 @@
+     orient -> resolve-target -> evidence-needs -> capability-match -> candidate select
+     (semantic route is the predictive side-branch: use it when a name stays opaque after topology.)
+   Argument order: write the query/target first, root second (e.g. plw context <query> [root]).
++    Every command that takes [root] also accepts --root DIR; the flag wins over the positional.
+     plw ast accepts both orders; --root DIR is always explicit.
+ 
+ 1. Orientation & fast mapping
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -3826,6 +3826,14 @@
+     }
+ 
+ 
++def _root_flag_from_argv(default: str) -> str:
++    """--root DIR in sys.argv wins over the positional root (B1)."""
++    for index, argument in enumerate(sys.argv):
++        if argument == "--root" and index + 1 < len(sys.argv):
++            return sys.argv[index + 1]
++    return default
++
++
+ def main():
+     global _MEMORY_SCOPE_EXPLICIT
+ 
+@@ -3840,17 +3848,17 @@
+                 "memory_state_dir": "--memory-state-dir PATH (or AI_STUDIO_STATE_DIR)",
+             },
+             "usage": {
+-                "work": "python3 hott_kernel.py work <task> [root] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep]",
+-                "analyze": "python3 hott_kernel.py analyze [root] [--analyzers a,b] [--output full|summary|findings|graph]",
++                "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep]",
++                "analyze": "python3 hott_kernel.py analyze [root] [--root DIR] [--analyzers a,b] [--output full|summary|findings|graph]",
+                 "analyzers": "python3 hott_kernel.py analyzers",
+-                "cache": "python3 hott_kernel.py cache status|refresh|clear [root]",
+-                "impact": "python3 hott_kernel.py impact <file> [root] [--output full|summary]",
+-                "outline": "python3 hott_kernel.py outline <file> [root]",
+-                "brief": "python3 hott_kernel.py brief <file> [root] [--output full|summary]",
+-                "context": "python3 hott_kernel.py context <query> [root] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
+-                "establish": "python3 hott_kernel.py establish [root] [--baseline path]",
+-                "synthesize": "python3 hott_kernel.py synthesize [root] [--output full|summary]",
+-                "steer": "python3 hott_kernel.py steer [root] [--output full|summary] [--baseline path]",
++                "cache": "python3 hott_kernel.py cache status|refresh|clear [root] [--root DIR]",
++                "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
++                "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
++                "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++                "context": "python3 hott_kernel.py context <query> [root] [--root DIR] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
++                "establish": "python3 hott_kernel.py establish [root] [--root DIR] [--baseline path]",
++                "synthesize": "python3 hott_kernel.py synthesize [root] [--root DIR] [--output full|summary]",
++                "steer": "python3 hott_kernel.py steer [root] [--root DIR] [--output full|summary] [--baseline path]",
+                 "memory_store": "python3 hott_kernel.py memory_store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]",
+                 "memory_recall": "python3 hott_kernel.py memory_recall [query] [--type t] [--tags t1,t2] [--limit 20]",
+                 "memory_analyze": "python3 hott_kernel.py memory_analyze [--analyzers a,b] [--output full|summary] [--include-historical] [--include-provenance]",
+@@ -3875,8 +3883,8 @@
+                 "fiber_switch": "python3 hott_kernel.py fiber switch <new_task> <new_focus>",
+                 "fiber_transport": "python3 hott_kernel.py fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]",
+                 "fiber_list_archives": "python3 hott_kernel.py fiber list_archives",
+-                "xanalyze": "python3 hott_kernel.py xanalyze [root] [--output summary|full] [--no-store] [--analyzers a,b]",
+-                "xsteer": "python3 hott_kernel.py xsteer [root] [--output full|summary]",
++                "xanalyze": "python3 hott_kernel.py xanalyze [root] [--root DIR] [--output summary|full] [--no-store] [--analyzers a,b]",
++                "xsteer": "python3 hott_kernel.py xsteer [root] [--root DIR] [--output full|summary]",
+                 "xcontext": "python3 hott_kernel.py xcontext <file_path>",
+             },
+         }, indent=2))
+@@ -3952,6 +3960,7 @@
+             ))
+         task = sys.argv[2]
+         root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         targets: List[str] = []
+         goal = "auto"
+         depth = "auto"
+@@ -4024,6 +4033,7 @@
+ 
+     elif mode == "analyze":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+ 
+         # Parse flags
+         analyzers = None
+@@ -4070,6 +4080,7 @@
+             if len(sys.argv) > 3 and not sys.argv[3].startswith("--")
+             else "."
+         )
++        root = _root_flag_from_argv(root)
+         _emit_cli_result(kernel_cache(action, root))
+ 
+     elif mode == "impact":
+@@ -4080,6 +4091,7 @@
+             ))
+         target = sys.argv[2]
+         root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "full"
+         for i, arg in enumerate(sys.argv):
+             if arg == "--output" and i + 1 < len(sys.argv):
+@@ -4095,6 +4107,7 @@
+             ))
+         target = sys.argv[2]
+         root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         result = kernel_outline(root, target)
+         _emit_cli_result(result)
+ 
+@@ -4106,6 +4119,7 @@
+             ))
+         target = sys.argv[2]
+         root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "full"
+         for i, arg in enumerate(sys.argv):
+             if arg == "--output" and i + 1 < len(sys.argv):
+@@ -4115,6 +4129,7 @@
+ 
+     elif mode == "cycle_break":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         target_file = None
+         output_mode = "full"
+         for i, arg in enumerate(sys.argv):
+@@ -4133,6 +4148,7 @@
+             ))
+         query = sys.argv[2]
+         root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         target_files: List[str] = []
+         budget_tokens = DEFAULT_BUDGET_TOKENS
+         max_hops = DEFAULT_MAX_HOPS
+@@ -4191,6 +4207,7 @@
+ 
+     elif mode == "establish":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         baseline_path = None
+         for i, arg in enumerate(sys.argv):
+             if arg == "--baseline" and i + 1 < len(sys.argv):
+@@ -4200,6 +4217,7 @@
+ 
+     elif mode == "synthesize":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "full"
+         for i, arg in enumerate(sys.argv):
+             if arg == "--output" and i + 1 < len(sys.argv):
+@@ -4209,6 +4227,7 @@
+ 
+     elif mode == "steer":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "full"
+         baseline_path = None
+         for i, arg in enumerate(sys.argv):
+@@ -4616,6 +4635,7 @@
+ 
+     elif mode == "xanalyze":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "summary"
+         auto_store = True
+         analyzers = None
+@@ -4631,6 +4651,7 @@
+ 
+     elif mode == "xsteer":
+         root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
++        root = _root_flag_from_argv(root)
+         output_mode = "full"
+         for i, arg in enumerate(sys.argv):
+             if arg == "--output" and i + 1 < len(sys.argv):
