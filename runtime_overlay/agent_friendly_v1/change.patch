@@ -1,0 +1,324 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2104,6 +2104,9 @@
+     # Step 4: Filter output berdasarkan mode
+     if output_mode == "summary":
+         base["unified_summary"] = unified_summary
++        top_findings, findings_truncated = _top_check_findings(analyzer_output)
++        base["findings"] = top_findings
++        base["findings_truncated"] = findings_truncated
+         return base
+ 
+     elif output_mode == "findings":
+@@ -2130,6 +2133,43 @@
+     return counts
+ 
+ 
++_CHECK_FINDINGS_LIMIT = 100
++
++
++def _top_check_findings(
++    analyzer_output: Dict[str, Any],
++    limit: int = _CHECK_FINDINGS_LIMIT,
++) -> tuple:
++    """Flatten actionable findings for the `plw check --json` envelope.
++
++    The summary envelope used to carry only counts, so an agent had to
++    open the analyzer cache file to read a single finding — and the
++    human-readable path could never list one either, because it reads
++    the same top-level `findings` key. This returns the actionable
++    findings (critical/error/high/medium — anything at least as severe
++    as high), each tagged with its analyzer, in a deterministic order
++    (severity, analyzer, file/node, full JSON), bounded to `limit` with
++    a truncation flag. Low/info findings stay in the analyzer cache.
++    """
++    rank = {"critical": 0, "error": 0, "high": 1, "medium": 2}
++    collected = []
++    for name, result in analyzer_output.get("results", {}).items():
++        for finding in result.get("findings", []):
++            sev = finding.get("severity", "info")
++            if sev not in rank:
++                continue
++            item = dict(finding)
++            item.setdefault("analyzer", name)
++            collected.append(item)
++    collected.sort(key=lambda f: (
++        rank.get(f.get("severity", "medium"), 2),
++        f.get("analyzer", ""),
++        f.get("file", "") or f.get("node", ""),
++        json.dumps(f, sort_keys=True, ensure_ascii=False),
++    ))
++    return collected[:limit], len(collected) > limit
++
++
+ def kernel_impact(
+     scan_root: str,
+     target_file: str,
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -512,7 +512,10 @@
+     if not critical_findings and failed == 0:
+         print("✓ PASS: No critical architectural violations or circular imports detected.")
+         if total > 0:
+-            print(f"  (Note: {total} low/info advisory findings present. Use --json to inspect).")
++            by_sev = summary.get("findings_by_severity", {}) or {}
++            parts = [f"{n} {s}" for s, n in by_sev.items() if n]
++            detail = ", ".join(parts) if parts else f"{total} advisory"
++            print(f"  (Note: {detail} findings present. Use --json to inspect).")
+     else:
+         print(f"✗ ISSUES FOUND: {len(critical_findings)} critical/high severity findings:")
+         for f in critical_findings[:10]:
+@@ -4453,6 +4456,43 @@
+     return code
+ 
+ 
++def _resolve_ast_positionals(operation, pos1, pos2, flag_root):
++    """Resolve `plw ast` positionals to (root, query, error).
++
++    Canonical form is query-first: `plw ast callers <query> [root]`,
++    with `--root DIR` as the always-explicit form. The legacy root-first
++    form (`plw ast callers <root> <query>`) keeps working: two
++    positionals always mean root-first, and a single positional that
++    names an existing directory means root (query is then missing, as
++    before). `doctor` and `index` keep the legacy order — their first
++    positional is always the root.
++    """
++    if flag_root is not None:
++        root = Path(flag_root).expanduser().resolve()
++        if pos2 is not None:
++            if operation == "index":
++                return root, None, (
++                    "plw ast index --root DIR <status|warm|clean>: "
++                    "unexpected extra argument"
++                )
++            return root, None, (
++                "plw ast <op> <query> --root DIR: unexpected extra argument"
++            )
++        return root, pos1, None
++    if operation in ("doctor", "index"):
++        root = (
++            Path(pos1).expanduser().resolve()
++            if pos1 is not None else Path(".").resolve()
++        )
++        return root, pos2, None
++    if pos2 is not None:
++        # Two positionals: legacy root-first, unchanged.
++        return Path(pos1).expanduser().resolve(), pos2, None
++    if pos1 is not None and Path(pos1).expanduser().is_dir():
++        return Path(pos1).expanduser().resolve(), None, None
++    return Path(".").resolve(), pos1, None
++
++
+ def cmd_ast(args: List[str]) -> int:
+     """Tree-sitter structural queries via the codesearch-go engine.
+ 
+@@ -4470,15 +4510,20 @@
+     import argparse
+     parser = argparse.ArgumentParser(prog="plw ast")
+     parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor", "index"))
+-    parser.add_argument("root", nargs="?", default=".")
+-    parser.add_argument("query", nargs="?")
++    parser.add_argument("query", nargs="?", default=None)
++    parser.add_argument("root", nargs="?", default=None)
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--binary", default=None)
+     parser.add_argument("--cache-dir", default=None)
+     parser.add_argument("--timeout", type=int, default=120)
+     parser.add_argument("--limit", type=int, default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
+-    root = Path(opts.root).expanduser().resolve()
++    root, query, resolve_error = _resolve_ast_positionals(
++        opts.operation, opts.query, opts.root, opts.root_flag,
++    )
++    if resolve_error:
++        parser.error(resolve_error)
+     try:
+         from core.codesearch_engine import (
+             DEFAULT_TIMEOUT_S,
+@@ -4492,7 +4537,7 @@
+         )
+     except Exception as exc:  # engine module must never take the CLI down
+         result: Dict[str, Any] = error_envelope(
+-            opts.operation, str(root), opts.query or "",
++            opts.operation, str(root), query or "",
+             f"codesearch engine module unavailable: {exc}",
+         )
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+@@ -4502,19 +4547,23 @@
+         if opts.operation == "doctor":
+             result = doctor_envelope(root, opts.binary, opts.cache_dir)
+         elif opts.operation == "index":
+-            if (opts.query or "") not in ("status", "warm", "clean"):
++            if (query or "") not in ("status", "warm", "clean"):
+                 parser.error("plw ast index requires status|warm|clean")
+             binary, discovered_via = discover_codesearch(opts.binary)
+             result = run_index_command(
+-                opts.query, root, binary, discovered_via,
++                query, root, binary, discovered_via,
+                 timeout_s, opts.cache_dir,
+             )
+         else:
+-            if not opts.query:
+-                parser.error("plw ast defs|callers|related|search requires <query>")
++            if not query:
++                parser.error(
++                    "plw ast defs|callers|related|search requires <query> — "
++                    "write the query first, e.g. plw ast callers <name> [root], "
++                    "or use --root DIR"
++                )
+             binary, discovered_via = discover_codesearch(opts.binary)
+             # G8: a comma-separated query answers all names in one scan.
+-            names = [n.strip() for n in opts.query.split(",") if n.strip()] \
++            names = [n.strip() for n in query.split(",") if n.strip()] \
+                 if opts.operation in ("defs", "callers", "related") else []
+             if len(names) > 1:
+                 result = run_batch_query(
+@@ -4524,12 +4573,12 @@
+                 )
+             else:
+                 result = run_query(
+-                    opts.operation, root, opts.query,
++                    opts.operation, root, query,
+                     binary, discovered_via, timeout_s, opts.limit,
+                     opts.cache_dir,
+                 )
+     except EngineError as exc:
+-        result = error_envelope(opts.operation, str(root), opts.query or "", str(exc))
++        result = error_envelope(opts.operation, str(root), query or "", str(exc))
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+     else:
+@@ -4752,10 +4801,22 @@
+     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+         print("""PLW — Proof Logic Working & HoTT Kernel CLI
+ Usage:
++  Start here — new to PLW? Read top to bottom, then run:
++    plw doctor [root]                     -> readiness check
++    plw topology [root]                   -> map of the codebase
++    plw ast <defs|callers|related|search> <query> [root]  -> where things are defined / who calls them
++    plw agent orient [root] --task TASK   -> task entrypoint (orientation only, no execution)
++  Task pipeline, in order — each step reads the previous step's receipt:
++    orient -> resolve-target -> evidence-needs -> capability-match -> candidate select
++    (semantic route is the predictive side-branch: use it when a name stays opaque after topology.)
++  Argument order: write the query/target first, root second (e.g. plw context <query> [root]).
++    plw ast accepts both orders; --root DIR is always explicit.
++
++1. Orientation & fast mapping
+   plw doctor [root] [--json]
+       -> Verifies standalone binary/embedded skill readiness; Chromium is optional for static capabilities
+-  plw ast <defs|callers|related|search|doctor> [root] [query] [--binary PATH] [--timeout N] [--limit N] [--json]
+-      -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); callers are name-based leads, not proof
++  plw ast <defs|callers|related|search|doctor> <query> [root] [--root DIR] [--binary PATH] [--timeout N] [--limit N] [--json]
++      -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); write the query first, root second — a first word that names an existing directory is still read as root, and --root DIR is explicit; callers are name-based leads, not proof
+   plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--json]
+       -> Official target-first agent entrypoint; orientation only, no runtime/source mutation authority
+   plw capability list [--json]
+@@ -4790,8 +4851,10 @@
+       -> Compiles valid proof-gap transitions; never executes them
+   plw kan <file_or_query> [root] [--mode lan|ran|both] [--cache-mode MODE] [--json]
+       -> Imputes expected imports, callers, and conventions for new/isolated files
++
++2. Analysis, quality & context
+   plw check [root] [--analyzers a,b] [--json]
+-      -> Quick architectural and boundary violation check
++      -> Quick architectural and boundary violation check; --json includes high+medium findings (low/info stay in the analyzer cache)
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
+   plw brief <file> [root] [--json]
+@@ -4812,29 +4875,8 @@
+       -> Shows project-scoped transition outcome experience; never truth evidence
+   plw transition-model [--state-class sha256:...] [--json]
+   plw q-values [--state-class sha256:...] [--json]
+-  plw reconcile-outcomes [--record] [--json]
+-  plw lineage <sha256:id> [--json]
+-      -> Traces explicit parent-linked decision ancestry; never infers semantic causality
+-  plw accountability <sha256:decision-id> [--json]
+-      -> Audits who filtered/compacted evidence, the resulting evidence debt, and recovery duty
+-  plw accountability-chain <sha256:decision-id> [--limit N] [--json]
+-      -> Verifies and summarizes F111 relevance -> F112 delivery accountability without raw prompt/source
+-  plw action-lease acquire [--store-dir DIR] --allow-state-change [--json]
+-      -> Atomically consumes one authorization/freshness nonce pair for one allowlisted executor; reads the full chain bundle from stdin
+-  plw action-lease status <sha256:lease-id> [--json]
+-      -> Verifies lease state read-only; inspection never regrants executor-start authority
+-  plw action-outcome register [--store-dir DIR] --allow-state-change [--json]
+-      -> Claims one exact F121 lease handoff into a durable F122 attempt record; does not prove external execution started
+-  plw action-outcome record [--store-dir DIR] --allow-state-change [--json]
+-      -> Records one terminal executor observation as SUCCEEDED, FAILED, or INDETERMINATE without settling postconditions
+-  plw action-outcome status <sha256:lease-id> [--json]
+-      -> Reads attempt/outcome state; a registered attempt without terminal receipt remains unresolved
+-  plw action-adapter prepare [--store-dir DIR] --allow-state-change [--json]
+-      -> Persists one F123 dispatch intent for an exact unresolved F122 attempt; does not invoke a concrete adapter
+-  plw action-adapter observe [--store-dir DIR] --allow-state-change [--json]
+-      -> Records one adapter observation and forwards terminal observations into F122 without proving postconditions
+-  plw action-adapter status <sha256:lease-id> [--json]
+-      -> Reads dispatch/observation bridge state; missing observation remains unresolved
++
++3. UI & framework
+   plw angular-anchors [root] [--file FILE] [--selector SELECTOR] [--no-resources] [--json]
+   plw ui static <query> [root] [--selector SELECTOR] [--max-candidates N] [--json]
+   plw ui map <snapshot.json> [root] [--min-gap PX] [--json]
+@@ -4850,11 +4892,16 @@
+       -> Binds one F125 UI reference to verified F123 capture provenance without executing runtime
+   plw geometric-impact <snapshot.json> [root] [--focus UI_ID] [--constraints query.json] [--proximity PX] [--lease-id ID --store-dir DIR] [--no-resources] [--json]
+       -> Evaluates explicit geometric constraints and projects selected UI owners to bounded topology impact; read-only
++
++4. Governance, lease & proof (advanced)
++  Stage order — each stage reads the previous stage's receipt; never skip a stage:
++    F111 relevance -> F121 lease -> F122 attempt -> F123 dispatch -> F127 impact -> F128 evidence -> F129 coverage -> validation-request (F131) -> validation-authorization (F132) -> validation-lease (F133) -> F139 execution-backed -> F141 postcondition -> F142 fullstack
+   plw validation-plan <snapshot.json> [root] [--scenario-catalog catalog.json] [--max-scenarios N] [--focus UI_ID] [--constraints query.json] [--lease-id ID --store-dir DIR] [--json]
+       -> Plans a bounded recoverable validation scenario set from F127 impact; never executes renders/tests
+   plw validation-evidence <plan.json> <evidence.json> [--store-dir DIR] [--json]
+       -> Binds external evidence to exact F128 scenarios and separates verified receipts from exact content provenance
+   plw validation-coverage <plan.json> <evidence.json> <obligations.json> [--store-dir DIR] [--json]
++      -> Checks F129 coverage: plan + evidence + obligations in, coverage verdict out; run after validation-evidence
+   plw validation-coverage execution-backed <f139-binding.json> <obligations.json> [--json]
+       -> Re-derives F129 or F139 proof obligations read-only; complete coverage is still not postcondition proof
+   plw postcondition-proof <f139-binding.json> <f140-coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
+@@ -4868,14 +4915,46 @@
+   plw validation-lease acquire <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID --idempotency-key KEY [--lease-ttl-seconds N] [--store-dir DIR] --allow-state-change [--json]
+       -> Atomically consumes one exact F133 binding into one short-lived lease; no attempt or dispatch occurs
+   plw validation-lease status <sha256:lease-id> [--request-id ID] [--executor-id ID] [--store-dir DIR] [--json]
++      -> Reads one F133 lease state; inspection never regrants
+   plw validation-attempt register <lease-id> --attempt-key KEY --validator-id ID --executor-id ID --allow-state-change [--store-dir DIR] [--json]
++      -> Registers one attempt under an F133 lease; no execution happens
+   plw validation-attempt status <lease-id> [--request-id ID] [--executor-id ID] [--store-dir DIR] [--json]
++      -> Reads one validation attempt state; an attempt without a terminal observation stays unresolved
+   plw validation-dispatch prepare <attempt-id> --dispatch-key KEY --validator-id ID --executor-id ID --allow-state-change [--store-dir DIR] [--json]
++      -> Prepares one dispatch for a validation attempt; does not invoke an executor
+   plw validation-dispatch status <attempt-id> [--request-id ID] [--executor-id ID] [--store-dir DIR] [--json]
++      -> Reads one validation dispatch state
+   plw validation-runtime claim <dispatch-intent-id> --runtime-key KEY --allow-state-change [--store-dir DIR] [--json]
++      -> Claims runtime work for one dispatch intent; the claim alone proves no execution
+   plw validation-runtime observe <dispatch-intent-id> --dispatch-state STATE --reconciliation-state STATE [--terminal-status STATUS] [--observation-kind KIND] --observation-json JSON [--evidence-id sha256:...]... --allow-state-change [--store-dir DIR] [--json]
++      -> Records one runtime observation for a dispatch intent
+   plw validation-runtime status <dispatch-intent-id> [--store-dir DIR] [--json]
+       -> Reads a validation lease without regranting attempt or dispatch authority
++  plw action-lease acquire [--store-dir DIR] --allow-state-change [--json]
++      -> Atomically consumes one authorization/freshness nonce pair for one allowlisted executor; reads the full chain bundle from stdin
++  plw action-lease status <sha256:lease-id> [--json]
++      -> Verifies lease state read-only; inspection never regrants executor-start authority
++  plw action-outcome register [--store-dir DIR] --allow-state-change [--json]
++      -> Claims one exact F121 lease handoff into a durable F122 attempt record; does not prove external execution started
++  plw action-outcome record [--store-dir DIR] --allow-state-change [--json]
++      -> Records one terminal executor observation as SUCCEEDED, FAILED, or INDETERMINATE without settling postconditions
++  plw action-outcome status <sha256:lease-id> [--json]
++      -> Reads attempt/outcome state; a registered attempt without terminal receipt remains unresolved
++  plw action-adapter prepare [--store-dir DIR] --allow-state-change [--json]
++      -> Persists one F123 dispatch intent for an exact unresolved F122 attempt; does not invoke a concrete adapter
++  plw action-adapter observe [--store-dir DIR] --allow-state-change [--json]
++      -> Records one adapter observation and forwards terminal observations into F122 without proving postconditions
++  plw action-adapter status <sha256:lease-id> [--json]
++      -> Reads dispatch/observation bridge state; missing observation remains unresolved
++  plw reconcile-outcomes [--record] [--json]
++  plw lineage <sha256:id> [--json]
++      -> Traces explicit parent-linked decision ancestry; never infers semantic causality
++  plw accountability <sha256:decision-id> [--json]
++      -> Audits who filtered/compacted evidence, the resulting evidence debt, and recovery duty
++  plw accountability-chain <sha256:decision-id> [--limit N] [--json]
++      -> Verifies and summarizes F111 relevance -> F112 delivery accountability without raw prompt/source
++
++5. Install & other
+   plw install [--system | --bin-dir DIR] [--json]
+       -> Verifies F129 integrity and projects v1/v2 obligations with optional same-observation witness groups; never executes validators
+   plw memory <subcommand> [...]

@@ -156,6 +156,10 @@ apply_reviewable_overlay "kotlin_topology_v1"
 grep -Fq 'KOTLIN_SOURCE_EXTENSIONS' language_semantics.py
 grep -Fq 'kotlin_symbol_index' core/shared_graph.py
 grep -Fq 'stable_shared_graph (.ts/.tsx/.js/.jsx/.kt)' core/portable_agent.py
+apply_reviewable_overlay "agent_friendly_v1"
+grep -Fq '_top_check_findings' hott_kernel.py
+grep -Fq '_resolve_ast_positionals' plw_cli.py
+grep -Fq 'Task pipeline, in order' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
