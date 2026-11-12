@@ -1,0 +1,16 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4622,6 +4622,13 @@
+     print(f"# [{title}]")
+     if result.get("error"):
+         print("# Error: " + str(result.get("error")))
++        # The human rendering must carry the same pointer as the JSON
++        # rendering: an alias name is not a typo, and the agent reading
++        # this first must learn the canonical name here, not only via --json.
++        if result.get("alias_of"):
++            print("# Alias of: " + str(result.get("alias_of")))
++            if result.get("hint"):
++                print("# Hint: " + str(result.get("hint")))
+         return code
+     if "ready" in result:
+         print("# Version: " + str(result.get("version")))

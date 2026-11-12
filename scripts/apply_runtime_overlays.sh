@@ -192,6 +192,10 @@ grep -Fq '_engine_answer_summary' hott_kernel.py
 grep -Fq '# Engine answer: ' plw_cli.py
 apply_reviewable_overlay "doctor_ready_scope_v1"
 grep -Fq 'portable interface + target root; stable topology is a separate check' plw_cli.py
+apply_reviewable_overlay "describe_alias_human_v1"
+grep -Fq '# Alias of: ' plw_cli.py
+apply_reviewable_overlay "describe_group_op_alias_v1"
+grep -Fq '"obligations": "validation-coverage"' core/semantic_affordance.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

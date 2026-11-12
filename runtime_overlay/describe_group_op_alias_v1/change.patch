@@ -1,0 +1,58 @@
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -898,18 +898,27 @@
+ # canonical-only and `capability list` never shows these names.
+ # Deliberately excluded: ui-map (a separate command, not an alias of ui),
+ # codesearch/tree-sitter (ast is unregistered), capabilities/skills
+-# (capability/skill are unregistered).
++# (capability/skill are unregistered). Group-op names (validation,
++# execution, obligations, postcondition, chain, model, reconcile) ARE
++# included even though they come from argparse `choices`, not dispatch
++# tuples: they are the names the tool itself advertises in --help, so an
++# agent trying them first must get the pointer. lineage/accountability
++# need no entry (already canonical); memory must NOT be one (it is a
++# registered command of its own — the memory subsystem, not
++# transition-memory).
+ ALIAS_TO_CANONICAL = {
+     "audit-context": "accountability",
+     "affordance": "semantic",
+     "angular-ownership": "angular-anchors",
+     "bootstrap": "install",
++    "chain": "accountability-chain",
+     "codebase-topology": "topology",
+     "command-telemetry": "output-telemetry",
+     "context-accountability": "accountability",
+     "decision-lineage": "lineage",
+     "delayed-cost": "reconcile-outcomes",
+     "evidence-need": "evidence-needs",
++    "execution": "action-lease",
+     "execution-backed-evidence": "validation-scenario-bind",
+     "execution-lease": "action-lease",
+     "executor-adapter": "action-adapter",
+@@ -917,14 +926,18 @@
+     "full-stack-state": "fullstack-state",
+     "geometry-reference": "ui-reference",
+     "import-graph": "topology",
++    "model": "transition-model",
++    "obligations": "validation-coverage",
+     "observe-output": "compact-output",
+     "outcome-memory": "transition-memory",
+     "pack": "context",
+     "policy-values": "q-values",
++    "postcondition": "postcondition-proof",
+     "proof-obligations": "validation-coverage",
+     "proof-transitions": "transitions",
+     "prove-postcondition": "postcondition-proof",
+     "q-value": "q-values",
++    "reconcile": "reconcile-outcomes",
+     "runtime-attest": "attest-runtime",
+     "runtime-geometry-reference": "runtime-ui-reference",
+     "scenario-evidence": "validation-evidence",
+@@ -936,6 +949,7 @@
+     "target-resolve": "resolve-target",
+     "transition": "transitions",
+     "ui-impact": "geometric-impact",
++    "validation": "validation-lease",
+     "validation-authorize": "validation-authorization",
+     "validation-evidence-acceptance": "validation-result",
+     "validation-handoff": "validation-request",
