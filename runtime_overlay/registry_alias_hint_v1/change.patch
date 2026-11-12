@@ -1,0 +1,87 @@
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -890,11 +890,68 @@
+     return " ".join(re.findall(r"[a-z0-9_↔-]+", str(value or "").casefold()))
+ 
+ 
++# Names the CLI dispatch accepts that are not registered contracts.
++# Every key is a name `plw <name>` already accepts in plw_cli.py main();
++# every value is a registered canonical in COMMAND_CONTRACTS. The table
++# teaches describe_command to point at the canonical instead of returning
++# a bare not-registered error. It is data only: COMMAND_CONTRACTS stays
++# canonical-only and `capability list` never shows these names.
++# Deliberately excluded: ui-map (a separate command, not an alias of ui),
++# codesearch/tree-sitter (ast is unregistered), capabilities/skills
++# (capability/skill are unregistered).
++ALIAS_TO_CANONICAL = {
++    "audit-context": "accountability",
++    "affordance": "semantic",
++    "angular-ownership": "angular-anchors",
++    "bootstrap": "install",
++    "codebase-topology": "topology",
++    "command-telemetry": "output-telemetry",
++    "context-accountability": "accountability",
++    "decision-lineage": "lineage",
++    "delayed-cost": "reconcile-outcomes",
++    "evidence-need": "evidence-needs",
++    "execution-backed-evidence": "validation-scenario-bind",
++    "execution-lease": "action-lease",
++    "executor-adapter": "action-adapter",
++    "executor-outcome": "action-outcome",
++    "full-stack-state": "fullstack-state",
++    "geometry-reference": "ui-reference",
++    "import-graph": "topology",
++    "observe-output": "compact-output",
++    "outcome-memory": "transition-memory",
++    "pack": "context",
++    "policy-values": "q-values",
++    "proof-obligations": "validation-coverage",
++    "proof-transitions": "transitions",
++    "prove-postcondition": "postcondition-proof",
++    "q-value": "q-values",
++    "runtime-attest": "attest-runtime",
++    "runtime-geometry-reference": "runtime-ui-reference",
++    "scenario-evidence": "validation-evidence",
++    "scenario-plan": "validation-plan",
++    "semantics": "semantic",
++    "setup": "install",
++    "state-transition-model": "transition-model",
++    "self-simplify": "simplify",
++    "target-resolve": "resolve-target",
++    "transition": "transitions",
++    "ui-impact": "geometric-impact",
++    "validation-authorize": "validation-authorization",
++    "validation-evidence-acceptance": "validation-result",
++    "validation-handoff": "validation-request",
++    "validator-attempt": "validation-attempt",
++    "validator-dispatch": "validation-dispatch",
++    "validator-lease": "validation-lease",
++    "validator-runtime": "validation-runtime",
++    "workflow-audit-chain": "accountability-chain",
++}
++
++
+ def describe_command(command: str) -> Dict[str, Any]:
+     name = str(command or "").strip().lower().replace("_", "-")
+     contract = COMMAND_CONTRACTS.get(name)
+     if contract is None:
+-        return {
++        result = {
+             "schema_version": SCHEMA_VERSION,
+             "policy": POLICY,
+             "command": name,
+@@ -903,6 +960,14 @@
+             "authority": "descriptive_only",
+             "available_commands": sorted(COMMAND_CONTRACTS),
+         }
++        canonical = ALIAS_TO_CANONICAL.get(name)
++        if canonical is not None:
++            result["alias_of"] = canonical
++            result["hint"] = (
++                f"{name} is an alias of {canonical}; "
++                "describe the canonical name."
++            )
++        return result
+     return {
+         "schema_version": SCHEMA_VERSION,
+         "policy": POLICY,
