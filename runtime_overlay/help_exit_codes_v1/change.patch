@@ -1,0 +1,165 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -930,6 +930,9 @@
+ 
+ 
+ def cmd_check(args: List[str]) -> int:
++    if "-h" in args or "--help" in args:
++        print("Usage: plw check [root] [--analyzers a,b] [--cache-mode MODE] [--json] [--root DIR]")
++        return 0
+     root = "."
+     analyzers = None
+     cache_mode = None
+@@ -965,6 +968,9 @@
+ 
+ 
+ def cmd_steer(args: List[str]) -> int:
++    if "-h" in args or "--help" in args:
++        print("Usage: plw steer [root] [--cache-mode MODE] [--json] [--root DIR]")
++        return 0
+     root = "."
+     cache_mode = None
+     as_json = False
+@@ -2280,6 +2286,9 @@
+                 cache_mode = value
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw angular-anchors [root] [--json] [--no-resources] [--file FILE] [--selector SEL] [--cache-mode MODE] [--root DIR]")
++            return 0
+         if arg.startswith("-"):
+             print(f"[PLW Error] Unknown angular-anchors argument: {arg}", file=sys.stderr)
+             return 2
+@@ -2359,6 +2368,10 @@
+                 store_dir = args[i + 1]
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            positional = "<lease-id> <snapshot.json> [root]" if allow_store_dir else "<snapshot.json> [root]"
++            print(f"Usage: plw {command} {positional} [--json] [--no-resources] [--root DIR] [--cache-mode MODE]" + (" [--store-dir DIR]" if allow_store_dir else ""))
++            raise SystemExit(0)
+         if arg.startswith("-"):
+             print(f"[PLW Error] Unknown {command} argument: {arg}", file=sys.stderr)
+             return None
+@@ -2425,6 +2438,10 @@
+             except ValueError:
+                 print(f"[PLW Error] invalid value for {arg}: {value}", file=sys.stderr); return None
+             i += 2; continue
++        if arg in ("-h", "--help"):
++            usage = "plw ui inspect <snapshot.json> <ui-id> [root]" if inspect else "plw ui map <snapshot.json> [root]"
++            print(f"Usage: {usage} [--json] [--no-resources] [--root DIR] [--cache-mode MODE] [--min-gap N] [--max-elements N] [--max-issues N]")
++            raise SystemExit(0)
+         if arg.startswith("-"):
+             print(f"[PLW Error] Unknown ui {'inspect' if inspect else 'map'} argument: {arg}", file=sys.stderr); return None
+         parsed["positional"].append(arg); i += 1
+@@ -3009,6 +3026,9 @@
+     if not args:
+         print("Usage: plw ui <static|map|inspect|scenarios|diff|hunt|diagnose|reproduce|probe-plan|isolate|fix-plan|verify-fix|capture-script> ...", file=sys.stderr); return 2
+     sub,args=args[0],args[1:]
++    if sub in ("-h", "--help"):
++        print("Usage: plw ui <static|map|inspect|scenarios|diff|hunt|diagnose|reproduce|probe-plan|isolate|fix-plan|verify-fix|capture-script> ...")
++        return 0
+     if sub == "static": return cmd_ui_static(args)
+     if sub == "map": return cmd_ui_map(args)
+     if sub == "inspect": return cmd_ui_inspect(args)
+@@ -3157,6 +3177,9 @@
+                 parsed["cache_mode"] = value
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw geometric-impact <snapshot.json> [root] [--json] [--no-resources] [--root DIR] [--cache-mode MODE] [--store-dir DIR] [--lease-id ID] [--constraints FILE] [--proximity N] [--focus UI-ID]")
++            raise SystemExit(0)
+         if arg.startswith("-"):
+             print(f"[PLW Error] Unknown geometric-impact argument: {arg}", file=sys.stderr)
+             return None
+@@ -3235,6 +3258,9 @@
+     i = 0
+     while i < len(args):
+         arg = args[i]
++        if arg in ("-h", "--help"):
++            print("Usage: plw validation-plan <snapshot.json> [root] [--scenario-catalog FILE] [--max-scenarios N] [--json] [--no-resources] [--root DIR] [--cache-mode MODE] [--store-dir DIR] [--lease-id ID] [--constraints FILE] [--proximity N] [--focus UI-ID]")
++            raise SystemExit(0)
+         if arg in {"--scenario-catalog", "--max-scenarios"}:
+             if i + 1 >= len(args):
+                 print(f"[PLW Error] {arg} requires a value", file=sys.stderr)
+@@ -3340,6 +3366,9 @@
+             store_dir = args[i + 1]
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw validation-evidence <plan.json> <evidence.json> [--json] [--store-dir DIR]")
++            raise SystemExit(0)
+         if arg.startswith("--"):
+             print(f"[PLW Error] unknown validation-evidence option: {arg}", file=sys.stderr)
+             return None
+@@ -3411,6 +3440,10 @@
+             store_dir = args[i + 1]
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw validation-coverage <plan.json> <evidence.json> <obligations.json> [--json] [--store-dir DIR]")
++            print("Usage: plw validation-coverage execution-backed <f139-binding.json> <obligations.json> [--json]")
++            raise SystemExit(0)
+         if arg.startswith("--"):
+             print(f"[PLW Error] unknown validation-coverage option: {arg}", file=sys.stderr)
+             return None
+@@ -3525,6 +3558,9 @@
+                 executor_id = value
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw validation-request <plan.json> <evidence.json> <obligations.json> --validator-id ID --executor-id ID [--json] [--store-dir DIR]")
++            raise SystemExit(0)
+         if arg.startswith("--"):
+             print(f"[PLW Error] unknown validation-request option: {arg}", file=sys.stderr)
+             return None
+@@ -3752,6 +3788,9 @@
+             else: executor_id = value
+             i += 2
+             continue
++        if arg in ("-h", "--help"):
++            print("Usage: plw validation-authorization <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID [--json] [--store-dir DIR]")
++            raise SystemExit(0)
+         if arg.startswith("--"):
+             print(f"[PLW Error] unknown validation-authorization option: {arg}", file=sys.stderr)
+             return None
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -409,6 +409,21 @@
+ 
+ 
+ CODEBASE_SCHEMA_VERSION = "3.0.0-kernel"
++
++# Usage lines for modes whose --help must answer instead of being swallowed
++# as a positional (work: task, impact/outline/brief: file, memory/fiber:
++# subcommand). Strings mirror the usage map in main()'s top-level help
++# (work/impact/outline/brief) and the branches' own usage errors
++# (memory/fiber). Only modes listed here answer --help; every other mode
++# keeps its existing behavior.
++_MODE_HELP_USAGE = {
++    "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep]",
++    "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
++    "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
++    "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++    "memory": "python3 hott_kernel.py memory <submode> ...",
++    "fiber": "python3 hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]",
++}
+ PUBLIC_KERNEL_MODES = (
+     "work",
+     "analyze",
+@@ -4019,6 +4034,15 @@
+         ))
+         return
+ 
++    if ("--help" in sys.argv[2:] or "-h" in sys.argv[2:]) and mode in _MODE_HELP_USAGE:
++        print(json.dumps({
++            "tool": "hott_kernel",
++            "schema_version": "4.0.0-kernel",
++            "mode": mode,
++            "usage": _MODE_HELP_USAGE[mode],
++        }, indent=2))
++        return
++
+     if mode == "work":
+         if len(sys.argv) < 3 or sys.argv[2].startswith("--"):
+             _emit_cli_result(_kernel_error(

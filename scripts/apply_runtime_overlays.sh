@@ -179,6 +179,10 @@ grep -Fq 'formatter_class=argparse.RawDescriptionHelpFormatter' plw_cli.py
 apply_reviewable_overlay "registry_alias_hint_v1"
 grep -Fq 'ALIAS_TO_CANONICAL' core/semantic_affordance.py
 grep -Fq '"alias_of"' core/semantic_affordance.py
+apply_reviewable_overlay "help_exit_codes_v1"
+grep -Fq '_MODE_HELP_USAGE' hott_kernel.py
+grep -Fq 'Usage: plw validation-coverage <plan.json>' plw_cli.py
+grep -Fq 'Usage: plw check [root]' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
