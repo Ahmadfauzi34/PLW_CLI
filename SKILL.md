@@ -23,6 +23,13 @@ plw capability list --json
 plw capability describe <command> --json
 ```
 
+Governance commands also have grouped namespace aliases
+(`plw lease validation|execution`, `plw proof obligations|postcondition`,
+`plw ledger lineage|accountability|chain|memory|model|reconcile` — each maps
+to one canonical command; see `plw --help` or `plw <group> --help`).
+Aliases are CLI-only: `capability describe` and `skill show` accept the
+canonical names.
+
 ## Read exact embedded skill contracts
 
 ```bash

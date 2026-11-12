@@ -173,6 +173,9 @@ grep -Fq 'def cmd_lease' plw_cli.py
 grep -Fq 'def cmd_proof' plw_cli.py
 grep -Fq 'def cmd_ledger' plw_cli.py
 grep -Fq 'Namespace aliases (same commands, grouped names' plw_cli.py
+apply_reviewable_overlay "namespace_alias_help_v1"
+grep -Fq 'Operations map to canonical commands:' plw_cli.py
+grep -Fq 'formatter_class=argparse.RawDescriptionHelpFormatter' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

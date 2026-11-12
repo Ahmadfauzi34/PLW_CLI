@@ -1,0 +1,51 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4926,7 +4926,13 @@
+     plw lease execution ... -> plw action-lease ...
+     """
+     import argparse
+-    parser = argparse.ArgumentParser(prog="plw lease")
++    parser = argparse.ArgumentParser(
++        prog="plw lease",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog="Operations map to canonical commands:\n"
++               "  validation -> plw validation-lease\n"
++               "  execution -> plw action-lease\n"
++               "Additive aliases; canonical names unchanged.")
+     parser.add_argument("operation", choices=("validation", "execution"))
+     parser.add_argument("rest", nargs=argparse.REMAINDER)
+     opts = parser.parse_args(args)
+@@ -4942,7 +4948,13 @@
+     plw proof postcondition ... -> plw postcondition-proof ...
+     """
+     import argparse
+-    parser = argparse.ArgumentParser(prog="plw proof")
++    parser = argparse.ArgumentParser(
++        prog="plw proof",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog="Operations map to canonical commands:\n"
++               "  obligations -> plw validation-coverage\n"
++               "  postcondition -> plw postcondition-proof\n"
++               "Additive aliases; canonical names unchanged.")
+     parser.add_argument("operation", choices=("obligations", "postcondition"))
+     parser.add_argument("rest", nargs=argparse.REMAINDER)
+     opts = parser.parse_args(args)
+@@ -4962,7 +4974,17 @@
+     plw ledger reconcile ... -> plw reconcile-outcomes ...
+     """
+     import argparse
+-    parser = argparse.ArgumentParser(prog="plw ledger")
++    parser = argparse.ArgumentParser(
++        prog="plw ledger",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog="Operations map to canonical commands:\n"
++               "  lineage -> plw lineage\n"
++               "  accountability -> plw accountability\n"
++               "  chain -> plw accountability-chain\n"
++               "  memory -> plw transition-memory\n"
++               "  model -> plw transition-model\n"
++               "  reconcile -> plw reconcile-outcomes\n"
++               "Additive aliases; canonical names unchanged.")
+     parser.add_argument("operation", choices=(
+         "lineage", "accountability", "chain", "memory", "model", "reconcile"))
+     parser.add_argument("rest", nargs=argparse.REMAINDER)
