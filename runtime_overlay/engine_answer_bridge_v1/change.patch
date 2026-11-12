@@ -73,7 +73,7 @@
          agent_decision_frame = {}
 --- a/core/target_resolution.py
 +++ b/core/target_resolution.py
-@@ -62,6 +62,18 @@
+@@ -62,6 +62,31 @@
      return terms[:24], path_hints[:8] + [x for x in identifiers[:12] if x not in path_hints]
  
  
@@ -89,20 +89,66 @@
 +    return 0
 +
 +
++def _content_identifier_term_count(row: Mapping[str, Any]) -> int:
++    """How many matched content terms are backed by a code identifier.
++
++    Reads the ``identifier_terms`` of the candidate's own
++    ``content_identifier_hint`` evidence row; 0 when no matched term
++    occurs inside a mixed-case identifier in the file.
++    """
++    for ev in row.get("evidence", []) or []:
++        if isinstance(ev, Mapping) and ev.get("kind") == "content_identifier_hint":
++            return len(ev.get("identifier_terms", []) or [])
++    return 0
++
++
  def _resolve_explicit(value: str, vertices: Sequence[str], scan_root: str) -> Tuple[Optional[str], List[str], str]:
      requested = _norm(value)
      vertex_norm = {_norm(v): str(v) for v in vertices}
-@@ -279,6 +291,16 @@
+@@ -239,7 +264,22 @@
+             if content_hits:
+                 weight = min(9, 3 * len(content_hits))
+                 seed_score += weight
+-                evidence.append({"kind": "content_identifier_hint", "values": content_hits[:4], "weight": weight})
++                # Identifier evidence: a hit counts as identifier-backed
++                # only when the term occurs inside a mixed-case identifier
++                # in the file (e.g. rebuildCSR, simhashBits) — a bare
++                # lowercase word (value, export) is a generic word, not
++                # a code identifier, however many of them match.
++                tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", content)
++                identifier_hits = [
++                    term for term in content_hits
++                    if any(
++                        term in tok.lower()
++                        and any(c.islower() for c in tok)
++                        and any(c.isupper() for c in tok)
++                        for tok in tokens
++                    )
++                ]
++                evidence.append({"kind": "content_identifier_hint", "values": content_hits[:4], "identifier_terms": identifier_hits[:4], "weight": weight})
+ 
+         if seed_score <= 0:
+             continue
+@@ -279,6 +319,25 @@
          if top_score >= 12 and top_score - second_score >= 4:
              state = "RESOLVED"
              reason = "unique_high_margin_candidate"
-+        elif len(candidate_rows) == 1 and _content_term_count(candidate_rows[0]) >= 2:
++        elif (
++            len(candidate_rows) == 1
++            and _content_term_count(candidate_rows[0]) >= 2
++            and _content_identifier_term_count(candidate_rows[0]) >= 1
++        ):
 +            # A lone candidate matching two or more task identifiers in
 +            # content is the only thing the seed points at. The 12-point
 +            # bar above is calibrated for path/basename evidence and can
 +            # never be reached by content hints alone (cap 9 + fan-in
 +            # cap 3), so a single content-only candidate would stay
-+            # AMBIGUOUS forever. One-term content hits stay ambiguous —
++            # AMBIGUOUS forever. At least one matched term must be backed
++            # by a mixed-case identifier in the file: two generic
++            # lowercase words (value + export in `export const value =
++            # 1;`) are not identifiers, and resolving on them turned the
++            # CI readiness smoke's expected NOT_READY into
++            # NOT_ESTABLISHED. One-term content hits stay ambiguous —
 +            # a lone word is still only a hint.
 +            state = "RESOLVED"
 +            reason = "single_candidate_content_identifiers"
