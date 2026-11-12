@@ -1,0 +1,11 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4322,7 +4322,7 @@
+         else:
+             orient = result.get("target_orientation", {}) or {}
+             inv = orient.get("inventory", {}) or {}
+-            print(f"# Files: {inv.get('files', 0)} | internal import edges: {inv.get('internal_import_edges', 0)}")
++            print(f"# Files: {inv.get('files', 0)} (stable-topology sources only; .ts/.tsx/.js/.jsx) | internal import edges: {inv.get('internal_import_edges', 0)}")
+             print(f"# Entrypoints: {inv.get('entrypoints', 0)} | tests: {inv.get('tests', 0)} | cyclic SCCs: {inv.get('cyclic_sccs', 0)}")
+             print(f"# Unresolved imports: {inv.get('unresolved_imports', 0)} | external imports: {inv.get('external_imports', 0)}")
+             engine = (result.get("target_orientation") or {}).get("engine") or {}

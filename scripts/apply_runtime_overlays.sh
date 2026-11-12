@@ -196,6 +196,14 @@ apply_reviewable_overlay "describe_alias_human_v1"
 grep -Fq '# Alias of: ' plw_cli.py
 apply_reviewable_overlay "describe_group_op_alias_v1"
 grep -Fq '"obligations": "validation-coverage"' core/semantic_affordance.py
+apply_reviewable_overlay "describe_first_contact_v1"
+grep -Fq 'FIRST_CONTACT_HELP' core/semantic_affordance.py
+apply_reviewable_overlay "topology_files_scope_v1"
+grep -Fq 'stable-topology sources only' plw_cli.py
+apply_reviewable_overlay "ledger_memory_disambiguation_v1"
+grep -Fq 'transition-memory (not plw memory)' plw_cli.py
+apply_reviewable_overlay "doctor_engine_required_note_v1"
+grep -Fq 'required for structural questions' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

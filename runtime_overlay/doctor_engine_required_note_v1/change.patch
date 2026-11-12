@@ -1,0 +1,11 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4647,7 +4647,7 @@
+         browser = ((result.get("runtime") or {}).get("browser") or {})
+         print("# Chromium: " + (str(browser.get("executable")) if browser.get("available") else "optional / not found"))
+         engine = ((result.get("runtime") or {}).get("codesearch_engine") or {})
+-        print("# Tree-sitter engine: " + (str(engine.get("binary")) + " schema=" + str(engine.get("schema")) if engine.get("available") else "optional / not found"))
++        print("# Tree-sitter engine: " + (str(engine.get("binary")) + " schema=" + str(engine.get("schema")) if engine.get("available") else "not found (optional for PLW itself; required for structural questions)"))
+         print("# First contact: " + str((result.get("agent") or {}).get("first_contact")))
+         return code
+     if "capabilities" in result:

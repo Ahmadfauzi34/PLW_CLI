@@ -1,0 +1,58 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4625,10 +4625,12 @@
+         # The human rendering must carry the same pointer as the JSON
+         # rendering: an alias name is not a typo, and the agent reading
+         # this first must learn the canonical name here, not only via --json.
++        # A hint without alias_of (first-contact pointer, N3) is printed
++        # on its own: the Hint line carries any pointer describe produced.
+         if result.get("alias_of"):
+             print("# Alias of: " + str(result.get("alias_of")))
+-            if result.get("hint"):
+-                print("# Hint: " + str(result.get("hint")))
++        if result.get("hint"):
++            print("# Hint: " + str(result.get("hint")))
+         return code
+     if "ready" in result:
+         print("# Version: " + str(result.get("version")))
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -960,6 +960,23 @@
+     "workflow-audit-chain": "accountability-chain",
+ }
+ 
++# First-contact commands (doctor, ast, agent, skill, capability, ui)
++# are real commands an agent meets first, but they are NOT registered
++# capabilities, so describe cannot return a contract for them. This
++# table teaches describe_command to point at their --help instead of
++# returning a bare not-registered error. It is a pointer, NOT an alias:
++# describe answers with `hint` only -- no `alias_of`, `known` stays
++# false, the error is unchanged. COMMAND_CONTRACTS stays untouched and
++# `capability list` never shows these names.
++FIRST_CONTACT_HELP = {
++    "agent": "plw agent --help",
++    "ast": "plw ast --help",
++    "capability": "plw capability --help",
++    "doctor": "plw doctor --help",
++    "skill": "plw skill --help",
++    "ui": "plw ui --help",
++}
++
+ 
+ def describe_command(command: str) -> Dict[str, Any]:
+     name = str(command or "").strip().lower().replace("_", "-")
+@@ -981,6 +998,14 @@
+                 f"{name} is an alias of {canonical}; "
+                 "describe the canonical name."
+             )
++        else:
++            help_cmd = FIRST_CONTACT_HELP.get(name)
++            if help_cmd is not None:
++                result["hint"] = (
++                    f"{name} is a first-contact command, "
++                    "not a registered capability; "
++                    f"see {help_cmd}."
++                )
+         return result
+     return {
+         "schema_version": SCHEMA_VERSION,

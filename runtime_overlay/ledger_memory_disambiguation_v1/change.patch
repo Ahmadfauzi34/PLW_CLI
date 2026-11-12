@@ -1,0 +1,11 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -5043,7 +5043,7 @@
+                "  lineage -> plw lineage\n"
+                "  accountability -> plw accountability\n"
+                "  chain -> plw accountability-chain\n"
+-               "  memory -> plw transition-memory\n"
++               "  memory -> plw transition-memory (not plw memory)\n"
+                "  model -> plw transition-model\n"
+                "  reconcile -> plw reconcile-outcomes\n"
+                "Additive aliases; canonical names unchanged.")
