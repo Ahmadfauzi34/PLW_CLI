@@ -27,7 +27,17 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/go" "$TMP/ts/src" "$TMP/mixed/src" "$TMP/run"
+mkdir -p "$TMP/go" "$TMP/ts/src" "$TMP/mixed/src" "$TMP/kt/src" "$TMP/run"
+cat > "$TMP/kt/src/Main.kt" <<'EOF'
+fun main() {
+    println(greet("Ahmad"))
+}
+EOF
+cat > "$TMP/kt/src/Greeter.kt" <<'EOF'
+fun greet(name: String): String {
+    return "hi " + name + "!"
+}
+EOF
 cat > "$TMP/go/main.go" <<'EOF'
 package main
 
@@ -76,8 +86,14 @@ env -u CODESEARCH_BIN PATH=/usr/bin:/bin ./plw agent orient "$TMP/ts" \
 # Case 4: mixed Go+TS, engine -> context B, topology still available.
 CODESEARCH_BIN="$ENGINE" ./plw agent orient "$TMP/mixed" \
   --task "di mana Greet didefinisikan" --json > "$TMP/mixed-engine.json"
+# Case 5: Kotlin-only, no engine -> context A, structural unavailable.
+env -u CODESEARCH_BIN PATH=/usr/bin:/bin ./plw agent orient "$TMP/kt" \
+  --task "di mana greet didefinisikan" --json > "$TMP/kt-noengine.json"
+# Case 6: Kotlin-only, engine -> context B, structural via plw ast.
+CODESEARCH_BIN="$ENGINE" ./plw agent orient "$TMP/kt" \
+  --task "di mana greet didefinisikan" --json > "$TMP/kt-engine.json"
 
-python3 - "$TMP/go-noengine.json" "$TMP/go-engine.json" "$TMP/ts-noengine.json" "$TMP/mixed-engine.json" <<'PY'
+python3 - "$TMP/go-noengine.json" "$TMP/go-engine.json" "$TMP/ts-noengine.json" "$TMP/mixed-engine.json" "$TMP/kt-noengine.json" "$TMP/kt-engine.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -85,9 +101,9 @@ from pathlib import Path
 def load(p):
     return json.loads(Path(p).read_text())
 
-go_no, go_yes, ts_no, mixed_yes = (load(p) for p in sys.argv[1:])
+go_no, go_yes, ts_no, mixed_yes, kt_no, kt_yes = (load(p) for p in sys.argv[1:])
 
-for doc in (go_no, go_yes, ts_no, mixed_yes):
+for doc in (go_no, go_yes, ts_no, mixed_yes, kt_no, kt_yes):
     # Additive change: the old orient contract is untouched.
     assert doc["portable_agent_surface"]["entrypoint"] == "plw agent orient", doc
     assert "target_support" in doc and "portable_agent_state" in doc, doc
@@ -127,6 +143,29 @@ assert ctx["context"] == "B", ctx
 assert ctx["languages"] == {"go": 2, "typescript": 2}, ctx
 assert ctx["needs_engine"] is True, ctx
 assert ctx["structural_query"]["available"] is True, ctx
+assert ctx["topology"]["available"] is True, ctx
+
+# Track 1 (K3): Kotlin is a matrix language — counted, engine-gated,
+# but topology-covered (unlike Go, whose topology is unavailable).
+ctx = kt_no["dynamic_context"]
+assert ctx["context"] == "A", ctx
+assert ctx["languages"] == {"kotlin": 2}, ctx
+assert ctx["needs_engine"] is True, ctx
+assert ctx["engine"]["available"] is False, ctx
+assert ctx["structural_query"]["available"] is False, ctx
+assert ctx["structural_query"]["route"] is None, ctx
+assert "codesearch-go" in ctx["reason"], ctx
+assert ctx["topology"]["available"] is True, ctx
+
+ctx = kt_yes["dynamic_context"]
+assert ctx["context"] == "B", ctx
+assert ctx["languages"] == {"kotlin": 2}, ctx
+assert ctx["needs_engine"] is True, ctx
+assert ctx["engine"]["available"] is True, ctx
+assert ctx["engine"]["schema"] == "go9", ctx
+assert ctx["structural_query"]["available"] is True, ctx
+assert "plw ast" in ctx["structural_query"]["route"], ctx
+assert "Context B" in ctx["reason"], ctx
 assert ctx["topology"]["available"] is True, ctx
 
 print("SMOKE_ORIENT_CONTEXT: PASS")

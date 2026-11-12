@@ -1,0 +1,132 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -15,7 +15,7 @@
+ import re
+ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+ 
+-JS_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
++JS_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+ PYTHON_SOURCE_EXTENSIONS = (".py",)
+ # K5: Kotlin joins the DEFAULT source contract (unlike Python, there is no
+ # self-host hazard: PLW itself has no .kt files). Gradle scripts (.kts) stay
+@@ -648,6 +648,16 @@
+         spec, alias = spec.strip(), alias.strip()
+     wildcard = spec.endswith("::*")
+     path = spec[:-3] if wildcard else spec
++    # `self` refers to the module the group opens, not a child named
++    # `self`: `use crate::foo::{self, bar}` imports `crate::foo`
++    # itself (H4). The group recursion passes the base as `prefix`
++    # (with a trailing "::"), so strip it back to the base. A bare
++    # `self` with no group prefix is malformed — drop it.
++    if path == "self":
++        base = prefix[:-2] if prefix.endswith("::") else prefix
++        if not base or not _is_valid_rust_path(base):
++            return []
++        return [(base, alias, False)]
+     full = f"{prefix}{path}" if prefix else path
+     if not _is_valid_rust_path(full):
+         return []
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -21,21 +21,35 @@
+ DYNAMIC_CONTEXT_SCHEMA_VERSION = "plw-dynamic-context-v1"
+ 
+ # Languages the dynamic context matrix distinguishes, by file extension.
+-# language_semantics only defines JS/Python sets; Go/Rust live here because
+-# the matrix (not the stable topology graph) is what needs them.
++# One source of truth for extensions: every extension any layer handles
++# (stable graph via language_semantics SOURCE_EXTENSIONS, engine via
++# codesearch-go defaultExts) appears here, mapped to its matrix language.
++# Modern JS/TS module variants (.mjs/.cjs/.mts/.cts) are JavaScript /
++# TypeScript; .kt is Kotlin (engine-supported: defs/callers/related).
+ MATRIX_LANGUAGE_EXTENSIONS = {
+     ".go": "go",
+     ".rs": "rust",
+     ".py": "python",
+     ".js": "javascript",
+     ".jsx": "jsx",
++    ".mjs": "javascript",
++    ".cjs": "javascript",
+     ".ts": "typescript",
+     ".tsx": "tsx",
++    ".mts": "typescript",
++    ".cts": "typescript",
++    ".kt": "kotlin",
+ }
+ # Languages the stable topology graph covers without any engine.
+-STABLE_TOPOLOGY_LANGUAGES = {"javascript", "jsx", "typescript", "tsx"}
++# This must mirror SOURCE_EXTENSIONS (JS + Kotlin + Rust); it is a
++# contract constant — the dynamic-context gate itself keys off
++# ENGINE_LANGUAGES below.
++STABLE_TOPOLOGY_LANGUAGES = {"javascript", "jsx", "typescript", "tsx", "kotlin", "rust"}
+ # Languages whose structural questions need the tree-sitter engine.
+-ENGINE_LANGUAGES = {"go", "rust", "python"}
++# Kotlin and Rust sit in both sets on purpose: the stable graph covers
++# their imports, but defs/callers/related need the engine (G6: the
++# engine does not extend topology).
++ENGINE_LANGUAGES = {"go", "rust", "python", "kotlin"}
+ 
+ 
+ def _state_root() -> Path:
+@@ -295,7 +309,7 @@
+     which routes exist for this (languages, engine) state, and the
+     agent picks the route matching its task:
+ 
+-    * target languages: Go/Rust/Python need the engine; TS/JS/JSX/TSX
++    * target languages: Go/Rust/Python/Kotlin need the engine; TS/JS/JSX/TSX
+       are answered by the stable topology graph alone.
+     * engine availability: from doctor (available -> context B,
+       unavailable -> context A plus the recorded reason).
+@@ -331,17 +345,19 @@
+             "reason": "target languages are all in stable topology scope",
+         }
+     else:
++        missing = sorted(lang for lang in languages if lang in ENGINE_LANGUAGES)
+         structural = {
+             "available": False,
+             "route": None,
+             "reason": (
+-                "engine unavailable; structural questions on go/rust/python "
+-                "need the codesearch-go release binary"
++                "engine unavailable; structural questions on "
++                + "/".join(missing)
++                + " need the codesearch-go release binary"
+             ),
+         }
+     topology: Dict[str, Any] = {
+         "available": bool(support.get("topology_ready")),
+-        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx/.kt/.rs)",
++        "scope": "stable_shared_graph (" + "/".join(SOURCE_EXTENSIONS) + ")",
+         "reason": str(support.get("reason") or ""),
+         "note": "the engine does not extend topology (G6)",
+     }
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -795,12 +795,27 @@
+         else:
+             key = "calls" if mode == "callers" else "related"
+             field = "callee" if mode == "callers" else "symbol"
++            # Callers rows carry the full callee expression; reduce it
++            # to its base and fan the row out to every requested query
++            # with that base, so `pkg.Foo` receives its rows instead of
++            # stranding them under an orphan `Foo` key (H2). The engine
++            # matches by trailing identifier, so one row may fan out to
++            # several queries sharing a base (`pkg.Foo`, `other.Foo`).
++            base_to_queries: Dict[str, List[str]] = {}
++            if mode == "callers":
++                for name in names:
++                    base_to_queries.setdefault(_callee_base(name), []).append(name)
+             for row in result.get(key) or []:
+                 if not isinstance(row, dict):
+                     continue
+                 owner = row.get(field)
+                 if mode == "callers":
+                     owner = _callee_base(owner)
++                    targets = base_to_queries.get(owner)
++                    if targets:
++                        for target in targets:
++                            grouped[target].append(row)
++                        continue
+                 if owner in grouped:
+                     grouped[owner].append(row)
+                 else:

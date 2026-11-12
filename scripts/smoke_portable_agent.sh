@@ -31,6 +31,18 @@ function isRefIdentifier(id) {
 }
 EOF
 
+# Track 1: Kotlin + Rust targets (K3 matrix, H4 self-import).
+mkdir -p "$TMP/kt-target/src" "$TMP/rs-target/src/foo"
+printf 'fun main() {\n    println("hi")\n}\n' > "$TMP/kt-target/src/Main.kt"
+cat > "$TMP/rs-target/Cargo.toml" <<'EOF'
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+EOF
+printf 'pub fn bar() {}\n' > "$TMP/rs-target/src/foo/mod.rs"
+printf 'pub mod foo;\nuse crate::foo::{self, bar};\n' > "$TMP/rs-target/src/lib.rs"
+
 cd "$TMP/run"
 export HOME="$TMP/home"
 export XDG_STATE_HOME="$TMP/state"
@@ -46,6 +58,10 @@ export XDG_CACHE_HOME="$TMP/cache"
 ./plw candidate select "Explain why isSCSSMapItemNode is a bounded boolean guard candidate" "$TMP/target" --json > "$TMP/selection.json"
 ./plw candidate capability-match "Explain why isSCSSMapItemNode is a bounded boolean guard candidate" "$TMP/target" --json > "$TMP/candidate-route.json"
 ./plw candidate capability-match "Select one boolean guard with opposite boolean returns" "$TMP/target" --json > "$TMP/ambiguous-route.json"
+./plw doctor "$TMP/kt-target" --json > "$TMP/doctor-kt.json"
+./plw doctor "$TMP/rs-target" --json > "$TMP/doctor-rs.json"
+./plw agent orient "$TMP/kt-target" --task "cari main" --json > "$TMP/orient-kt.json"
+./plw topology "$TMP/rs-target" --json > "$TMP/topology-rs.json"
 
 python - "$TMP" "$ROOT/VERSION" <<'PY'
 import json
@@ -64,6 +80,10 @@ candidate_orient = json.loads((root / "candidate-orient.json").read_text())
 selection = json.loads((root / "selection.json").read_text())
 candidate_route = json.loads((root / "candidate-route.json").read_text())
 ambiguous_route = json.loads((root / "ambiguous-route.json").read_text())
+doctor_kt = json.loads((root / "doctor-kt.json").read_text())
+doctor_rs = json.loads((root / "doctor-rs.json").read_text())
+orient_kt = json.loads((root / "orient-kt.json").read_text())
+topology_rs = json.loads((root / "topology-rs.json").read_text())
 target = root / "target"
 
 if doctor.get("ready") is not True:
@@ -124,6 +144,37 @@ if ambiguous_route.get("candidate_capability_match", {}).get("status") != "CAPAB
 if "js_boolean_guard.strict_equality_string.temp_worktree.v1" in json.dumps(caps):
     raise SystemExit("internal mutation capability leaked into public capability discovery")
 
+# Track 1: Kotlin + Rust are first-class targets (K3 matrix, H4 self-import).
+for doctor_lang in (doctor_kt, doctor_rs):
+    if doctor_lang.get("ready") is not True:
+        raise SystemExit(f"doctor not ready on kotlin/rust target: {doctor_lang}")
+    if doctor_lang.get("readiness", {}).get("stable_target_topology_ready") is not True:
+        raise SystemExit(f"stable topology not ready on kotlin/rust target: {doctor_lang}")
+kt_ctx = orient_kt.get("dynamic_context", {})
+if kt_ctx.get("languages") != {"kotlin": 1}:
+    raise SystemExit(f"kotlin target languages wrong: {kt_ctx.get('languages')}")
+if kt_ctx.get("needs_engine") is not True:
+    raise SystemExit("kotlin target must need the engine for structural questions")
+if kt_ctx.get("topology", {}).get("available") is not True:
+    raise SystemExit(f"kotlin topology unavailable: {kt_ctx.get('topology')}")
+kt_struct = kt_ctx.get("structural_query", {})
+if orient_kt.get("dynamic_context", {}).get("engine", {}).get("available") is True:
+    if kt_struct.get("available") is not True or "plw ast" not in (kt_struct.get("route") or ""):
+        raise SystemExit(f"kotlin structural query not routed via engine: {kt_struct}")
+else:
+    if kt_struct.get("available") is not False or kt_struct.get("route") is not None:
+        raise SystemExit(f"kotlin structural query must be unavailable without engine: {kt_struct}")
+    if "codesearch-go" not in (kt_struct.get("reason") or ""):
+        raise SystemExit(f"kotlin no-engine reason must name the engine: {kt_struct}")
+rs_resolution = topology_rs.get("target_orientation", {}).get("import_resolution", {})
+if rs_resolution.get("unresolved_sample") not in ([], None):
+    raise SystemExit(f"rust self-import left a phantom unresolved entry: {rs_resolution}")
+rs_inventory = topology_rs.get("target_orientation", {}).get("inventory", {})
+if rs_inventory.get("unresolved_imports") != 0:
+    raise SystemExit(f"rust unresolved count not zero: {rs_inventory}")
+if rs_inventory.get("internal_import_edges", 0) < 1:
+    raise SystemExit(f"rust self-import edge missing: {rs_inventory}")
+
 actual = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
 if actual != ["src/guards.js", "src/main.ts", "src/value.ts"]:
     raise SystemExit(f"target repository polluted: {actual}")
@@ -133,6 +184,7 @@ print(
     f"version={version} capabilities={caps['capability_count']} "
     f"skills={skills['embedded_count']}/{skills['skill_count']} "
     "candidate_handoff=CONDITIONAL_DISCOVERY task_text_used=false "
-    "candidate_selection=RESOLVED/AMBIGUOUS capability_match=read-only"
+    "candidate_selection=RESOLVED/AMBIGUOUS capability_match=read-only "
+    "kotlin_languages=1 rust_self_unresolved=0"
 )
 PY

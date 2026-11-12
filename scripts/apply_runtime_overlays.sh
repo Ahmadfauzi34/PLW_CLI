@@ -212,6 +212,12 @@ apply_reviewable_overlay "engine_answer_bridge_v1"
 grep -Fq 'single_candidate_content_identifiers' core/target_resolution.py
 grep -Fq 'Only ``calls`` edges are projected as calls' hott_kernel.py
 grep -Fq 'Raw flat edge' core/agent_communication.py
+apply_reviewable_overlay "silent_wrong_answers_v1"
+grep -Fq '".mts": "typescript"' core/portable_agent.py
+grep -Fq '"kotlin", "rust"' core/portable_agent.py
+grep -Fq 'base_to_queries' core/codesearch_engine.py
+grep -Fq 'refers to the module the group opens' language_semantics.py
+grep -Fq '".mjs", ".cjs", ".mts", ".cts"' language_semantics.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
