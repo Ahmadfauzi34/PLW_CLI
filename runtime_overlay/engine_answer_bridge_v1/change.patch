@@ -1,0 +1,153 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -3132,7 +3132,7 @@
+     }
+ 
+ 
+-def _engine_answer_summary(target_orientation: Dict[str, Any]) -> Dict[str, Any]:
++def _engine_answer_summary(target_orientation: Dict[str, Any], terms: Any = None) -> Dict[str, Any]:
+     """Summarize engine-located symbols for the agent decision frame.
+ 
+     The topology target may stay unresolved (or ambiguous) while the
+@@ -3140,13 +3140,48 @@
+     lets the decision frame say so up front instead of reading as "no
+     answer". Returns {} when the engine located nothing, so the frame
+     stays silent instead of claiming an answer. Never raises.
++
++    Only ``calls`` edges are projected as calls: ``symbol_edges`` also
++    carries ``related`` rows (re-export, ffi, ...) which have no caller
++    or callee at all — projecting them unfiltered used to emit
++    ``{"caller": {"file": null, "line": null}, "callee": null}`` rows
++    (the engine's file/line sort puts ``related`` rows first). When
++    ``terms`` (task-seed terms) are given, rows whose names contain a
++    term rank first, stable within each group, before the [:4] cut —
++    otherwise the cut keeps whatever the engine's sort put first, which
++    need not be what the task asked about.
+     """
+     try:
+         engine = (target_orientation or {}).get("engine") or {}
+         nodes = [n for n in (engine.get("symbol_nodes") or []) if isinstance(n, dict)]
+-        edges = [e for e in (engine.get("symbol_edges") or []) if isinstance(e, dict)]
++        edges = [
++            e for e in (engine.get("symbol_edges") or [])
++            if isinstance(e, dict) and e.get("kind") == "calls"
++        ]
+         if not nodes and not edges:
+             return {}
++        terms_l = [str(t).lower() for t in (terms or []) if str(t).strip()]
++
++        def _term_hits(name: str) -> int:
++            lowered = (name or "").lower()
++            return sum(1 for t in terms_l if t and t in lowered)
++
++        def _ranked(rows, key):
++            if not terms_l:
++                return rows
++            scored = sorted(
++                enumerate(rows),
++                key=lambda pair: (-_term_hits(key(pair[1])), pair[0]),
++            )
++            return [row for _, row in scored]
++
++        def _call_name(edge: Dict[str, Any]) -> str:
++            caller = edge.get("caller") or {}
++            callee = edge.get("callee") or {}
++            return "%s %s" % (caller.get("symbol") or "", callee.get("symbol") or "")
++
++        nodes = _ranked(nodes, lambda n: str(n.get("symbol") or ""))
++        edges = _ranked(edges, _call_name)
+         return {
+             "symbols": [
+                 {
+@@ -3545,7 +3580,10 @@
+             capability_selection=capability_selection_projection,
+             proof_gate=proof_projection,
+             skill_handoff=normalized_handoff,
+-            engine_answer=_engine_answer_summary(target_orientation),
++            engine_answer=_engine_answer_summary(
++                target_orientation,
++                terms=(target_resolution.get("task_seed") or {}).get("terms") or [],
++            ),
+         )
+     else:
+         agent_decision_frame = {}
+--- a/core/target_resolution.py
++++ b/core/target_resolution.py
+@@ -62,6 +62,18 @@
+     return terms[:24], path_hints[:8] + [x for x in identifiers[:12] if x not in path_hints]
+ 
+ 
++def _content_term_count(row: Mapping[str, Any]) -> int:
++    """How many distinct task terms a candidate matched in file content.
++
++    Reads the candidate's own ``content_identifier_hint`` evidence row;
++    0 when the candidate matched no content identifier.
++    """
++    for ev in row.get("evidence", []) or []:
++        if isinstance(ev, Mapping) and ev.get("kind") == "content_identifier_hint":
++            return len(ev.get("values", []) or [])
++    return 0
++
++
+ def _resolve_explicit(value: str, vertices: Sequence[str], scan_root: str) -> Tuple[Optional[str], List[str], str]:
+     requested = _norm(value)
+     vertex_norm = {_norm(v): str(v) for v in vertices}
+@@ -279,6 +291,16 @@
+         if top_score >= 12 and top_score - second_score >= 4:
+             state = "RESOLVED"
+             reason = "unique_high_margin_candidate"
++        elif len(candidate_rows) == 1 and _content_term_count(candidate_rows[0]) >= 2:
++            # A lone candidate matching two or more task identifiers in
++            # content is the only thing the seed points at. The 12-point
++            # bar above is calibrated for path/basename evidence and can
++            # never be reached by content hints alone (cap 9 + fan-in
++            # cap 3), so a single content-only candidate would stay
++            # AMBIGUOUS forever. One-term content hits stay ambiguous —
++            # a lone word is still only a hint.
++            state = "RESOLVED"
++            reason = "single_candidate_content_identifiers"
+         else:
+             state = "AMBIGUOUS"
+             reason = "multiple_or_low_margin_candidates"
+--- a/core/agent_communication.py
++++ b/core/agent_communication.py
+@@ -85,7 +85,10 @@
+     summary stays out of the frame instead of claiming an answer. The
+     summary shape is {symbols: [{symbol, file, line, kind, authority}],
+     calls: [{caller: {file, line}, callee: <symbol string>}]}; a callee
+-    given as a raw edge dict is still accepted defensively.
++    given as a raw edge dict is still accepted defensively, as is a raw
++    flat call row ({path, line, caller: <symbol>, callee: <symbol>}).
++    A call row that names neither a file nor a callee is dropped instead
++    of projected as nulls.
+     """
+     if not isinstance(answer, Mapping):
+         return None
+@@ -105,15 +108,25 @@
+         if not isinstance(c, Mapping):
+             continue
+         caller = c.get("caller")
++        if isinstance(caller, str):
++            # Raw flat edge: the caller is the enclosing symbol name;
++            # file/line live on the edge itself.
++            caller = {"file": c.get("path") or c.get("file"), "line": c.get("line")}
+         if not isinstance(caller, Mapping):
+             caller = {}
+         callee = c.get("callee")
+         if isinstance(callee, Mapping):
+             callee = callee.get("symbol")
++        if not isinstance(callee, str):
++            callee = None
++        call_file = caller.get("file") or c.get("path") or c.get("file")
++        call_line = caller.get("line") if caller.get("line") is not None else c.get("line")
++        if call_file is None and callee is None:
++            continue
+         calls.append(
+             {
+-                "caller": {"file": caller.get("file"), "line": caller.get("line")},
+-                "callee": callee if isinstance(callee, str) else None,
++                "caller": {"file": call_file, "line": call_line},
++                "callee": callee,
+             }
+         )
+     if not symbols and not calls:

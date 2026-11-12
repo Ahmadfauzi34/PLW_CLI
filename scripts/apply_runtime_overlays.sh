@@ -208,6 +208,10 @@ apply_reviewable_overlay "rust_topology_v1"
 grep -Fq 'parse_rust_imports' language_semantics.py
 grep -Fq 'rust_module_index' core/shared_graph.py
 grep -Fq '"/".join(source_extensions())' plw_cli.py
+apply_reviewable_overlay "engine_answer_bridge_v1"
+grep -Fq 'single_candidate_content_identifiers' core/target_resolution.py
+grep -Fq 'Only ``calls`` edges are projected as calls' hott_kernel.py
+grep -Fq 'Raw flat edge' core/agent_communication.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
