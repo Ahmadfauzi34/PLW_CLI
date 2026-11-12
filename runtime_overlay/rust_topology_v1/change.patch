@@ -1,0 +1,675 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -13,7 +13,7 @@
+ import json
+ import os
+ import re
+-from typing import Any, Dict, Iterable, List, Optional, Set
++from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+ 
+ JS_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+ PYTHON_SOURCE_EXTENSIONS = (".py",)
+@@ -21,7 +21,11 @@
+ # self-host hazard: PLW itself has no .kt files). Gradle scripts (.kts) stay
+ # out on purpose — they are build configuration, not app source.
+ KOTLIN_SOURCE_EXTENSIONS = (".kt",)
+-SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + KOTLIN_SOURCE_EXTENSIONS
++# R1: Rust joins the DEFAULT source contract on the same argument (PLW
++# itself has no .rs files). Build scripts (build.rs) are ordinary source:
++# they live in the crate like any module, so they stay in.
++RUST_SOURCE_EXTENSIONS = (".rs",)
++SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + KOTLIN_SOURCE_EXTENSIONS + RUST_SOURCE_EXTENSIONS
+ EXPERIMENTAL_SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS
+ JS_RESOLUTION_EXTENSIONS = JS_SOURCE_EXTENSIONS
+ PYTHON_RESOLUTION_EXTENSIONS = PYTHON_SOURCE_EXTENSIONS
+@@ -88,15 +92,17 @@
+         return "python"
+     if p.endswith(KOTLIN_SOURCE_EXTENSIONS):
+         return "kotlin"
++    if p.endswith(RUST_SOURCE_EXTENSIONS):
++        return "rust"
+     return "javascript"
+ 
+ 
+ def source_extensions(*, include_python: bool = False) -> tuple[str, ...]:
+     """Return the active source-extension contract.
+ 
+-    Stable/default callers see the TS/JS + Kotlin boundary (Kotlin joined the
+-    default in K5; .kts Gradle scripts stay out). Python is exposed only
+-    through an explicit experimental/self-host path.
++    Stable/default callers see the TS/JS + Kotlin + Rust boundary (Kotlin
++    joined the default in K5, Rust in R1; .kts Gradle scripts stay out).
++    Python is exposed only through an explicit experimental/self-host path.
+     """
+     return EXPERIMENTAL_SOURCE_EXTENSIONS if include_python else SOURCE_EXTENSIONS
+ 
+@@ -506,6 +512,266 @@
+     return raw_import.endswith(".R") and raw_import[:-2] in set(packages)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Rust frontend (R1). Stdlib-only, regex + small recursive descent — mirroring
++# the Kotlin frontend above. Rust has two import mechanisms:
++#   `use a::b::C;`, `use a::{B, C as D};`, `use a::b::*;` (glob),
++#   `use a::b as c;`, `use crate::...;`, `use self::...;`, `use super::...;`
++#   `mod foo;` / `pub mod foo;` (a file edge: foo.rs or foo/mod.rs)
++# Every import is runtime: Rust has no `import type`, and a `mod`
++# declaration is a file edge. `use` statements are matched with optional
++# leading whitespace, so uses inside function bodies and inline `mod`
++# blocks are captured too; `mod` is anchored at column 0 (rustfmt puts
++# top-level `mod` there) so a `mod inner;` inside an inline `mod outer`
++# block — whose file is outer/inner.rs, not inner.rs — never becomes a
++# wrong edge. `mod` is emitted with its bare name plus a `rust_mod`
++# marker: the graph resolves it in the Rust branch against sibling files
++# (`<name>.rs`, then `<name>/mod.rs` next to the declaring file) — NOT
++# through the relative-import branch, because a Rust `mod` is relative to
++# the declaring *module's* directory (`mod bar;` in `src/foo.rs` is
++# `src/foo/bar.rs`, while `./bar` from that file would wrongly mean
++# `src/bar.rs`).
++# Accepted noise (same class as the Kotlin frontend's): `strip_js_comments`
++# is not string-aware, so a `//` inside a string literal can hide a `use`
++# on the same line; nested block comments are not stripped either. The
++# resolver is name-based, not visibility-checked: a `use` of a private
++# item still resolves to the declaring file (an edge, not a proof the
++# import compiles) — the same honesty boundary as the engine's
++# name-based callers.
++# ---------------------------------------------------------------------------
++
++RUST_STDLIB_CRATES = ("std", "core", "alloc")
++
++# One `use ... ;` statement; DOTALL so rustfmt's multi-line groups match.
++# `[^;]+` stops at the statement's own semicolon (a `use` never contains
++# one inside its braces).
++RUST_USE_STATEMENT_REGEX = re.compile(
++    r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);",
++    re.MULTILINE | re.DOTALL,
++)
++
++# Top-level `mod` only: column-0 anchored (see the header comment).
++RUST_MOD_REGEX = re.compile(
++    r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][\w]*)\s*;",
++    re.MULTILINE,
++)
++
++# Top-level declarations only: anchored at column 0, so indented members
++# inside an `impl` block or an inline `mod` block never match. Tolerates
++# `pub(...)` visibility and the `async`/`unsafe`/`const`/`extern "..."`/
++# `default` modifiers (repeatable, any order). `impl` has no name and is
++# skipped; items inside an inline `mod` block are NOT indexed (accepted
++# limitation: a `use` of such an item classifies as rust_unresolved, not
++# as a wrong edge).
++RUST_DECL_REGEX = re.compile(
++    r"^(?:macro_rules!\s+([A-Za-z_][\w]*)|"
++    r"(?:pub(?:\([^)]*\))?\s+)?"
++    r"(?:async\s+|unsafe\s+|const\s+|extern\s+\"[^\"]*\"\s+|default\s+)*"
++    r"(?:fn|struct|enum|union|trait|type|const|static|mod)\s+([A-Za-z_][\w]*))",
++    re.MULTILINE,
++)
++
++_RUST_PATH_SEGMENT_REGEX = re.compile(r"^[A-Za-z_][\w]*$")
++
++RUST_CRATE_BIN_DIRS = ("bin", "examples", "tests", "benches")
++
++
++def rust_top_level_names(content: str) -> List[str]:
++    """Return top-level declaration names of a Rust file (R1)."""
++    names: List[str] = []
++    for macro_name, decl_name in RUST_DECL_REGEX.findall(strip_js_comments(content)):
++        name = macro_name or decl_name
++        if name:
++            names.append(name)
++    return names
++
++
++def _split_rust_use_group(body: str) -> List[str]:
++    """Split a `{...}` group body on top-level commas (R1)."""
++    parts: List[str] = []
++    depth = 0
++    current: List[str] = []
++    for ch in body:
++        if ch == "{":
++            depth += 1
++        elif ch == "}":
++            depth -= 1
++        if ch == "," and depth == 0:
++            parts.append("".join(current))
++            current = []
++        else:
++            current.append(ch)
++    tail = "".join(current).strip()
++    if tail:
++        parts.append(tail)
++    return [p.strip() for p in parts if p.strip()]
++
++
++def _is_valid_rust_path(path: str) -> bool:
++    return bool(path) and all(
++        _RUST_PATH_SEGMENT_REGEX.match(seg) for seg in path.split("::")
++    )
++
++
++def _expand_rust_use_spec(spec: str, prefix: str = "") -> List[Any]:
++    """Expand one `use` spec into (path, alias, wildcard) triples (R1).
++
++    Handles `a::b`, `a::b as c`, `a::b::*`, and `{...}` groups at any
++    depth (`use a::{b::{c, d}, e};` -> `a::b::c`, `a::b::d`, `a::e`).
++    Malformed members are dropped, never emitted as garbage paths.
++    """
++    spec = " ".join(spec.split())
++    results: List[Any] = []
++    brace = spec.find("::{")
++    if brace != -1:
++        base = spec[:brace].strip()
++        full_base = f"{prefix}{base}" if prefix else base
++        depth = 0
++        end = -1
++        for i in range(brace + 2, len(spec)):
++            if spec[i] == "{":
++                depth += 1
++            elif spec[i] == "}":
++                depth -= 1
++                if depth == 0:
++                    end = i
++                    break
++        if end == -1 or not _is_valid_rust_path(full_base):
++            return []
++        body = spec[brace + 3 : end]
++        for member in _split_rust_use_group(body):
++            results.extend(_expand_rust_use_spec(member, prefix=full_base + "::"))
++        return results
++    alias: Optional[str] = None
++    if " as " in spec:
++        spec, alias = spec.rsplit(" as ", 1)
++        spec, alias = spec.strip(), alias.strip()
++    wildcard = spec.endswith("::*")
++    path = spec[:-3] if wildcard else spec
++    full = f"{prefix}{path}" if prefix else path
++    if not _is_valid_rust_path(full):
++        return []
++    if alias and not _RUST_PATH_SEGMENT_REGEX.match(alias):
++        return []
++    return [(full, alias, wildcard)]
++
++
++def parse_rust_imports(content: str) -> List[Dict[str, Any]]:
++    """Parse Rust `use` + `mod` statements (R1). Every import is runtime."""
++    clean = strip_js_comments(content)
++    results: List[Dict[str, Any]] = []
++    for match in RUST_USE_STATEMENT_REGEX.finditer(clean):
++        for path, alias, wildcard in _expand_rust_use_spec(match.group(1)):
++            symbol = alias or path.rsplit("::", 1)[-1]
++            results.append({
++                "raw_import": path,
++                "import_nature": "runtime",
++                "statement": match.group(0).strip(),
++                "symbols": [symbol],
++                "semantic_usages": [],
++                "language": "rust",
++                "is_relative": False,
++                "alias": alias,
++                "wildcard": wildcard,
++            })
++    for match in RUST_MOD_REGEX.finditer(clean):
++        name = match.group(1)
++        results.append({
++            "raw_import": name,
++            "import_nature": "runtime",
++            "statement": match.group(0).strip(),
++            "symbols": [name],
++            "semantic_usages": [],
++            "language": "rust",
++            "is_relative": False,
++            "alias": None,
++            "wildcard": False,
++            "rust_mod": True,
++        })
++    return results
++
++
++def _rust_modpath_from_rel(rel: str) -> Tuple[str, ...]:
++    if rel.endswith(".rs"):
++        rel = rel[:-3]
++    parts = tuple(p for p in rel.split("/") if p not in ("", "."))
++    if parts and parts[-1] == "mod":
++        parts = parts[:-1]
++    return parts
++
++
++def rust_module_path_of(file_path: str, all_files: Iterable[str]) -> Tuple[str, Tuple[str, ...]]:
++    """Return (crate_root, module_path) for a Rust file (R1).
++
++    Crate root determination, in order:
++    1. `lib.rs` / `main.rs` -> its own directory is the root, module ().
++    2. A file directly under a `bin` / `examples` / `tests` / `benches`
++       directory is its own crate (Cargo semantics), module ().
++    3. The nearest ancestor directory containing `lib.rs` or `main.rs`
++       (checked against the corpus file set, not the filesystem).
++    4. Otherwise the file itself is a standalone crate root, module ().
++    Module path: the path from the root, `.rs` stripped, `/` -> `::`,
++    with a trailing `mod` segment dropped (`foo/mod.rs` is module `foo`).
++    """
++    norm = normalize_path(file_path)
++    base = os.path.basename(norm)
++    parent = os.path.dirname(norm)
++    if base in ("lib.rs", "main.rs"):
++        return parent or ".", ()
++    if os.path.basename(parent) in RUST_CRATE_BIN_DIRS:
++        return norm, ()
++    files = set(normalize_path(f) for f in all_files)
++    ancestors: List[str] = []
++    cur = parent
++    while True:
++        ancestors.append(cur)
++        if not cur or cur in (".", "/"):
++            break
++        nxt = os.path.dirname(cur)
++        if nxt == cur:
++            break
++        cur = nxt
++    for ancestor in ancestors:
++        prefix = (ancestor + "/") if ancestor not in ("", ".") else ""
++        if prefix + "lib.rs" in files or prefix + "main.rs" in files:
++            root = ancestor or "."
++            if root == ".":
++                rel = norm
++            else:
++                rel = norm[len(root) + 1 :] if norm.startswith(root + "/") else norm
++            return root, _rust_modpath_from_rel(rel)
++    return norm, ()
++
++
++_RUST_TOML_SECTION_REGEX = re.compile(r"^\[(.+?)\]\s*$", re.MULTILINE)
++_RUST_TOML_NAME_REGEX = re.compile(r"^name\s*=\s*\"([^\"]+)\"", re.MULTILINE)
++
++
++def rust_cargo_package_name(manifest_text: str) -> Tuple[str, str]:
++    """Return (package_name, lib_name) from a Cargo.toml text (R1).
++
++    The lib target name defaults to the package name with `-` -> `_`;
++    an explicit `[lib] name` overrides it. Returns ("", "") when no
++    `[package] name` is present.
++    """
++    sections: Dict[str, str] = {}
++    current = ""
++    start = 0
++    for match in _RUST_TOML_SECTION_REGEX.finditer(manifest_text):
++        sections[current] = manifest_text[start : match.start()]
++        current = match.group(1).strip()
++        start = match.end()
++    sections[current] = manifest_text[start:]
++    package_text = sections.get("package", "")
++    pkg_match = _RUST_TOML_NAME_REGEX.search(package_text)
++    if not pkg_match:
++        return "", ""
++    package = pkg_match.group(1)
++    lib_match = _RUST_TOML_NAME_REGEX.search(sections.get("lib", ""))
++    lib_name = lib_match.group(1) if lib_match else package.replace("-", "_")
++    return package, lib_name
++
++
+ __all__ = [
+     "JS_RESOLUTION_EXTENSIONS",
+     "JS_SOURCE_EXTENSIONS",
+@@ -513,6 +779,8 @@
+     "KOTLIN_SOURCE_EXTENSIONS",
+     "PYTHON_RESOLUTION_EXTENSIONS",
+     "PYTHON_SOURCE_EXTENSIONS",
++    "RUST_SOURCE_EXTENSIONS",
++    "RUST_STDLIB_CRATES",
+     "SOURCE_EXTENSIONS",
+     "EXPERIMENTAL_SOURCE_EXTENSIONS",
+     "is_tool_implementation_path",
+@@ -532,8 +800,12 @@
+     "kotlin_source_root",
+     "kotlin_top_level_names",
+     "parse_kotlin_imports",
++    "parse_rust_imports",
+     "python_module_candidates",
+     "resolve_relative_import_path",
++    "rust_cargo_package_name",
++    "rust_module_path_of",
++    "rust_top_level_names",
+     "source_language",
+     "strip_js_comments",
+     "strip_jsonc_comments",
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -24,6 +24,7 @@
+ 
+ from language_semantics import (
+     JS_RESOLUTION_EXTENSIONS as RESOLUTION_EXTENSIONS,
++    RUST_STDLIB_CRATES,
+     SOURCE_EXTENSIONS,
+     alias_candidates as _alias_candidates,
+     candidate_targets as _candidate_targets,
+@@ -39,8 +40,12 @@
+     normalize_path as _normalize_path,
+     parse_kotlin_imports as _parse_kotlin_imports,
+     parse_python_imports,
++    parse_rust_imports as _parse_rust_imports,
+     python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
++    rust_cargo_package_name as _rust_cargo_package_name,
++    rust_module_path_of as _rust_module_path_of,
++    rust_top_level_names as _rust_top_level_names,
+     source_language,
+     source_path_allowed,
+     strip_js_comments as _strip_comments,
+@@ -130,6 +135,14 @@
+                 item.get("symbols", []), clean_content
+             )
+         return items
++    if source_language(file_path) == "rust":
++        items = _parse_rust_imports(content)
++        clean_content = _strip_comments(content)
++        for item in items:
++            item["semantic_usages"] = _find_semantic_usages(
++                item.get("symbols", []), clean_content
++            )
++        return items
+     clean_content = _strip_comments(content)
+     results: List[Dict[str, str]] = []
+ 
+@@ -156,6 +169,8 @@
+ ENTRYPOINT_RULES = [
+     (re.compile(r"^main\.server\.(ts|js)$"), "ssr_bootstrap", 0.95),
+     (re.compile(r"^main\.(ts|js)$"), "browser_bootstrap", 0.95),
++    # R1: a Rust binary crate's entry point.
++    (re.compile(r"^main\.rs$"), "binary_entry", 0.90),
+     (re.compile(r"^server\.(ts|js)$"), "server_http", 0.90),
+     (re.compile(r"^entry\.server\.(ts|js)$"), "ssr_bootstrap", 0.90),
+     (re.compile(r"^entry\.client\.(ts|js)$"), "browser_bootstrap", 0.90),
+@@ -185,7 +200,10 @@
+         return True
+     if os.path.basename(file_path).endswith("Test.kt"):
+         return True
+-    return "/src/test/" in file_path.replace("\\", "/")
++    if "/src/test/" in file_path.replace("\\", "/"):
++        return True
++    # R1: Rust integration tests live under a `tests/` directory.
++    return "/tests/" in file_path.replace("\\", "/")
+ 
+ 
+ def _read_file(path: str) -> Optional[str]:
+@@ -625,6 +643,39 @@
+     return dict(sorted(discovered.items()))
+ 
+ 
++def _rust_package_for_file(file_path: str) -> Tuple[str, str]:
++    """Return (lib_name, lib_root) for a Rust file from its nearest Cargo.toml (R1).
++
++    The lib target name defaults to the package name with `-` -> `_` (an
++    explicit `[lib] name` wins — see `rust_cargo_package_name`). The lib
++    root is the package dir's `src`, in corpus path form. Returns ("", "")
++    when no manifest is found or the package has no `[package] name`
++    (e.g. snapshot mode) — the caller then treats `<pkg>::` imports as
++    external, never as wrong edges.
++    """
++    directory = os.path.dirname(file_path)
++    while True:
++        fs_dir = os.path.abspath(directory) if directory else os.getcwd()
++        manifest = os.path.join(fs_dir, "Cargo.toml")
++        if os.path.isfile(manifest):
++            try:
++                with open(manifest, encoding="utf-8", errors="ignore") as f:
++                    text = f.read()
++            except OSError:
++                return "", ""
++            _package, lib_name = _rust_cargo_package_name(text)
++            if not lib_name:
++                return "", ""
++            lib_root = _normalize_path(os.path.join(directory, "src")) if directory else "src"
++            return lib_name, lib_root
++        if not directory:
++            return "", ""
++        parent = os.path.dirname(directory)
++        if parent == directory:
++            return "", ""
++        directory = parent
++
++
+ def build_shared_graph(
+     scan_root: str = ".",
+     ignore_dirs: Optional[Set[str]] = None,
+@@ -705,6 +756,40 @@
+                 kotlin_symbol_index.setdefault((_pkg, _name), _fp)
+ 
+     # ============================================================
++    # PASS 1.5 (cont.): Rust module/symbol index (R1)
++    # Built from the contents PASS 1 already read. Crate roots are
++    # derived per file (nearest ancestor lib.rs/main.rs; bin/examples/
++    # tests/benches files are their own crates), so workspace layouts
++    # need no configuration. Top-level declarations are indexed as
++    # (root, module, name) -> file, so `use crate::foo::greet` resolves
++    # even when `greet` is declared in a differently-named file.
++    # Package names come from the nearest Cargo.toml ([package] name,
++    # `-` -> `_`; explicit [lib] name wins) so integration tests can
++    # `use <pkg>::...` the library crate. When the manifest is absent
++    # (e.g. snapshot mode) the package map stays empty and `<pkg>::`
++    # imports classify as external — never as wrong edges.
++    # ============================================================
++    rust_file_module: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
++    rust_module_index: Dict[Tuple[str, Tuple[str, ...]], str] = {}
++    rust_symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str] = {}
++    rust_top_modules: Dict[str, Set[str]] = {}
++    rust_package_lib: Dict[str, str] = {}
++    for _fp in all_files:
++        if not _fp.endswith(".rs"):
++            continue
++        _content = file_map.get(_fp, "")
++        _root, _modpath = _rust_module_path_of(_fp, all_files)
++        rust_file_module[_fp] = (_root, _modpath)
++        rust_module_index.setdefault((_root, _modpath), _fp)
++        if _modpath:
++            rust_top_modules.setdefault(_root, set()).add(_modpath[0])
++        for _name in _rust_top_level_names(_content):
++            rust_symbol_index.setdefault((_root, _modpath, _name), _fp)
++        _lib_name, _lib_root = _rust_package_for_file(_fp)
++        if _lib_name and _lib_root:
++            rust_package_lib.setdefault(_lib_name, _lib_root)
++
++    # ============================================================
+     # PASS 2: Node metadata extraction
+     # ============================================================
+     node_metadata: Dict[str, Dict[str, Any]] = {}
+@@ -821,6 +906,139 @@
+                             "reason": "kotlin_external",
+                         })
+                     continue
++                if language == "rust":
++                    # R1: Rust `use` paths, plus `mod` declarations. A `mod`
++                    # is resolved against sibling files next to the
++                    # declaring file (`<name>.rs`, then `<name>/mod.rs`) —
++                    # a `mod` is relative to the declaring *module's*
++                    # directory, so the generic relative branch (file
++                    # directory) would mis-resolve it. `use` paths resolve
++                    # in two stages — module path under the importer's crate
++                    # root, then the (module, name) symbol index — mirroring
++                    # the Kotlin branch. No parent-module fallback: a typo
++                    # stays unresolved, honestly. Unmatched imports are
++                    # classified, not silently dropped: a `::*` glob resolves
++                    # through the module stage (it targets one module file)
++                    # and is unresolved (rust_glob) only when that module
++                    # does not resolve; std/core/alloc are external
++                    # (rust_stdlib); other unknown first segments are
++                    # external crates (rust_external); anchored
++                    # (`crate`/`self`/`super`), own-package (`<pkg>::`) and
++                    # known-local-module paths that do not resolve are
++                    # unresolved (rust_unresolved).
++                    if item.get("rust_mod"):
++                        # A `mod` is relative to the declaring *module's*
++                        # directory: resolve through the module index (it
++                        # encodes exactly that: lib.rs -> (foo,) is
++                        # src/foo.rs, foo.rs -> (foo, bar) is
++                        # src/foo/bar.rs, foo/mod.rs -> (foo, bar) is the
++                        # same file). Files that are their own crate
++                        # (src/bin/*, examples/*, tests/*, benches/*,
++                        # standalone files: root == the file itself) have
++                        # no module directory, so their child modules live
++                        # next to the file instead.
++                        _own_root, _own_mod = rust_file_module.get(fp, (fp, ()))
++                        _target_mod = _own_mod + (raw_import,)
++                        _mod_matched = rust_module_index.get((_own_root, _target_mod))
++                        if _mod_matched is None and _own_root == fp:
++                            _mod_dir = os.path.dirname(fp)
++                            _mod_cands = [
++                                _normalize_path(os.path.join(_mod_dir, raw_import + ".rs")),
++                                _normalize_path(os.path.join(_mod_dir, raw_import, "mod.rs")),
++                            ]
++                            _mod_matched = next(
++                                (c for c in _mod_cands if c in all_files_set), None
++                            )
++                        if _mod_matched:
++                            edges.append((fp, _mod_matched))
++                            resolved_edge_natures.setdefault((fp, _mod_matched), []).append(nature)
++                            resolved_edge_usages.setdefault((fp, _mod_matched), []).extend(usages)
++                            resolved_targets.append(_mod_matched)
++                        else:
++                            _mod_base = _normalize_path(
++                                os.path.join(_own_root, * _target_mod)
++                            ) if _own_root != fp else _normalize_path(
++                                os.path.join(os.path.dirname(fp), raw_import)
++                            )
++                            unresolved_imports.append({
++                                "importer": fp,
++                                "raw_import": raw_import,
++                                "reason": "rust_mod_unresolved",
++                                "attempted_candidates": [
++                                    _mod_base + ".rs",
++                                    _mod_base + "/mod.rs",
++                                ],
++                            })
++                        continue
++                    # A glob (`use a::b::*;`) targets one module file, so
++                    # it resolves through the module stage below; only a
++                    # glob whose module does not resolve stays unresolved
++                    # (rust_glob). (Unlike a Kotlin wildcard, which targets
++                    # a multi-file package and has no single file to edge
++                    # to, so it stays unresolved there.)
++                    _segs = raw_import.split("::")
++                    _own_root, _own_mod = rust_file_module.get(fp, (fp, ()))
++                    _target_root = _own_root
++                    _anchored = False
++                    _own_package = False
++                    if _segs[0] == "crate":
++                        _base: Tuple[str, ...] = ()
++                        _rest = _segs[1:]
++                        _anchored = True
++                    elif _segs[0] == "self":
++                        _base = _own_mod
++                        _rest = _segs[1:]
++                        _anchored = True
++                    elif _segs[0] == "super":
++                        _ups = 0
++                        while _ups < len(_segs) and _segs[_ups] == "super":
++                            _ups += 1
++                        _base = _own_mod[: max(0, len(_own_mod) - _ups)]
++                        _rest = _segs[_ups:]
++                        _anchored = True
++                    elif _segs[0] in RUST_STDLIB_CRATES:
++                        external_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "rust_stdlib",
++                        })
++                        continue
++                    elif _segs[0] in rust_package_lib:
++                        _target_root = rust_package_lib[_segs[0]]
++                        _base = ()
++                        _rest = _segs[1:]
++                        _own_package = True
++                    else:
++                        _base = ()
++                        _rest = _segs
++                    _full = _base + tuple(_rest)
++                    matched = None
++                    if _rest:
++                        matched = rust_module_index.get((_target_root, _full))
++                    if not matched and _rest and not item.get("wildcard"):
++                        matched = rust_symbol_index.get(
++                            (_target_root, _base + tuple(_rest[:-1]), _rest[-1])
++                        )
++                    if matched:
++                        edges.append((fp, matched))
++                        resolved_edge_natures.setdefault((fp, matched), []).append(nature)
++                        resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
++                        resolved_targets.append(matched)
++                    elif _anchored or _own_package or (
++                        _rest and _rest[0] in rust_top_modules.get(_target_root, set())
++                    ):
++                        unresolved_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "rust_glob" if item.get("wildcard") else "rust_unresolved",
++                        })
++                    else:
++                        external_imports.append({
++                            "importer": fp,
++                            "raw_import": raw_import,
++                            "reason": "rust_external",
++                        })
++                    continue
+                 if language == "python":
+                     python_candidates = python_module_candidates(raw_import, [scan_root_norm])
+                     matched = next((cand for cand in python_candidates if cand in all_files_set), None)
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -13,7 +13,7 @@
+ 
+ from core.shared_graph import DEFAULT_IGNORE_DIRS, discover_source_files
+ from core.semantic_affordance import COMMAND_CONTRACTS, describe_command
+-from language_semantics import JS_SOURCE_EXTENSIONS
++from language_semantics import SOURCE_EXTENSIONS
+ 
+ SCHEMA_VERSION = "plw-portable-agent-v1"
+ POLICY = "standalone-binary-target-first-agent-surface-v1"
+@@ -341,7 +341,7 @@
+         }
+     topology: Dict[str, Any] = {
+         "available": bool(support.get("topology_ready")),
+-        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx/.kt)",
++        "scope": "stable_shared_graph (.ts/.tsx/.js/.jsx/.kt/.rs)",
+         "reason": str(support.get("reason") or ""),
+         "note": "the engine does not extend topology (G6)",
+     }
+@@ -402,7 +402,7 @@
+         )
+     return {
+         "scope": "stable_shared_graph",
+-        "topology_extensions": list(JS_SOURCE_EXTENSIONS),
++        "topology_extensions": list(SOURCE_EXTENSIONS),
+         "supported_source_files": supported,
+         "topology_ready": bool(supported),
+         "reason": reason,
+@@ -472,7 +472,7 @@
+         "schema_version": SCHEMA_VERSION,
+         "entrypoint": "plw agent orient",
+         "stable_topology": {
+-            "extensions": list(JS_SOURCE_EXTENSIONS),
++            "extensions": list(SOURCE_EXTENSIONS),
+             "experimental_python_promoted": False,
+         },
+         "flow": [
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -152,6 +152,7 @@
+     from core.runtime_attestation import create_runtime_attestation, find_runtime_attestation_lineages_for_output
+     from core.proof_transitions import transition_identity
+     from core.semantic_affordance import describe_command, route_task_semantics
++    from language_semantics import source_extensions
+     from core.operation_plan import resolve_operation_plan
+     from core.portable_agent import (
+         build_version as portable_build_version,
+@@ -4322,7 +4323,11 @@
+         else:
+             orient = result.get("target_orientation", {}) or {}
+             inv = orient.get("inventory", {}) or {}
+-            print(f"# Files: {inv.get('files', 0)} (stable-topology sources only; .ts/.tsx/.js/.jsx) | internal import edges: {inv.get('internal_import_edges', 0)}")
++            # R1: the scope lists the live source-extension contract, so the
++            # label can never again lag the count (it used to hardcode the
++            # JS-only list even after Kotlin joined the graph).
++            _topo_exts = "/".join(source_extensions())
++            print(f"# Files: {inv.get('files', 0)} (stable-topology sources only; {_topo_exts}) | internal import edges: {inv.get('internal_import_edges', 0)}")
+             print(f"# Entrypoints: {inv.get('entrypoints', 0)} | tests: {inv.get('tests', 0)} | cyclic SCCs: {inv.get('cyclic_sccs', 0)}")
+             print(f"# Unresolved imports: {inv.get('unresolved_imports', 0)} | external imports: {inv.get('external_imports', 0)}")
+             engine = (result.get("target_orientation") or {}).get("engine") or {}

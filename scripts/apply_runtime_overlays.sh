@@ -204,6 +204,10 @@ apply_reviewable_overlay "ledger_memory_disambiguation_v1"
 grep -Fq 'transition-memory (not plw memory)' plw_cli.py
 apply_reviewable_overlay "doctor_engine_required_note_v1"
 grep -Fq 'required for structural questions' plw_cli.py
+apply_reviewable_overlay "rust_topology_v1"
+grep -Fq 'parse_rust_imports' language_semantics.py
+grep -Fq 'rust_module_index' core/shared_graph.py
+grep -Fq '"/".join(source_extensions())' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
