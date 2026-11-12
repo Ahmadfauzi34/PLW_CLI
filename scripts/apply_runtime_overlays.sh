@@ -183,6 +183,9 @@ apply_reviewable_overlay "help_exit_codes_v1"
 grep -Fq '_MODE_HELP_USAGE' hott_kernel.py
 grep -Fq 'Usage: plw validation-coverage <plan.json>' plw_cli.py
 grep -Fq 'Usage: plw check [root]' plw_cli.py
+apply_reviewable_overlay "ast_help_root_first_v1"
+grep -Fq '[root] [query]' plw_cli.py
+grep -Fq 'plw ast is the exception: two positionals are root-first' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

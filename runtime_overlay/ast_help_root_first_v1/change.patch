@@ -1,0 +1,89 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4661,13 +4661,13 @@
+ def _resolve_ast_positionals(operation, pos1, pos2, flag_root):
+     """Resolve `plw ast` positionals to (root, query, error).
+ 
+-    Canonical form is query-first: `plw ast callers <query> [root]`,
+-    with `--root DIR` as the always-explicit form. The legacy root-first
+-    form (`plw ast callers <root> <query>`) keeps working: two
+-    positionals always mean root-first, and a single positional that
+-    names an existing directory means root (query is then missing, as
+-    before). `doctor` and `index` keep the legacy order — their first
+-    positional is always the root.
++    Two positionals always mean root-first: `plw ast callers <root>
++    <query>`. A single positional is the query (root is the current
++    directory) unless it names an existing directory, in which case it
++    is the root and the query is missing. `--root DIR` is the
++    always-explicit form and wins over any positional. `doctor` and
++    `index` keep the legacy order — their first positional is always
++    the root.
+     """
+     if flag_root is not None:
+         root = Path(flag_root).expanduser().resolve()
+@@ -4708,12 +4708,17 @@
+     reports, builds, or deletes the engine's gob index for that root
+     (G9); the index lives under PLW's cache root unless --cache-dir
+     or CODESEARCH_CACHE_DIR says otherwise.
++
++    Argument order: two positionals are always root-first (root, then
++    query); a single positional is the query unless it names a
++    directory, in which case it is the root; --root DIR is always
++    explicit.
+     """
+     import argparse
+-    parser = argparse.ArgumentParser(prog="plw ast")
++    parser = argparse.ArgumentParser(prog="plw ast", epilog="Argument order: two positionals are always root-first (root, then query); a single positional is the query unless it names a directory, in which case it is the root; --root DIR is always explicit.")
+     parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor", "index"))
+-    parser.add_argument("query", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=None)
++    parser.add_argument("query", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--binary", default=None)
+     parser.add_argument("--cache-dir", default=None)
+@@ -4722,7 +4727,7 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = parser.parse_args(args)
+     root, query, resolve_error = _resolve_ast_positionals(
+-        opts.operation, opts.query, opts.root, opts.root_flag,
++        opts.operation, opts.root, opts.query, opts.root_flag,
+     )
+     if resolve_error:
+         parser.error(resolve_error)
+@@ -4760,8 +4765,8 @@
+             if not query:
+                 parser.error(
+                     "plw ast defs|callers|related|search requires <query> — "
+-                    "write the query first, e.g. plw ast callers <name> [root], "
+-                    "or use --root DIR"
++                    "write the query alone (root is the current directory), "
++                    "write the root first then the query, or use --root DIR"
+                 )
+             binary, discovered_via = discover_codesearch(opts.binary)
+             # G8: a comma-separated query answers all names in one scan.
+@@ -5115,7 +5120,7 @@
+   Start here — new to PLW? Read top to bottom, then run:
+     plw doctor [root]                     -> readiness check
+     plw topology [root]                   -> map of the codebase
+-    plw ast <defs|callers|related|search> <query> [root]  -> where things are defined / who calls them
++    plw ast <defs|callers|related|search> [root] [query]  -> where things are defined / who calls them
+     plw agent orient [root] --task TASK   -> task entrypoint (orientation only, no execution)
+   Task pipeline, in order — each step reads the previous step's receipt:
+     orient -> resolve-target -> evidence-needs -> capability-match -> candidate select
+@@ -5127,13 +5132,13 @@
+     plw ledger lineage|accountability|chain|memory|model|reconcile — lineage / accountability / accountability-chain / transition-memory / transition-model / reconcile-outcomes
+   Argument order: write the query/target first, root second (e.g. plw context <query> [root]).
+     Every command that takes [root] also accepts --root DIR; the flag wins over the positional.
+-    plw ast accepts both orders; --root DIR is always explicit.
++    plw ast is the exception: two positionals are root-first (root, then query); one positional is the query unless it names a directory; --root DIR is always explicit.
+ 
+ 1. Orientation & fast mapping
+   plw doctor [root] [--json]
+       -> Verifies standalone binary/embedded skill readiness; Chromium is optional for static capabilities
+-  plw ast <defs|callers|related|search|doctor> <query> [root] [--root DIR] [--binary PATH] [--timeout N] [--limit N] [--json]
+-      -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); write the query first, root second — a first word that names an existing directory is still read as root, and --root DIR is explicit; callers are name-based leads, not proof
++  plw ast <defs|callers|related|search|doctor> [root] [query] [--root DIR] [--binary PATH] [--timeout N] [--limit N] [--json]
++      -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); two positionals are always root-first, a single positional is the query unless it names a directory, and --root DIR is explicit; callers are name-based leads, not proof
+   plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--json]
+       -> Official target-first agent entrypoint; orientation only, no runtime/source mutation authority
+   plw capability list [--json]
