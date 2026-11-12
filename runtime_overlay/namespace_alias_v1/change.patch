@@ -1,0 +1,94 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4919,6 +4919,67 @@
+     return code
+ 
+ 
++def cmd_lease(args: List[str]) -> int:
++    """Namespace alias for the lease commands (additive; canonical names unchanged).
++
++    plw lease validation ... -> plw validation-lease ...
++    plw lease execution ... -> plw action-lease ...
++    """
++    import argparse
++    parser = argparse.ArgumentParser(prog="plw lease")
++    parser.add_argument("operation", choices=("validation", "execution"))
++    parser.add_argument("rest", nargs=argparse.REMAINDER)
++    opts = parser.parse_args(args)
++    if opts.operation == "validation":
++        return cmd_validation_lease(opts.rest)
++    return cmd_action_lease(opts.rest)
++
++
++def cmd_proof(args: List[str]) -> int:
++    """Namespace alias for the proof commands (additive; canonical names unchanged).
++
++    plw proof obligations ... -> plw validation-coverage ...
++    plw proof postcondition ... -> plw postcondition-proof ...
++    """
++    import argparse
++    parser = argparse.ArgumentParser(prog="plw proof")
++    parser.add_argument("operation", choices=("obligations", "postcondition"))
++    parser.add_argument("rest", nargs=argparse.REMAINDER)
++    opts = parser.parse_args(args)
++    if opts.operation == "obligations":
++        return cmd_validation_coverage(opts.rest)
++    return cmd_postcondition_proof(opts.rest)
++
++
++def cmd_ledger(args: List[str]) -> int:
++    """Namespace alias for the ledger commands (additive; canonical names unchanged).
++
++    plw ledger lineage ... -> plw lineage ...
++    plw ledger accountability ... -> plw accountability ...
++    plw ledger chain ... -> plw accountability-chain ...
++    plw ledger memory ... -> plw transition-memory ...
++    plw ledger model ... -> plw transition-model ...
++    plw ledger reconcile ... -> plw reconcile-outcomes ...
++    """
++    import argparse
++    parser = argparse.ArgumentParser(prog="plw ledger")
++    parser.add_argument("operation", choices=(
++        "lineage", "accountability", "chain", "memory", "model", "reconcile"))
++    parser.add_argument("rest", nargs=argparse.REMAINDER)
++    opts = parser.parse_args(args)
++    if opts.operation == "lineage":
++        return cmd_lineage(opts.rest)
++    if opts.operation == "accountability":
++        return cmd_accountability(opts.rest)
++    if opts.operation == "chain":
++        return cmd_accountability_chain(opts.rest)
++    if opts.operation == "memory":
++        return cmd_transition_memory(opts.rest)
++    if opts.operation == "model":
++        return cmd_transition_model(opts.rest)
++    return cmd_reconcile_outcomes(opts.rest)
++
++
+ def cmd_semantic(args: List[str]) -> int:
+     """Read-only predictive semantics for agents unfamiliar with PLW vocabulary."""
+     import argparse
+@@ -4999,6 +5060,10 @@
+     orient -> resolve-target -> evidence-needs -> capability-match -> candidate select
+     (semantic route is the predictive side-branch: use it when a name stays opaque after topology.)
+   Receipts: every stage issues a receipt and names the next stage — pass it with --receipt <json|@file> to the next stage; a stage checks task, stage order and root, and refuses a mismatched receipt. Entry stages (orient, work) take no receipt.
++  Namespace aliases (same commands, grouped names; canonical names unchanged):
++    plw lease validation|execution — validation-lease / action-lease
++    plw proof obligations|postcondition — validation-coverage / postcondition-proof
++    plw ledger lineage|accountability|chain|memory|model|reconcile — lineage / accountability / accountability-chain / transition-memory / transition-model / reconcile-outcomes
+   Argument order: write the query/target first, root second (e.g. plw context <query> [root]).
+     Every command that takes [root] also accepts --root DIR; the flag wins over the positional.
+     plw ast accepts both orders; --root DIR is always explicit.
+@@ -5184,6 +5249,12 @@
+         sys.exit(cmd_candidate(sub_args))
+     elif cmd in ("semantic", "semantics", "affordance"):
+         sys.exit(cmd_semantic(sub_args))
++    elif cmd == "lease":
++        sys.exit(cmd_lease(sub_args))
++    elif cmd == "proof":
++        sys.exit(cmd_proof(sub_args))
++    elif cmd == "ledger":
++        sys.exit(cmd_ledger(sub_args))
+     elif cmd in ("context", "pack"):
+         sys.exit(cmd_context(sub_args))
+     elif cmd in ("transitions", "transition", "proof-transitions", "proof_transitions"):
