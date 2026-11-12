@@ -1,0 +1,11 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4625,7 +4625,7 @@
+         return code
+     if "ready" in result:
+         print("# Version: " + str(result.get("version")))
+-        print("# READY: " + ("true" if result.get("ready") else "false"))
++        print("# READY: " + ("true" if result.get("ready") else "false") + " (portable interface + target root; stable topology is a separate check)")
+         support = result.get("target_support", {}) or {}
+         print("# Stable topology: %s | supported_files=%s | extensions=%s" % (
+             "READY" if support.get("topology_ready") else "NOT_READY",

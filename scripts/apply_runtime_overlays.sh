@@ -186,6 +186,12 @@ grep -Fq 'Usage: plw check [root]' plw_cli.py
 apply_reviewable_overlay "ast_help_root_first_v1"
 grep -Fq '[root] [query]' plw_cli.py
 grep -Fq 'plw ast is the exception: two positionals are root-first' plw_cli.py
+apply_reviewable_overlay "orient_engine_answer_v1"
+grep -Fq 'engine_answer' core/agent_communication.py
+grep -Fq '_engine_answer_summary' hott_kernel.py
+grep -Fq '# Engine answer: ' plw_cli.py
+apply_reviewable_overlay "doctor_ready_scope_v1"
+grep -Fq 'portable interface + target root; stable topology is a separate check' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

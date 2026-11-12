@@ -1,0 +1,175 @@
+--- a/core/agent_communication.py
++++ b/core/agent_communication.py
+@@ -77,6 +77,61 @@
+     return value
+ 
+ 
++def _project_engine_answer(answer: Mapping[str, Any] | None) -> Dict[str, Any] | None:
++    """Project an engine-answer summary into the decision frame, or None.
++
++    The frame owns its schema: only the known keys survive, only when at
++    least one located symbol or call is named. An empty or malformed
++    summary stays out of the frame instead of claiming an answer. The
++    summary shape is {symbols: [{symbol, file, line, kind, authority}],
++    calls: [{caller: {file, line}, callee: <symbol string>}]}; a callee
++    given as a raw edge dict is still accepted defensively.
++    """
++    if not isinstance(answer, Mapping):
++        return None
++    symbols = [
++        {
++            "symbol": s.get("symbol"),
++            "file": s.get("file"),
++            "line": s.get("line"),
++            "kind": s.get("kind"),
++            "authority": s.get("authority"),
++        }
++        for s in (answer.get("symbols") or [])[:4]
++        if isinstance(s, Mapping)
++    ]
++    calls = []
++    for c in (answer.get("calls") or [])[:4]:
++        if not isinstance(c, Mapping):
++            continue
++        caller = c.get("caller")
++        if not isinstance(caller, Mapping):
++            caller = {}
++        callee = c.get("callee")
++        if isinstance(callee, Mapping):
++            callee = callee.get("symbol")
++        calls.append(
++            {
++                "caller": {"file": caller.get("file"), "line": caller.get("line")},
++                "callee": callee if isinstance(callee, str) else None,
++            }
++        )
++    if not symbols and not calls:
++        return None
++    return {
++        "resolved": True,
++        "symbols": symbols,
++        "calls": calls,
++        "symbol_count": int(answer.get("symbol_count") or len(symbols)),
++        "call_count": int(answer.get("call_count") or len(calls)),
++        "detail_location": "target_orientation.engine",
++        "note": (
++            "Engine layer located symbol(s) in this target; detail in "
++            "target_orientation.engine, route in dynamic_context."
++        ),
++    }
++
++
+ def build_agent_decision_frame(
+     *,
+     work_status: str,
+@@ -85,6 +140,7 @@
+     capability_selection: Mapping[str, Any],
+     proof_gate: Mapping[str, Any],
+     skill_handoff: Mapping[str, Any],
++    engine_answer: Mapping[str, Any] | None = None,
+ ) -> Dict[str, Any]:
+     resolution = target_resolution.get("resolution", {}) or {}
+     target_state = str(resolution.get("state") or "UNKNOWN")
+@@ -124,10 +180,15 @@
+         action_readiness = "NOT_READY"
+ 
+     task_postcondition_status = "UNPROVEN" if postcondition_requested else "NOT_EXPLICITLY_REQUESTED_OR_DERIVED"
+-    return {
++    projected_answer = _project_engine_answer(engine_answer)
++    frame = {
+         "schema_version": SCHEMA_VERSION,
+         "policy": POLICY,
+         "orchestration_status": orchestration,
++        # The engine answer sits directly under the headline status: a
++        # BLOCKED frame must not read as "no answer" when the engine
++        # layer already located the symbol(s).
++        **({"engine_answer": projected_answer} if projected_answer is not None else {}),
+         "legacy_work_status_scope": "reference_pack_status_only",
+         "target": {"state": target_state, "selected_targets": selected_targets},
+         "evidence": {
+@@ -174,6 +235,7 @@
+             "commit_truth": False,
+         },
+     }
++    return frame
+ 
+ 
+ __all__ = ["SCHEMA_VERSION", "POLICY", "normalize_skill_handoff", "build_agent_decision_frame"]
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -3132,6 +3132,49 @@
+     }
+ 
+ 
++def _engine_answer_summary(target_orientation: Dict[str, Any]) -> Dict[str, Any]:
++    """Summarize engine-located symbols for the agent decision frame.
++
++    The topology target may stay unresolved (or ambiguous) while the
++    engine layer already located symbol(s) in the target; the summary
++    lets the decision frame say so up front instead of reading as "no
++    answer". Returns {} when the engine located nothing, so the frame
++    stays silent instead of claiming an answer. Never raises.
++    """
++    try:
++        engine = (target_orientation or {}).get("engine") or {}
++        nodes = [n for n in (engine.get("symbol_nodes") or []) if isinstance(n, dict)]
++        edges = [e for e in (engine.get("symbol_edges") or []) if isinstance(e, dict)]
++        if not nodes and not edges:
++            return {}
++        return {
++            "symbols": [
++                {
++                    "symbol": n.get("symbol"),
++                    "file": n.get("file"),
++                    "line": n.get("line"),
++                    "kind": n.get("kind"),
++                    "authority": n.get("authority"),
++                }
++                for n in nodes[:4]
++            ],
++            "calls": [
++                {
++                    "caller": {
++                        "file": (e.get("caller") or {}).get("file"),
++                        "line": (e.get("caller") or {}).get("line"),
++                    },
++                    "callee": (e.get("callee") or {}).get("symbol"),
++                }
++                for e in edges[:4]
++            ],
++            "symbol_count": len(nodes),
++            "call_count": len(edges),
++        }
++    except Exception:
++        return {}
++
++
+ def kernel_work(
+     scan_root: str,
+     task: str,
+@@ -3502,6 +3545,7 @@
+             capability_selection=capability_selection_projection,
+             proof_gate=proof_projection,
+             skill_handoff=normalized_handoff,
++            engine_answer=_engine_answer_summary(target_orientation),
+         )
+     else:
+         agent_decision_frame = {}
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4950,6 +4950,15 @@
+             if sq.get("route"):
+                 print("# Structural route: " + str(sq["route"]))
+             print("# Target state: " + str(target.get("state", "unknown")))
++            answer = (frame.get("engine_answer", {}) or {})
++            if answer.get("symbols") or answer.get("calls"):
++                parts = []
++                for s in (answer.get("symbols") or [])[:4]:
++                    parts.append("%s defined %s:%s" % (s.get("symbol"), s.get("file"), s.get("line")))
++                for c in (answer.get("calls") or [])[:4]:
++                    caller = c.get("caller") or {}
++                    parts.append("%s:%s calls %s" % (caller.get("file"), caller.get("line"), c.get("callee")))
++                print("# Engine answer: " + "; ".join(parts) + " (detail: target_orientation.engine)")
+             ui_handoff = result.get("ui_source_handoff", {}) or {}
+             if ui_handoff.get("status") != "NOT_APPLICABLE":
+                 print("# UI source handoff: " + str(ui_handoff.get("status", "unknown")))
