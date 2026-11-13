@@ -415,3 +415,64 @@ ada def chunk sama sekali; memperbaikinya berarti memperluas query AST
 berikut yang terpisah. Bonus ranking definisi (compileDefRes) masih
 regex-only: method TS tidak mendapat bonus x2.0 di `search` biasa.
 Belum di-push ke PLW_CLI; pin engine belum dirotasi (menunggu kata user).
+
+## 2026-11-13 — Refactor 1 (SOLID): `//go:build verify` di harness.go (atas "Oke, kerjakan refactor 1 (tag harness)")
+harness.go (1.470 baris, framework verifikasi generik) terkompilasi ke
+biner rilis padahal unreachable di build normal — satu-satunya pemakai
+tokenize_spec.go ber-tag verify. Perubahan: 1 baris tag + komentar
+penempatan di kepala file; NOL perubahan logika (komparator/gerbang/
+IsCompleteAndVerified tak tersentuh). Tag aman karena `go run` mode
+file mengabaikan build tag (pola yang sama sudah dipakai tokenize_spec.go).
+Verifikasi (§5): baseline pohon PLW gofmt bersih, vet OK, go test 85/85,
+black-box 98/99 vs biner lama di tree (1 gagal: test_ts_methods_found —
+kontrol negatif, biner lama tak punya fix defs-only); sesudah: gofmt/vet/
+test lewat build.sh, go test 85/85, black-box 99/99 vs biner baru,
+verify-tokenize.sh READY_TO_COMMIT, `go list` tak lagi memuat harness.go.
+Biner baru: commit `7e0cf29f60ab`, digest
+`9c84e9a9efee20f46ef632659f715df6ad2f8f193973584869750b550dcb435a`
+(reproducible: build ulang dari direktori berbeda, digest sama).
+Byte berubah (36.379.338 -> 36.385.608) -> rotasi pin WAJIB menyertai push.
+Belum di-push ke PLW_CLI; pin belum dirotasi (menunggu kata user).
+
+## 2026-11-13 — Refactor 2 (SOLID): helper span bersama di search.go (atas "Oke, lanjut refactor 2 (helper span search.go)")
+`dedupContained` dan `dropContainedSigs` (search.go) membangun mesin
+span yang sama persis (span dari Text + byPath + loop O(k^2) per file).
+Perubahan: tipe paket `chunkSpan` + method `contains` + helper
+`chunkSpansAndGroups` dipakai kedua fungsi; komentar ganda hasil
+copy-paste di atas `dedupContained` (teks `diversify` nyasar) diganti
+satu paragraf yang akurat. NOL perubahan perilaku (logika containment
+dan aturan drop disalin verbatim ke method/helper).
+Verifikasi (§5): baseline pohon PLW go test 85/85, black-box 99/99 vs
+biner 9c84e9a9; sesudah: `build.sh` lolos semua gerbang, go test 85/85,
+black-box 99/99 vs biner baru, diferensial biner lama vs baru 79 kasus
+(fixture, rp, codesearch-go; plain/--full/--all/--defs-only/--paths-only/
+--json) 0 diff (stdout + exit code identik).
+Biner baru: commit `19519a841d55`, digest
+`d725da4c187e4004fc65918041a35b6815dd144a7f4326ce5a8a7b67c814c23f`
+(reproducible: build ulang dari direktori berbeda, digest sama).
+Byte berubah (36.385.608 -> 36.386.161) -> rotasi pin WAJIB menyertai push.
+Belum di-push ke PLW_CLI; pin belum dirotasi (menunggu kata user).
+
+## 2026-11-13 — Refactor 3 (SOLID): helper processFile di index.go (atas "Oke, lanjut refactor 3 (helper processFile index.go)")
+`buildFull` (paralel) dan `sync` (sekuensial) mengandung blok pemrosesan
+per-file yang sama ~20 baris (readSource -> chunkFile -> ChunkDoc ->
+extractRelated). Perubahan: tipe `fileOutcome` + fungsi murni
+`processFile(root, rel)` dipakai keduanya; struct lokal `result`
+7-field dihapus (merge loop memakai `rels[i]`). Flag `relOK` menjaga
+beda ok-handling extractRelated persis seperti sebelumnya (buildFull
+mengabaikan, sync memeriksa); semua return false extractor membawa
+slice nil (dicek di related.go), jadi perilaku sama hari ini dan flag
+melindungi bila extractor berubah nanti. NOL perubahan perilaku.
+Verifikasi (§5): baseline pohon PLW go test 85/85, black-box 99/99 vs
+biner d725da4c; sesudah: `build.sh` lolos semua gerbang, go test 85/85,
+black-box 99/99 vs biner baru, diferensial biner lama vs baru 96 kasus
+0 diff nyata (baterai query 89 kasus + skenario sync: build, mutasi
+edit/hapus/tambah, sync ulang, --index-status; satu-satunya selisih
+mentah adalah path cache/root, nama gob (hash path root), dan newest
+(mtime salinan) — setelah normalisasi ketiganya, --index-status
+identik: files 12, chunks 54, size 33560, stale 0/0/0).
+Biner baru: commit `e88c2e3f11f8`, digest
+`62b532ec6b4d22ca223c452614a8db020566fc967678662b4a4ac4953906b177`
+(reproducible: build ulang dari direktori berbeda, digest sama).
+Byte berubah (36.386.161 -> 36.371.290) -> rotasi pin WAJIB menyertai push.
+Belum di-push ke PLW_CLI; pin belum dirotasi (menunggu kata user).

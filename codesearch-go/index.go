@@ -378,18 +378,52 @@ func (ix *memIndex) chunkingStats() (astFiles, fallbackFiles int) {
 // buildFull indexes every file, in parallel, merging in sorted path order
 // so chunk indices (and hence tie-breaking) are deterministic.
 // Returns the index and its build accounting (content + skip buckets).
+// fileOutcome is the per-file indexing result shared by buildFull
+// (parallel) and sync (sequential): the file read, its chunk docs and
+// AST flag, and its related maps. relOK mirrors extractRelated's ok:
+// every false return today carries nil slices, but the flag keeps the
+// two callers' ok-handling exact — buildFull ignores it (as before),
+// sync checks it (as before).
+type fileOutcome struct {
+	fr         fileRead
+	docs       []ChunkDoc
+	astOK      bool
+	relDefs    []relDef
+	relEdges   []relEdge
+	relBridges []relBridge
+	relOK      bool
+}
+
+// processFile reads one file and derives its index inputs: chunk docs
+// (+AST flag) and related maps. Pure — it touches no index state — so
+// buildFull can run it in goroutines and sync can call it inline.
+func processFile(root, rel string) fileOutcome {
+	fr := readSource(root, rel)
+	out := fileOutcome{fr: fr}
+	if !fr.haveText {
+		return out
+	}
+	chunks, astOK := chunkFile(rel, fr.text)
+	out.astOK = astOK
+	for _, c := range chunks {
+		out.docs = append(out.docs, ChunkDoc{
+			Path: rel,
+			Line: c.startLine,
+			Text: joinLines(c.lines),
+			Kind: string(c.kind),
+			Name: c.name,
+		})
+	}
+	// Second parse for the related maps (defs, re-export edges,
+	// bridges). Cost is paid once per build; the gob persists the
+	// maps, so cached runs skip it.
+	out.relDefs, out.relEdges, out.relBridges, out.relOK = extractRelated(rel, fr.text)
+	return out
+}
+
 func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 	rels := iterFiles(root, cfg)
-	type result struct {
-		rel        string
-		fr         fileRead
-		docs       []ChunkDoc
-		astOK      bool
-		relDefs    []relDef
-		relEdges   []relEdge
-		relBridges []relBridge
-	}
-	results := make([]result, len(rels))
+	results := make([]fileOutcome, len(rels))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
 	for i, rel := range rels {
@@ -398,37 +432,15 @@ func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			fr := readSource(root, rel)
-			var docs []ChunkDoc
-			var astOK bool
-			var rd []relDef
-			var re_ []relEdge
-			var rb []relBridge
-			if fr.haveText {
-				var chunks []chunk
-				chunks, astOK = chunkFile(rel, fr.text)
-				for _, c := range chunks {
-					docs = append(docs, ChunkDoc{
-						Path: rel,
-						Line: c.startLine,
-						Text: joinLines(c.lines),
-						Kind: string(c.kind),
-						Name: c.name,
-					})
-				}
-				// Second parse for the related maps (defs, re-export
-				// edges, bridges). Cost is paid once per build; the
-				// gob persists the maps, so cached runs skip it.
-				rd, re_, rb, _ = extractRelated(rel, fr.text)
-			}
-			results[i] = result{rel, fr, docs, astOK, rd, re_, rb}
+			results[i] = processFile(root, rel)
 		}(i, rel)
 	}
 	wg.Wait()
 
 	ix := newMemIndex(root)
 	var st buildStats
-	for _, r := range results {
+	for i, r := range results {
+		rel := rels[i]
 		if !r.fr.statOK {
 			continue
 		}
@@ -450,7 +462,7 @@ func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 				st.overchars++
 			}
 		}
-		ix.files[r.rel] = FileMeta{Mtime: r.fr.mtimeNanos, Size: r.fr.size, AST: r.astOK, Skip: r.fr.skip}
+		ix.files[rel] = FileMeta{Mtime: r.fr.mtimeNanos, Size: r.fr.size, AST: r.astOK, Skip: r.fr.skip}
 		if r.fr.mtimeNanos > ix.newest {
 			ix.newest = r.fr.mtimeNanos
 		}
@@ -506,25 +518,22 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 			}
 			continue
 		}
-		fr := readSource(root, rel)
+		out := processFile(root, rel)
+		fr := out.fr
 		if !fr.statOK {
 			delete(seen, rel)
 			continue
 		}
 		ix.removePath(rel)
 		ix.removeRel(rel)
-		astOK := false
 		if fr.haveText {
-			var chunks []chunk
-			chunks, astOK = chunkFile(rel, fr.text)
-			for _, c := range chunks {
-				d := ChunkDoc{Path: rel, Line: c.startLine, Text: joinLines(c.lines), Kind: string(c.kind), Name: c.name}
+			for _, d := range out.docs {
 				ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
 			}
-			if rd, re_, rb, ok := extractRelated(rel, fr.text); ok {
-				ix.relDefs = append(ix.relDefs, rd...)
-				ix.relEdges = append(ix.relEdges, re_...)
-				ix.relBridges = append(ix.relBridges, rb...)
+			if out.relOK {
+				ix.relDefs = append(ix.relDefs, out.relDefs...)
+				ix.relEdges = append(ix.relEdges, out.relEdges...)
+				ix.relBridges = append(ix.relBridges, out.relBridges...)
 			}
 			if old[rel] {
 				modified++
@@ -532,7 +541,7 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 				added++
 			}
 		}
-		ix.files[rel] = FileMeta{Mtime: fr.mtimeNanos, Size: fr.size, AST: astOK, Skip: fr.skip}
+		ix.files[rel] = FileMeta{Mtime: fr.mtimeNanos, Size: fr.size, AST: out.astOK, Skip: fr.skip}
 		if fr.mtimeNanos > ix.newest {
 			ix.newest = fr.mtimeNanos
 		}

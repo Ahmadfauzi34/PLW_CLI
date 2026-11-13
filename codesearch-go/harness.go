@@ -1,3 +1,11 @@
+//go:build verify
+
+// Build tag: the harness is a dev-only verification framework. It is
+// compiled only for the verify-tagged tokenize spec (see
+// verify-tokenize.sh — file-mode `go run` ignores build tags), so
+// normal builds, vet, and tests skip these lines entirely. The tag
+// changes packaging only; no comparator, gate, or
+// IsCompleteAndVerified logic is touched.
 // ============================================================================
 // [LOCKED CORE ENGINE] harness.go — Perspective-Aware Verification Harness v3.0 (Go Edition)
 // ============================================================================

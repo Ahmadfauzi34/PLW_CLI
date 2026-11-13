@@ -728,24 +728,38 @@ outer:
 	return out
 }
 
-// and decays the 2nd chunk shown from the same file (saturation decay)
-// so a file flooded with matches doesn't crowd out other files.
-// limit < 0 means no total cap (--limit 0 keeps its show-none semantics);
-// perFileCap <= 0 means no per-file cap. The saturation decay is a display
-// diversification hack: it applies only in the capped regime. Unlimited
-// recall (--all / --per-file-cap 0) returns pure BM25 scores and order.
-// diversify caps chunks per file so one file can't dominate the top-k,
-// and decays the 2nd chunk shown from the same file (saturation decay)
-// so a file flooded with matches doesn't crowd out other files.
-// limit < 0 means no total cap (--limit 0 keeps its show-none semantics);
-// perFileCap <= 0 means no per-file cap. The saturation decay is a display
-// diversification hack: it applies only in the capped regime. Unlimited
-// recall (--all / --per-file-cap 0) returns pure BM25 scores and order.
-// dedupContained drops a matched chunk when another matched chunk from
-// the same file strictly contains it (start/end line ranges). Overlapping
-// but non-containing chunks (fixed windows, split definitions) are kept;
-// identical ranges are kept (exact duplicates are already removed at
-// chunk time). O(k^2) per file over its matched chunks only.
+// chunkSpan is a 1-based inclusive line range of one matched chunk.
+type chunkSpan struct{ start, end int }
+
+// contains reports whether a strictly contains b. An identical range
+// is not containment: identical ranges are kept (exact duplicates are
+// already removed at chunk time).
+func (a chunkSpan) contains(b chunkSpan) bool {
+	return a.start <= b.start && a.end >= b.end &&
+		(a.start != b.start || a.end != b.end)
+}
+
+// chunkSpansAndGroups measures the line span of every matched chunk and
+// groups their indexes by file path. Shared by dedupContained and
+// dropContainedSigs: the two differ only in which nested chunk they
+// drop, not in how spans are measured.
+func chunkSpansAndGroups(sc []scoredChunk, ix *memIndex) ([]chunkSpan, map[string][]int) {
+	spans := make([]chunkSpan, len(sc))
+	for i, s := range sc {
+		d := ix.chunks[s.doc]
+		n := 1
+		if d.Text != "" {
+			n = strings.Count(d.Text, "\n") + 1
+		}
+		spans[i] = chunkSpan{d.Line, d.Line + n - 1}
+	}
+	byPath := map[string][]int{}
+	for i, s := range sc {
+		byPath[ix.chunks[s.doc].Path] = append(byPath[ix.chunks[s.doc].Path], i)
+	}
+	return spans, byPath
+}
+
 // dedupContained resolves nested matches within one file: among chunks
 // where one strictly contains another, only the best survives — the
 // higher BM25 score wins; on a tie the smaller (more specific) chunk
@@ -756,25 +770,8 @@ outer:
 // (exact duplicates are already removed at chunk time).
 // O(k^2) per file over its matched chunks only.
 func dedupContained(sc []scoredChunk, ix *memIndex) []scoredChunk {
-	type span struct{ start, end int }
-	spans := make([]span, len(sc))
-	for i, s := range sc {
-		d := ix.chunks[s.doc]
-		n := 1
-		if d.Text != "" {
-			n = strings.Count(d.Text, "\n") + 1
-		}
-		spans[i] = span{d.Line, d.Line + n - 1}
-	}
-	byPath := map[string][]int{}
-	for i, s := range sc {
-		byPath[ix.chunks[s.doc].Path] = append(byPath[ix.chunks[s.doc].Path], i)
-	}
+	spans, byPath := chunkSpansAndGroups(sc, ix)
 	drop := make([]bool, len(sc))
-	contains := func(a, b span) bool {
-		return a.start <= b.start && a.end >= b.end &&
-			(a.start != b.start || a.end != b.end)
-	}
 	for _, idxs := range byPath {
 		for _, i := range idxs {
 			for _, j := range idxs {
@@ -782,13 +779,13 @@ func dedupContained(sc []scoredChunk, ix *memIndex) []scoredChunk {
 					continue
 				}
 				a, b := spans[i], spans[j]
-				if !contains(a, b) && !contains(b, a) {
+				if !a.contains(b) && !b.contains(a) {
 					continue
 				}
 				// i is nested with j: drop i when j scores higher,
 				// or ties with a strictly smaller span.
 				if sc[j].score > sc[i].score ||
-					(sc[j].score == sc[i].score && contains(a, b)) {
+					(sc[j].score == sc[i].score && a.contains(b)) {
 					drop[i] = true
 					break
 				}
@@ -810,20 +807,7 @@ func dedupContained(sc []scoredChunk, ix *memIndex) []scoredChunk {
 // whose body is absent (excluded, or a one-liner with no separate
 // signature) is kept, so --full never loses a hit.
 func dropContainedSigs(sc []scoredChunk, ix *memIndex) []scoredChunk {
-	type span struct{ start, end int }
-	spans := make([]span, len(sc))
-	for i, s := range sc {
-		d := ix.chunks[s.doc]
-		n := 1
-		if d.Text != "" {
-			n = strings.Count(d.Text, "\n") + 1
-		}
-		spans[i] = span{d.Line, d.Line + n - 1}
-	}
-	byPath := map[string][]int{}
-	for i, s := range sc {
-		byPath[ix.chunks[s.doc].Path] = append(byPath[ix.chunks[s.doc].Path], i)
-	}
+	spans, byPath := chunkSpansAndGroups(sc, ix)
 	drop := make([]bool, len(sc))
 	for _, idxs := range byPath {
 		for _, i := range idxs {
@@ -834,9 +818,7 @@ func dropContainedSigs(sc []scoredChunk, ix *memIndex) []scoredChunk {
 				if i == j {
 					continue
 				}
-				a, b := spans[i], spans[j]
-				if a.start >= b.start && a.end <= b.end &&
-					(a.start != b.start || a.end != b.end) {
+				if spans[j].contains(spans[i]) {
 					drop[i] = true
 					break
 				}
