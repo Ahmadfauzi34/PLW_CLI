@@ -608,15 +608,11 @@ func lastNameSegment(raw string) string {
 	return segs[len(segs)-1]
 }
 
-// defIdentifierPatterns builds one definition-pattern regex per identifier
-// in the query. A chunk must match every identifier's pattern (mirroring the
-// query's AND semantics). Each identifier matches in any separator style:
-// the identifier "addNumbers" matches "func add_numbers", "def addNumbers",
-// etc. Crucially, only the FULL identifier is required — a sub-term alone
-// never suffices (so "getGraphParametersFlat" does not match
-// "const flat = ..."). This strictness is what makes --defs-only a
-// precision mode; the ranking bonus intentionally stays looser.
-func defIdentifierPatterns(plan queryPlan) []*regexp.Regexp {
+// defIdentifierTerms returns the per-identifier token parts for a query,
+// shared by defIdentifierPatterns (regex) and filterDefChunks (AST-name
+// check). Single identifier (possibly camelCase/snake_case) -> one entry;
+// several whitespace-separated identifiers -> one entry each.
+func defIdentifierTerms(plan queryPlan) [][]string {
 	var identTerms [][]string
 	if plan.likeMode {
 		name := lastNameSegment(plan.raw)
@@ -639,6 +635,20 @@ func defIdentifierPatterns(plan queryPlan) []*regexp.Regexp {
 			}
 		}
 	}
+	return identTerms
+}
+
+// defIdentifierPatterns builds one definition-pattern regex per identifier
+// in the query (see defIdentifierTerms). A chunk must match every
+// identifier's pattern (mirroring the query's AND semantics). Each
+// identifier matches in any separator style: the identifier "addNumbers"
+// matches "func add_numbers", "def addNumbers", etc. Crucially, only the
+// FULL identifier is required — a sub-term alone never suffices (so
+// "getGraphParametersFlat" does not match "const flat = ..."). This
+// strictness is what makes --defs-only a precision mode; the ranking bonus
+// intentionally stays looser.
+func defIdentifierPatterns(plan queryPlan) []*regexp.Regexp {
+	identTerms := defIdentifierTerms(plan)
 	kw := strings.Join(defKeywords, "|")
 	// Optional Go receiver between "func" and the name (see compileDefRes).
 	recv := `(?:\([^)]*\)\s+)?`
@@ -660,21 +670,58 @@ func defIdentifierPatterns(plan queryPlan) []*regexp.Regexp {
 	return out
 }
 
+// defNameMatches reports whether the AST-recorded defined name of a chunk
+// is the queried identifier, separator-style agnostic (addNumbers ==
+// add_numbers == addnumbers) and case-insensitive. Full equality only:
+// a prefix match would let "flat" claim the definition of
+// "getGraphParametersFlat" (K5 lesson).
+func defNameMatches(chunkName string, parts []string) bool {
+	if chunkName == "" || len(parts) == 0 {
+		return false
+	}
+	norm := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, "_", "")
+		s = strings.ReplaceAll(s, "-", "")
+		return s
+	}
+	joined := ""
+	for _, p := range parts {
+		joined += norm(p)
+	}
+	return norm(chunkName) == joined
+}
+
 // filterDefChunks keeps only chunks that define every identifier in the
-// query (see defIdentifierPatterns).
+// query (see defIdentifierPatterns). A chunk passes an identifier when
+// the definition regex matches its text OR when the AST recorded that
+// identifier as the chunk's defined name (opsi 1, 2026-11-13: trust the
+// AST — a signature chunk carries its defined name). The Name check is
+// what makes the option sound: it ties the chunk to the identifier, so
+// "func foo(bar string)" cannot leak into a query for "bar", keeping the
+// AND semantics across identifiers; and it is what completes the option
+// for one-line and body-less members, which never get a separate
+// signature chunk (astchunk.go: sigEnd == endLine -> no sig chunk) but
+// whose def body chunk carries the same recorded name. Windows and
+// fallback chunks have Name == "" and are unaffected.
 func filterDefChunks(sc []scoredChunk, ix *memIndex, plan queryPlan) []scoredChunk {
 	res := defIdentifierPatterns(plan)
-	if len(res) == 0 {
+	terms := defIdentifierTerms(plan)
+	if len(res) == 0 || len(terms) != len(res) {
 		return nil
 	}
 	var out []scoredChunk
 outer:
 	for _, s := range sc {
-		text := ix.chunks[s.doc].Text
-		for _, re := range res {
-			if !re.MatchString(text) {
-				continue outer
+		d := ix.chunks[s.doc]
+		for i, re := range res {
+			if re.MatchString(d.Text) {
+				continue
 			}
+			if defNameMatches(d.Name, terms[i]) {
+				continue
+			}
+			continue outer
 		}
 		out = append(out, s)
 	}

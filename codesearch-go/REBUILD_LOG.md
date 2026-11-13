@@ -318,23 +318,100 @@ unit test F2), black-box 91/91, F2 battery 7/7. Binary commit
 `f7ef3778d9407a1daa5da223bc959d64ee85a7000597a9ca0fe3d228884dedca`,
 schema tetap go9.
 
-## 2026-11-13 — vendored build (Track 4, K5)
+## Kotlin engine K1-K4 (2026-11-12, PLW Kotlin target)
+Target: oopbot-trial (341 .kt files). Schema stays go9 (no ChunkDoc
+change; the default-exts change alters the scan-config key, so old
+caches rebuild automatically).
+(a) K1: ".kt" joins defaultExts (scan.go) — Kotlin files are indexed
+by default; --ext kt already worked as text-only before.
+(b) K2: ktDefQuery (astchunk.go) — class/function/object/type-alias.
+Node names verified by probe against tree-sitter-kotlin (gotreesitter
+v0.55.1, grammars.KotlinLanguage()): interface/enum/data/sealed/
+annotation/fun-interface are ALL class_declaration; typealias is
+type_alias. The grammar carries NO "name"/"body" field
+(ChildByFieldName returns nil), so names and bodies are captured
+positionally (first type_identifier/simple_identifier child is the
+name — supertypes live in delegation_specifier, never as a direct
+type_identifier child; function_body is the optional body child,
+single-expression functions wrap theirs in a function_body too).
+Properties are NOT defs (a local val would become its own chunk, the
+way JS plain vars are not defs either) — top-level vals are found by
+--related instead. KDoc (/** */) attaches via an explicit ".kt"
+docMarkers case. defKeywords gains "fun", "object", "typealias",
+"val" (search.go) — without "fun", --defs-only could not match a
+Kotlin function at all; "val" mirrors "const"/"var" (a local val
+inside a function body matches the same way a local const does).
+(c) K3: ktCallQuery (callers.go) — plain calls capture the direct
+simple_identifier; qualified calls (client.connect(), super.foo(),
+this.bar()) capture the whole navigation_expression, like Go's
+"x.Method", so calleeBase reduces it to the trailing name.
+Constructor calls (Foo()) match the plain pattern. Caller column
+comes from ktDefQuery def ranges via defQueryFor (no change needed).
+(d) K4: extractRelatedKotlin (related.go) — defs from ktDefQuery
+plus top-level properties (property_declaration declarators outside
+every def range; member properties sit inside their class range and
+are skipped, like JS class fields). No re-export edges (Kotlin has
+no re-export syntax); the Kotlin<->Rust JNI bridge (external fun <->
+Java_...) is a later stage, not v1. runRelated admits .kt.
+Usage text updated (--callers languages + --related Kotlin note).
+Tests: +3 Go unit tests (TestASTChunkKotlin: chunk starts incl.
+KDoc/sig, local val + member property NOT defs; TestExtractCallsKotlin:
+plain/qualified/super/top-level constructor; TestExtractRelatedKotlin:
+interface/enum/typealias defs, top-level val, member property + enum
+entries NOT defs), +6 black-box tests (TestKotlin: default-ext search,
+AST proof line, --defs-only class/typealias/function, --callers
+qualified + property-reference negative, --related defs + count/ok
+negatives). `go vet` bersih, `go test` OK, black-box 97/97 (91+6),
+eval MRR 1.000 (def_rank 1.60, top-1-is-definition 4/5 — unchanged).
+Live on oopbot-trial: index 282 -> 623 files, AST 241 -> 569 files;
+`plw ast defs HostLauncher` finds HostLauncher.kt (KDoc chunk, with
+a K15 related row); `plw ast related HostLauncher` -> def at :22.
+Binary commit `8da8dea19350`, digest
+`c251454d970ae19b76f727e65476a9b945bd7f21711c86d5a9b41efe041ed1cb`
+(reproducible: rebuilt from a different directory, same digest).
+Pin rotated to engine_pin_v3 (same commit: pin line replaced +
+"kotlin" added to the adapter's TREE_SITTER_LANGUAGES; the
+fail-closed pin refused the new binary until the rotation, as
+designed). Real bugs caught by the tests during this change:
+compile error dq.lang (defQueryFor returns a bare Query, not a
+spec — fixed to getSpec); black-box --defs-only "start" shown 1 not
+>= 2 — the nested-chunk rule keeps only the signature (K12), the
+test was wrong, not the engine.
 
-`go mod vendor` (offline, GOPROXY=off, module already in the local
-cache) + `-mod=vendor` on `go build`/`go vet`/`go test` in build.sh.
-The build no longer touches the module proxy; a stale vendor tree
-fails loudly instead of silently downloading. Two build.sh fixes
-the vendoring exposed: the gofmt gate now excludes vendor/ (upstream
-`linguist_gen.go` is unformatted; `gofmt -w` on vendor would dirty
-the tree — the `grep -v` needs `|| true` under pipefail or a clean
-tree kills the script), and the COMMIT hash computation excludes
-vendor/ (it used to sweep 1333 vendored .go files into the hash).
-Digest: the vendored binary CANNOT match the old module-mode pin
-(vendor mode drops the dep h1 hash from buildinfo — measured:
--mod=mod + CGO_ENABLED=0 reproduces the old pin c251454d… exactly
-from the same source, the vendored build is 54ff5908…; two
-independent local builds agree). PINNED_ENGINE_DIGESTS moved to
-54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295
-(go9 8da8dea19350, -mod=vendor); the v0.2.5 asset pin is untouched.
-vendor/ is 1555 files / 32M (206 grammar .bin blobs are go:embed,
-not prunable).
+## defs-only opsi 1 (2026-11-13): filter percaya nama AST
+
+Blind spot dari audit v0.2.9 pada ~/workspace/rp: `--defs-only` melewatkan
+method TS (`rebuildCSR` :438, `indexDocument` :325, total 0) karena
+`filterDefChunks` (search.go) hanya memakai regex `defIdentifierPatterns`
+yang menuntut keyword definisi sebelum nama — method TS/JS tidak membawa
+keyword. Perbaikan: filter meloloskan chunk bila regex cocok ATAU nama
+yang dicatat AST untuk chunk itu sama dengan identifier yang dicari
+(`defNameMatches`, penyamaan dinormalisasi: case-insensitive, `_`/`-`
+diabaikan, equality penuh — bukan prefix, pelajaran K5). Name dipakai
+bukan hanya Kind "sig": method satu baris dan member interface tidak
+punya chunk sig (astchunk.go: sigEnd == endLine -> tanpa sig), tapi body
+chunk definisinya membawa Name yang sama; window/fallback chunk Name-nya
+"" sehingga tak terpengaruh. Name juga yang menjaga semantik AND antar
+identifier: chunk sig `func foo(bar string)` tidak bocor ke query "bar".
+`defIdentifierTerms` diekstrak dari `defIdentifierPatterns` (refactor
+tanpa perubahan perilaku) agar regex dan cek Name memakai daftar
+identifier yang sama.
+Verifikasi: `go vet` bersih, `go test` 85/85 (1 unit test baru
+`TestFilterDefChunksTrustsASTName`: sig chunk, body chunk one-liner,
+member interface, Name separator-insensitive, jebakan parameter `bar`,
+AND "foo bar"; kontrol negatif — test baru GAGAL di kode lama, 4 assert),
+black-box 99/99 (+2 test baru `TestDefsOnlyTSMethods`, gagal di biner
+rilis lama), eval MRR 1.000 (tidak berubah), skrip regresi
+`audit-v0.2.9/defs-repro/repro_defs_only_methods.py` 24/25 (sebelumnya
+14/25), `plw`-level: rebuildCSR 4 hit, indexDocument 6, syncKnowledgeGraph
+6, SimHash tetap 0, `export` tetap 0. Biner baru: commit `9a3db30a5027`,
+digest `b6f0ec48ec1bfba35a3b4f0a50906bc19bd0063caa33e26ae289069996a921a1`
+(reproducible: build ulang dari direktori berbeda, digest sama).
+SISA (bukan bagian perbaikan ini): member interface (`ifaceMethod`)
+tetap 0 — `jsDefQuery` hanya mengenal `method_definition`, bukan
+`method_signature` (node tree-sitter untuk member interface), jadi tidak
+ada def chunk sama sekali; memperbaikinya berarti memperluas query AST
+(chunking + callers + related) dan butuh bump skema indeks — tahap
+berikut yang terpisah. Bonus ranking definisi (compileDefRes) masih
+regex-only: method TS tidak mendapat bonus x2.0 di `search` biasa.
+Belum di-push ke PLW_CLI; pin engine belum dirotasi (menunggu kata user).

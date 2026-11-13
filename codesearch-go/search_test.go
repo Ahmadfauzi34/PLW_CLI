@@ -355,6 +355,61 @@ func TestFilterDefChunks(t *testing.T) {
 	}
 }
 
+func TestFilterDefChunksTrustsASTName(t *testing.T) {
+	// Regression 2026-11-13 (blind spot defs-only): TS/JS methods carry
+	// no definition keyword, so the regex alone drops them even when the
+	// AST classified the chunk as a definition. The filter trusts the
+	// AST-recorded name (sig chunk or def body chunk) as an OR.
+	ix := newMemIndex("/r")
+	add := func(path, text, kind, name string, line int) {
+		d := ChunkDoc{Path: path, Line: line, Text: text, Kind: kind, Name: name}
+		ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
+	}
+	// signature chunk of a TS method (no keyword before the name)
+	add("a.ts", "rebuildCSR(): void {", "sig", "rebuildCSR", 438)
+	// one-line method: no sig chunk exists, only a def body chunk
+	add("a.ts", "methodOne(): void {}", "body", "methodOne", 6)
+	// interface member: no body at all, only a def body chunk
+	add("a.ts", "ifaceMethod(): void;", "body", "ifaceMethod", 2)
+	// trap: sig chunk of foo whose signature mentions bar as a parameter
+	add("a.go", "func foo(bar string) {", "sig", "foo", 1)
+	// call site in a window chunk: no recorded name
+	add("a.ts", "this.rebuildCSR();", "window", "", 10)
+	// separator-insensitive name match via Name only (no keyword in text)
+	add("c.ts", "add_numbers(): void {", "sig", "add_numbers", 3)
+
+	// TS method via sig chunk; the call-site window must be dropped.
+	_, scored := ix.searchBody(parseQuery("rebuildCSR"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("rebuildCSR")); len(got) != 1 {
+		t.Errorf("rebuildCSR via sig chunk: got %d chunks, want 1", len(got))
+	}
+	// one-line method via def body chunk
+	_, scored = ix.searchBody(parseQuery("methodOne"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("methodOne")); len(got) != 1 {
+		t.Errorf("methodOne via body chunk: got %d chunks, want 1", len(got))
+	}
+	// interface member via def body chunk
+	_, scored = ix.searchBody(parseQuery("ifaceMethod"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("ifaceMethod")); len(got) != 1 {
+		t.Errorf("ifaceMethod via body chunk: got %d chunks, want 1", len(got))
+	}
+	// separator-insensitive Name match (addNumbers == add_numbers)
+	_, scored = ix.searchBody(parseQuery("addNumbers"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("addNumbers")); len(got) != 1 {
+		t.Errorf("addNumbers via Name: got %d chunks, want 1", len(got))
+	}
+	// parameter name must NOT claim the enclosing definition
+	_, scored = ix.searchBody(parseQuery("bar"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("bar")); len(got) != 0 {
+		t.Errorf("query bar: got %d chunks, want 0 (foo's sig must not leak)", len(got))
+	}
+	// AND semantics across identifiers survive the OR: foo passes, bar fails.
+	_, scored = ix.searchBody(parseQuery("foo bar"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("foo bar")); len(got) != 0 {
+		t.Errorf("query foo bar: got %d chunks, want 0", len(got))
+	}
+}
+
 func TestChunkingStats(t *testing.T) {
 	ix := newMemIndex("/r")
 	add := func(path, text string, ast bool) {
