@@ -15,7 +15,7 @@ import (
 	"syscall"
 )
 
-const schemaV = "go9" // go9: FileMeta carries skip reason (oversize/binary/overchars); was go8
+const schemaV = "go10" // go10: TS interface members (method_signature) are definitions (chunking, callers, related); was go9
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {

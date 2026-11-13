@@ -271,12 +271,13 @@ class AdapterTestCase(unittest.TestCase):
         self.assertIn("digest", str(ctx.exception))
 
     def test_version_schema_checked_before_digest(self):
-        # go10 stub with an unpinned digest must fail with the schema
-        # message (G9 W5), not the pin message.
-        stub = self.stub(env={"STUB_SCHEMA": "go10"})
+        # go11 stub with an unpinned digest must fail with the schema
+        # message (G9 W5), not the pin message. (go11: one past the
+        # current KNOWN_SCHEMA go10, so it is newer by construction.)
+        stub = self.stub(env={"STUB_SCHEMA": "go11"})
         with self.assertRaises(ce.EngineError) as ctx:
             ce.version_info(stub)
-        self.assertIn("go10", str(ctx.exception))
+        self.assertIn("go11", str(ctx.exception))
         self.assertIn("engine is newer", str(ctx.exception))
         self.assertNotIn("not pinned", str(ctx.exception))
 
@@ -603,11 +604,11 @@ class AdapterTestCase(unittest.TestCase):
         self.assertEqual(out["cache_dir"], str(ce.resolve_cache_dir()))
 
     def test_doctor_schema_mismatch_fields(self):
-        stub = self.stub(env={"STUB_SCHEMA": "go10"})
+        stub = self.stub(env={"STUB_SCHEMA": "go11"})
         out = ce.doctor_status(explicit=str(stub), root=self.fixture)
         self.assertFalse(out["available"])
-        self.assertEqual(out.get("engine_schema"), "go10")
-        self.assertEqual(out.get("known_schema"), "go9")
+        self.assertEqual(out.get("engine_schema"), "go11")
+        self.assertEqual(out.get("known_schema"), "go10")
 
     def test_doctor_envelope(self):
         stub = self.stub()

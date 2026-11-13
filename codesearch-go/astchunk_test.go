@@ -199,10 +199,13 @@ func TestASTChunkTS(t *testing.T) {
 	if !astOK {
 		t.Error("expected AST path for valid TS")
 	}
-	// defs: Shape(1-3), ID(5-5), Color(7-10), greet(12-14);
-	// gaps: 4-4, 6-6, 11-11, 15-15(trailing).
-	// K13: greet also yields a signature chunk (12-12).
-	wantStarts := []int{1, 4, 5, 6, 7, 11, 12, 12, 15}
+	// defs: Shape(1-3), area(2-2, interface member), ID(5-5),
+	// Color(7-10), greet(12-14); gaps: 4-4, 6-6, 11-11, 15-15(trailing).
+	// K13: greet also yields a signature chunk (12-12). The member
+	// chunk overlaps its interface chunk; both are kept (the member
+	// is the specific hit, the interface the container) — the same
+	// overlap as class methods in TestASTChunkJS.
+	wantStarts := []int{1, 2, 4, 5, 6, 7, 11, 12, 12, 15}
 	if got := chunkStarts(chunks); !reflect.DeepEqual(got, wantStarts) {
 		t.Errorf("chunk starts = %v, want %v", got, wantStarts)
 	}

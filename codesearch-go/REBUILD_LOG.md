@@ -476,3 +476,50 @@ Biner baru: commit `e88c2e3f11f8`, digest
 (reproducible: build ulang dari direktori berbeda, digest sama).
 Byte berubah (36.386.161 -> 36.371.290) -> rotasi pin WAJIB menyertai push.
 Belum di-push ke PLW_CLI; pin belum dirotasi (menunggu kata user).
+
+## 2026-11-13 — Interface member jadi definisi (go10): method_signature di tsDefQuery (atas "Ya oke lanjut" + instruksi proaktivitas tinggi proyek ini)
+Sisa defs-only opsi 1: member interface (`ifaceMethod`) total 0 di
+--defs-only karena `jsDefQuery` tak mengenal `method_signature`.
+Perubahan: `tsDefQuery` (`callers.go`) kini juga menangkap
+`(method_signature name: (property_identifier) @name)` — SATU set
+definisi TS untuk ketiga konsumen (chunking, callers, related), sesuai
+preseden widening class F2. Bentuk node dibuktikan probe dulu:
+TypeScript + TSX cocok dan menangkap `ifaceMethod` + `objMethod`
+(member object-type literal juga); JavaScript GAGAL kompilasi
+("unknown node type") — jadi pola ini TIDAK BOLEH masuk `jsDefQuery`
+(dikunci tes `TestTSDefQueryMethodSignature`). `property_signature`
+(properti interface, mis. `name: string;`) sengaja TIDAK ikut — gap
+terpisah, bukan bagian residu ini.
+Skema indeks go9 -> go10 (`index.go`, `ENGINE_CONTRACT.md` + seksi
+go10 + History): chunking berubah -> cache go9 lama harus ditolak dan
+dibangun ulang, bukan disajikan diam-diam (freshness hanya
+(mtime,size)). Adapter ikut naik lewat overlay `engine_state_v2`
+(KNOWN_SCHEMA + SUPPORTED_SCHEMAS; go9 tetap terdaftar karena aset
+rilis v0.2.5 masih go9) + rotasi pin ke digest baru (overlay
+`engine_pin_v7`) — keduanya di commit yang sama dengan perubahan
+engine, sesuai prosedur bump skema di ENGINE_CONTRACT.md.
+Tes: baru `TestTSDefQueryMethodSignature` (TS/TSX cocok + nama persis,
+JS gagal kompilasi; jsDefQuery tetap kompilasi untuk JS);
+`TestASTChunkTS` diupdate (chunk member `area` :2 berdampingan dengan
+chunk interface :1-3 — overlap yang sama seperti method di class);
+`TestVersionLine` + `TestSkipPersistsAcrossSaveLoad` go9 -> go10;
+black-box +1 `test_ts_interface_member_found` (suite kanonik di
+skill `local-multi-agent-loop/bin/tests/` — ditemukan HANYA di sana
++ /tmp; sempat tersalin ke `PLW/bin/tests/` lalu DIHAPUS agar tak ada
+dua kopi yang drift).
+Verifikasi (§5): baseline pohon PLW go test 85/85, black-box 99/99,
+repro 24/25 vs biner `62b532ec`; sesudah: `build.sh` lolos semua
+gerbang, go test 86/86 (+1 tes baru), black-box 100/100 vs biner baru,
+repro 25/25 (0 failing), diferensial mentah 96 kasus / 41 diff
+(semua exit 0 vs 0; fixture 36 kasus 0 diff, sync query 0 diff;
+sisanya hanya skor BM25 + label skema `index-status`) dan
+ternormalisasi 65 kasus / 11 beda (7 urutan bergeser saja, 3 `value`
++1 hit member interface `.d.ts`, 1 transient `--full
+dedupContained` tak terreproduksi dalam 11 ulangan + `--all`
+identik) + penolakan cache go9 terverifikasi (warm lama go9 54
+chunk -> warm baru go10 55 chunk).
+Biner baru: commit `b6e9a95c06a9`, digest
+`828eeeab911764a71709e1bf8ed2724c21cb74d30f26ebebcc3b2111d04f3765`
+(reproducible: build ulang dari direktori berbeda + salinan skill,
+digest sama). Byte berubah -> rotasi pin WAJIB menyertai push.
+Belum di-push ke PLW_CLI; pin v7 + state v2 menunggu kata user.

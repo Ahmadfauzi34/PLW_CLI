@@ -146,15 +146,23 @@ const jsDefQuery = `[
 	(variable_declarator name: (identifier) @name value: (function_expression body: (statement_block) @body) @def)
 ]`
 
-// tsDefQuery is jsDefQuery with the class-name pattern widened: in the
-// TypeScript grammar a class name is a type_identifier, not an
-// identifier (F2: --related never saw a TS class definition). The
-// alternation cannot live in jsDefQuery itself: tree-sitter-javascript
-// has no type_identifier node, so the shared query would fail to
-// compile for .js/.mjs/.cjs (caught by TestExtractRelatedJS).
-var tsDefQuery = strings.Replace(jsDefQuery,
+// tsDefQuery is jsDefQuery with two TypeScript-only widenings: the
+// class-name pattern accepts type_identifier (in the TypeScript
+// grammar a class name is a type_identifier, not an identifier — F2:
+// --related never saw a TS class definition), and interface members
+// count as definitions via method_signature (2026-11-13: --defs-only
+// never saw an interface member, because it is a method_signature,
+// not a method_definition). Neither can live in jsDefQuery itself:
+// tree-sitter-javascript has neither node, so the shared query would
+// fail to compile for .js/.mjs/.cjs (caught by TestExtractRelatedJS
+// for type_identifier and by TestTSDefQueryMethodSignature for
+// method_signature). The append uses TrimSuffix, not Replace on "]":
+// the widened class pattern already contains "]", so a plain Replace
+// would splice the new pattern into the class alternation.
+var tsDefQuery = strings.TrimSuffix(strings.Replace(jsDefQuery,
 	"(class_declaration name: (identifier) @name)",
-	"(class_declaration name: [(identifier) (type_identifier)] @name)", 1)
+	"(class_declaration name: [(identifier) (type_identifier)] @name)", 1), "]") +
+	"\n\t(method_signature name: (property_identifier) @name) @def\n]"
 
 var callerDefLangs = []callLang{
 	{".js", grammars.JavascriptLanguage, jsDefQuery},

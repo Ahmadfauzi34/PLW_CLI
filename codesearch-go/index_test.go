@@ -61,10 +61,10 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected the just-saved go9 index")
+		t.Fatal("loadDiskIndex rejected the just-saved go10 index")
 	}
-	if di.SchemaV != "go9" {
-		t.Errorf("SchemaV = %q, want go9", di.SchemaV)
+	if di.SchemaV != "go10" {
+		t.Errorf("SchemaV = %q, want go10", di.SchemaV)
 	}
 	if got := di.Files["bin.rs"].Skip; got != "binary" {
 		t.Errorf("reloaded bin.rs Skip = %q, want binary", got)

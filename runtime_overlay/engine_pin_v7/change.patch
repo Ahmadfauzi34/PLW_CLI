@@ -1,0 +1,23 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -108,13 +108,13 @@
+ # entry pins the published release asset (verified against its
+ # published .sha256), so an old released engine keeps working.
+ PINNED_ENGINE_DIGESTS = {
+-    # SOLID refactor 1-3 (2026-11-13): harness tagged verify, span
+-    # helper in search.go, processFile helper in index.go; the
+-    # reproducible-build digest moves to the new engine commit; the
+-    # superseded defs-only digest (b6f0ec48…) leaves the pin, as in
+-    # v1-v5. The v0.2.5 release-asset entry stays. Local + CI agree.
+-    "62b532ec6b4d22ca223c452614a8db020566fc967678662b4a4ac4953906b177":
+-        "go9 e88c2e3f11f8 (reproducible build.sh, -mod=vendor)",
++    # Interface members are definitions (2026-11-13, go10): TS
++    # method_signature joins tsDefQuery; the reproducible-build
++    # digest moves to the new engine commit; the superseded SOLID
++    # digest (62b532ec…) leaves the pin, as in v1-v6. The v0.2.5
++    # release-asset entry stays. Local + CI builds agree.
++    "828eeeab911764a71709e1bf8ed2724c21cb74d30f26ebebcc3b2111d04f3765":
++        "go10 b6e9a95c06a9 (reproducible build.sh, -mod=vendor)",
+     "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
+         "go9 8c5d6ffe8685 (v0.2.5 release asset)",
+ }

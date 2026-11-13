@@ -149,6 +149,12 @@ grep -Fq '9a3db30a5027' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v6"
 grep -Fq '62b532ec6b4d22ca223c452614a8db020566fc967678662b4a4ac4953906b177' core/codesearch_engine.py
 grep -Fq 'e88c2e3f11f8' core/codesearch_engine.py
+apply_reviewable_overlay "engine_state_v2"
+grep -Fq 'KNOWN_SCHEMA = "go10"' core/codesearch_engine.py
+grep -Fq '"go10": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v7"
+grep -Fq '828eeeab911764a71709e1bf8ed2724c21cb74d30f26ebebcc3b2111d04f3765' core/codesearch_engine.py
+grep -Fq 'b6e9a95c06a9' core/codesearch_engine.py
 apply_reviewable_overlay "discovery_v1"
 grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
 grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py
