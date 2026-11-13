@@ -218,6 +218,10 @@ grep -Fq '"kotlin", "rust"' core/portable_agent.py
 grep -Fq 'base_to_queries' core/codesearch_engine.py
 grep -Fq 'refers to the module the group opens' language_semantics.py
 grep -Fq '".mjs", ".cjs", ".mts", ".cts"' language_semantics.py
+apply_reviewable_overlay "remove_install_v1"
+grep -Fq '5. Other' plw_cli.py
+grep -Fq 'install_removed=1' scripts/smoke_portable_agent.sh
+grep -Fq 'removed install did not fail as unknown_mode' scripts/smoke_portable_agent.sh
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

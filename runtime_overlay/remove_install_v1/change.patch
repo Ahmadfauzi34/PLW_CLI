@@ -1,0 +1,252 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -83,7 +83,6 @@
+   plw postcondition-proof <f139-binding.json> <f140-coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
+   plw fullstack-state <root> <f139-binding.json> <f141-proof.json> <fullstack-spec.json> --current-revision REV [--geometry-impact FILE] [--ui-reference FILE] [--json]
+       -> Binds one F138-accepted result to exact F128 scenario identity; read-only and does not prove obligation coverage/postconditions/truth
+-  plw install [--system | --bin-dir DIR] [--json]
+   plw memory <subcommand> [args...]
+   plw fiber <subcommand> [args...]
+   plw <any hott_kernel mode> [args...]
+@@ -3636,133 +3635,6 @@
+ 
+ 
+ 
+-def cmd_install(args: List[str]) -> int:
+-    """Install PLW wrapper commands into a user or system bin directory.
+-
+-    `--system` maps to PLW_SYSTEM_BIN_DIR or /usr/local/bin. This command never
+-    invokes sudo or a shell command string; setup_plw.sh performs the bounded
+-    wrapper write and fails if the selected directory is not writable.
+-    """
+-    system = False
+-    bin_dir: Optional[str] = None
+-    as_json = False
+-    i = 0
+-    while i < len(args):
+-        arg = args[i]
+-        if arg == "--system":
+-            if bin_dir is not None:
+-                message = "--system and --bin-dir are mutually exclusive"
+-                if as_json:
+-                    print(json.dumps({"error": "install_location_conflict", "message": message}, indent=2))
+-                else:
+-                    print(f"[PLW Error] {message}", file=sys.stderr)
+-                return 2
+-            system = True
+-            i += 1
+-            continue
+-        if arg == "--bin-dir":
+-            if system:
+-                message = "--system and --bin-dir are mutually exclusive"
+-                if as_json:
+-                    print(json.dumps({"error": "install_location_conflict", "message": message}, indent=2))
+-                else:
+-                    print(f"[PLW Error] {message}", file=sys.stderr)
+-                return 2
+-            if i + 1 >= len(args):
+-                print("[PLW Error] --bin-dir requires DIR", file=sys.stderr)
+-                return 2
+-            bin_dir = args[i + 1]
+-            i += 2
+-            continue
+-        if arg == "--json":
+-            as_json = True
+-            i += 1
+-            continue
+-        if arg in ("-h", "--help", "help"):
+-            print("Usage: plw install [--system | --bin-dir DIR] [--json]")
+-            print("  --system installs wrappers in /usr/local/bin (or PLW_SYSTEM_BIN_DIR).")
+-            print("  The command never invokes sudo automatically.")
+-            return 0
+-        print(f"[PLW Error] Unknown install argument: {arg}", file=sys.stderr)
+-        return 2
+-
+-    setup_script = TOOL_ROOT / "setup_plw.sh"
+-    if not setup_script.is_file():
+-        result = {
+-            "status": "rejected",
+-            "error": "setup_script_missing",
+-            "setup_script": str(setup_script),
+-        }
+-        print(json.dumps(result, indent=2, ensure_ascii=False) if as_json else f"[PLW Error] setup script missing: {setup_script}")
+-        return 2
+-
+-    environment = os.environ.copy()
+-    setup_args = ["sh", str(setup_script)]
+-    if system:
+-        setup_args.append("--system")
+-        selected = environment.get("PLW_SYSTEM_BIN_DIR") or "/usr/local/bin"
+-    elif bin_dir is not None:
+-        setup_args.extend(["--bin-dir", bin_dir])
+-        selected = bin_dir
+-    else:
+-        selected = environment.get("PLW_BIN_DIR") or os.path.join(environment.get("HOME") or "", ".local", "bin")
+-
+-    try:
+-        completed = subprocess.run(
+-            setup_args,
+-            cwd=str(TOOL_ROOT),
+-            env=environment,
+-            capture_output=True,
+-            text=True,
+-            timeout=30,
+-            check=False,
+-        )
+-    except subprocess.TimeoutExpired:
+-        result = {
+-            "status": "rejected",
+-            "error": "install_timeout",
+-            "bin_dir": selected,
+-            "system_location_requested": system,
+-            "sudo_invoked": False,
+-        }
+-        print(json.dumps(result, indent=2, ensure_ascii=False) if as_json else "[PLW Error] install timed out")
+-        return 3
+-
+-    selected_path = str(Path(selected).expanduser())
+-    result = {
+-        "status": "installed" if completed.returncode == 0 else "rejected",
+-        "bin_dir": selected_path,
+-        "system_location_requested": system or os.path.normpath(selected_path) == "/usr/local/bin",
+-        "commands": [
+-            str(Path(selected_path) / "plw"),
+-            str(Path(selected_path) / "hott"),
+-            str(Path(selected_path) / "plw-call"),
+-        ],
+-        "path_contains_bin_dir": selected_path in (environment.get("PATH") or "").split(os.pathsep),
+-        "sudo_invoked": False,
+-        "setup_exit_code": completed.returncode,
+-        "setup_stdout": completed.stdout,
+-        "setup_stderr": completed.stderr,
+-        "authority": {
+-            "wrapper_files_changed": completed.returncode == 0,
+-            "source_mutated": False,
+-            "repository_mutated": False,
+-            "workflow_authority_granted": False,
+-            "external_runtime_executed": False,
+-        },
+-    }
+-    if as_json:
+-        print(json.dumps(result, indent=2, ensure_ascii=False))
+-    elif completed.returncode == 0:
+-        print(completed.stdout, end="")
+-    else:
+-        if completed.stderr:
+-            print(completed.stderr, end="", file=sys.stderr)
+-        else:
+-            print(f"[PLW Error] install failed for {selected_path}", file=sys.stderr)
+-    return 0 if completed.returncode == 0 else completed.returncode
+-
+-
+ 
+ def _parse_validation_authorization_args(args: List[str]) -> Optional[Dict[str, Any]]:
+     positionals: List[str] = []
+@@ -5299,9 +5171,7 @@
+   plw accountability-chain <sha256:decision-id> [--limit N] [--json]
+       -> Verifies and summarizes F111 relevance -> F112 delivery accountability without raw prompt/source
+ 
+-5. Install & other
+-  plw install [--system | --bin-dir DIR] [--json]
+-      -> Verifies F129 integrity and projects v1/v2 obligations with optional same-observation witness groups; never executes validators
++5. Other
+   plw memory <subcommand> [...]
+       -> Episodic/semantic memory operations; use `plw memory get <id>` for exact debt recovery
+   plw fiber <subcommand> [...]
+@@ -5424,8 +5294,6 @@
+         sys.exit(cmd_fullstack_state(sub_args))
+     elif cmd in ("validation-lease", "validation_lease", "validator-lease", "validator_lease"):
+         sys.exit(cmd_validation_lease(sub_args))
+-    elif cmd in ("install", "setup", "bootstrap"):
+-        sys.exit(cmd_install(sub_args))
+     else:
+         # Standard passthrough to hott_kernel.main()
+         # Rewriting sys.argv so hott_kernel sees original arguments
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -637,19 +637,6 @@
+         ["geometric correctness", "behavioral validity"],
+         "skills/runtime-geometry-capture-workflow.md",
+     ),
+-    "install": _contract(
+-        "Portable CLI Installation",
+-        ["CLI deployment", "executable bootstrap", "PATH installation"],
+-        ["command-line tool installation"],
+-        ["repository mutation", "runtime proof"],
+-        "The packaged PLW entrypoint exists but is not exposed at the requested binary location.",
+-        "Installed launcher/binary location and bootstrap status.",
+-        ["installation path", "launcher status"],
+-        ["INSTALLED", "REJECTED"],
+-        ["tool correctness"],
+-        "skills/tool-call-and-cli-workflow.md",
+-        state_change=True,
+-    ),
+     "memory": _contract(
+         "Semantic/Episodic Memory Operations",
+         ["episodic memory", "semantic memory", "retrieval", "association graph"],
+@@ -910,7 +897,6 @@
+     "audit-context": "accountability",
+     "affordance": "semantic",
+     "angular-ownership": "angular-anchors",
+-    "bootstrap": "install",
+     "chain": "accountability-chain",
+     "codebase-topology": "topology",
+     "command-telemetry": "output-telemetry",
+@@ -943,7 +929,6 @@
+     "scenario-evidence": "validation-evidence",
+     "scenario-plan": "validation-plan",
+     "semantics": "semantic",
+-    "setup": "install",
+     "state-transition-model": "transition-model",
+     "self-simplify": "simplify",
+     "target-resolve": "resolve-target",
+--- a/agent_tool.py
++++ b/agent_tool.py
+@@ -69,7 +69,6 @@
+     "validation-scenario-bind",
+     "postcondition-proof",
+     "fullstack-state",
+-    "install",
+     "memory",
+     "fiber",
+ )
+@@ -97,7 +96,7 @@
+     "kan",
+ }
+ _FIBER_READ_SUBCOMMANDS = {"status", "section_status", "list_archives"}
+-_PLW_STATE_COMMANDS = {"attest-runtime", "install"}
++_PLW_STATE_COMMANDS = {"attest-runtime"}
+ _COMMAND_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
+ 
+ 
+@@ -457,13 +456,6 @@
+         and result.get("decision") == "ADAPTER_OBSERVATION_RECORDED"
+         and result.get("observation_recorded") is True
+     )
+-    cli_wrapper_install = (
+-        surface == "plw"
+-        and mode == "install"
+-        and completed.returncode == 0
+-        and isinstance(result, dict)
+-        and result.get("status") == "installed"
+-    )
+     validation_authorization_bound = (
+         surface == "plw"
+         and mode == "validation-authorization"
+@@ -568,7 +560,6 @@
+             "action_outcome_executor_handoff": executor_handoff_claimed,
+             "action_adapter_dispatch_intent": adapter_dispatch_prepared,
+             "action_adapter_observation_recorded": adapter_observation_recorded,
+-            "cli_wrapper_install": cli_wrapper_install,
+             "validation_authorization_binding": validation_authorization_bound,
+             "validation_execution_lease": validation_execution_lease_acquired,
+             "validation_attempt_registration": validation_attempt_registered,
+@@ -583,7 +574,7 @@
+             "fullstack_state_composed": fullstack_state_composed,
+             "fullstack_validated": fullstack_validated,
+             "stable_promoted": False,
+-            "system_path_mutation": cli_wrapper_install and bool(result.get("system_location_requested")) if isinstance(result, dict) else False,
++            "system_path_mutation": False,
+             "execute_external_runtime": external_execution and completed.returncode == 0,
+             "external_execution_acknowledged": external_execution,
+             "mutate_source": False,

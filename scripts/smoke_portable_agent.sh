@@ -62,6 +62,8 @@ export XDG_CACHE_HOME="$TMP/cache"
 ./plw doctor "$TMP/rs-target" --json > "$TMP/doctor-rs.json"
 ./plw agent orient "$TMP/kt-target" --task "cari main" --json > "$TMP/orient-kt.json"
 ./plw topology "$TMP/rs-target" --json > "$TMP/topology-rs.json"
+# Track 2: install is removed; the kernel rejects it as unknown_mode rc 2.
+./plw install --json > "$TMP/install.json" || test $? -eq 2
 
 python - "$TMP" "$ROOT/VERSION" <<'PY'
 import json
@@ -84,6 +86,7 @@ doctor_kt = json.loads((root / "doctor-kt.json").read_text())
 doctor_rs = json.loads((root / "doctor-rs.json").read_text())
 orient_kt = json.loads((root / "orient-kt.json").read_text())
 topology_rs = json.loads((root / "topology-rs.json").read_text())
+install = json.loads((root / "install.json").read_text())
 target = root / "target"
 
 if doctor.get("ready") is not True:
@@ -92,6 +95,12 @@ if doctor.get("version") != version:
     raise SystemExit(f"embedded version mismatch: {doctor.get('version')} != {version}")
 if caps.get("capability_count", 0) < 40:
     raise SystemExit("capability registry unexpectedly small")
+if any(row.get("command") == "install" for row in caps.get("capabilities", [])):
+    raise SystemExit("removed install command still listed in capability registry")
+if install.get("error_code") != "unknown_mode":
+    raise SystemExit(f"removed install did not fail as unknown_mode: {install}")
+if "setup_script_missing" in json.dumps(install):
+    raise SystemExit("removed install still reports setup_script_missing")
 if skills.get("skill_count", 0) <= 0 or skills.get("embedded_count") != skills.get("skill_count"):
     raise SystemExit("embedded skill registry incomplete")
 if not skill.get("content") or skill.get("skill_path") != "skills/target-codebase-topology-workflow.md":
@@ -185,6 +194,6 @@ print(
     f"skills={skills['embedded_count']}/{skills['skill_count']} "
     "candidate_handoff=CONDITIONAL_DISCOVERY task_text_used=false "
     "candidate_selection=RESOLVED/AMBIGUOUS capability_match=read-only "
-    "kotlin_languages=1 rust_self_unresolved=0"
+    "kotlin_languages=1 rust_self_unresolved=0 install_removed=1"
 )
 PY
