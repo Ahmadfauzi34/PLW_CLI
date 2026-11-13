@@ -81,7 +81,7 @@ doctor, defs, callers, related, plw_doctor, negative = (load(p) for p in sys.arg
 
 assert doctor["ok"] is True, doctor
 assert doctor["engine"]["available"] is True, doctor
-assert doctor["engine"]["schema"] == "go9", doctor
+assert doctor["engine"]["schema"] == "go10", doctor
 assert doctor["engine"]["tree_sitter_ready"] is True, doctor
 
 hits = defs["engine_result"]["hits"]
@@ -96,7 +96,7 @@ rows = related["engine_result"]["related"]
 assert len(rows) == 1 and rows[0]["path"] == "src/util.ts", related
 
 engine = plw_doctor["runtime"]["codesearch_engine"]
-assert engine["available"] is True and engine["schema"] == "go9", plw_doctor
+assert engine["available"] is True and engine["schema"] == "go10", plw_doctor
 
 assert negative["ok"] is False and negative["engine_result"] is None, negative
 assert negative["error"], negative

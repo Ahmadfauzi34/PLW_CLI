@@ -124,7 +124,7 @@ ctx = go_yes["dynamic_context"]
 assert ctx["context"] == "B", ctx
 assert ctx["needs_engine"] is True, ctx
 assert ctx["engine"]["available"] is True, ctx
-assert ctx["engine"]["schema"] == "go9", ctx
+assert ctx["engine"]["schema"] == "go10", ctx
 assert ctx["structural_query"]["available"] is True, ctx
 assert "plw ast" in ctx["structural_query"]["route"], ctx
 assert "Context B" in ctx["reason"], ctx
@@ -162,7 +162,7 @@ assert ctx["context"] == "B", ctx
 assert ctx["languages"] == {"kotlin": 2}, ctx
 assert ctx["needs_engine"] is True, ctx
 assert ctx["engine"]["available"] is True, ctx
-assert ctx["engine"]["schema"] == "go9", ctx
+assert ctx["engine"]["schema"] == "go10", ctx
 assert ctx["structural_query"]["available"] is True, ctx
 assert "plw ast" in ctx["structural_query"]["route"], ctx
 assert "Context B" in ctx["reason"], ctx

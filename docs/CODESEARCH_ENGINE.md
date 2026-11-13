@@ -72,7 +72,7 @@ is null (except `search`, where the engine reports it).
 ## Schema contract
 
 The adapter accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` (`core/codesearch_engine.py`), currently `go9`.
+`SUPPORTED_SCHEMAS` (`core/codesearch_engine.py`), currently `go10`.
 The machine-checked contract lives in
 [codesearch-go/ENGINE_CONTRACT.md](../codesearch-go/ENGINE_CONTRACT.md)
 and is verified in CI by `scripts/check_engine_contract.sh`. A
@@ -124,7 +124,7 @@ plain message.
 - `binary digest ... is not pinned` — rebuild with
   `codesearch-go/build.sh` and pin the digest (above), or set
   `CODESEARCH_ALLOW_UNPINNED=1` explicitly for a development run.
-- `index schema 'go10' is not the known-good 'go9'` — the engine is
+- `index schema 'go11' is not the known-good 'go10'` — the engine is
   newer than this PLW build; upgrade PLW or pin the matching engine.
 - `engine predates index management` — the engine binary is older
   than index support; rebuild it, or use queries without
