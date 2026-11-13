@@ -64,6 +64,10 @@ export XDG_CACHE_HOME="$TMP/cache"
 ./plw topology "$TMP/rs-target" --json > "$TMP/topology-rs.json"
 # Track 2: install is removed; the kernel rejects it as unknown_mode rc 2.
 ./plw install --json > "$TMP/install.json" || test $? -eq 2
+# Track 3: fail-closed parsing (K4/H1) — --root before the query resolves,
+# and an unknown flag under --json is a JSON envelope rc 2.
+./plw context --root "$TMP/target" value --json > "$TMP/context-root-first.json"
+./plw check --json "$TMP/target" --not-a-flag > "$TMP/check-unknown-flag.json" || test $? -eq 2
 
 python - "$TMP" "$ROOT/VERSION" <<'PY'
 import json
@@ -184,6 +188,15 @@ if rs_inventory.get("unresolved_imports") != 0:
 if rs_inventory.get("internal_import_edges", 0) < 1:
     raise SystemExit(f"rust self-import edge missing: {rs_inventory}")
 
+# Track 3: --root before the query resolves to that query (K4a), and an
+# unknown flag under --json is a JSON envelope, rc 2 (K4b).
+context_rf = json.loads((root / "context-root-first.json").read_text())
+if context_rf.get("query") != "value":
+    raise SystemExit(f"context --root first did not resolve the query: {context_rf}")
+check_uf = json.loads((root / "check-unknown-flag.json").read_text())
+if check_uf.get("error") != "invalid_arguments":
+    raise SystemExit(f"unknown flag under --json was not a JSON envelope: {check_uf}")
+
 actual = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
 if actual != ["src/guards.js", "src/main.ts", "src/value.ts"]:
     raise SystemExit(f"target repository polluted: {actual}")
@@ -194,6 +207,6 @@ print(
     f"skills={skills['embedded_count']}/{skills['skill_count']} "
     "candidate_handoff=CONDITIONAL_DISCOVERY task_text_used=false "
     "candidate_selection=RESOLVED/AMBIGUOUS capability_match=read-only "
-    "kotlin_languages=1 rust_self_unresolved=0 install_removed=1"
+    "kotlin_languages=1 rust_self_unresolved=0 install_removed=1 parser_fail_closed=1"
 )
 PY

@@ -222,6 +222,10 @@ apply_reviewable_overlay "remove_install_v1"
 grep -Fq '5. Other' plw_cli.py
 grep -Fq 'install_removed=1' scripts/smoke_portable_agent.sh
 grep -Fq 'removed install did not fail as unknown_mode' scripts/smoke_portable_agent.sh
+apply_reviewable_overlay "parser_fail_closed_v1"
+grep -Fq '_PlwArgumentParser' plw_cli.py
+grep -Fq '_cli_error' plw_cli.py
+grep -Fq 'parse_intermixed_args' plw_cli.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py
