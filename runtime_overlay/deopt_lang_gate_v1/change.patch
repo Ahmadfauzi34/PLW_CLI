@@ -1,0 +1,75 @@
+--- a/codebase/performance_analyzers.py
++++ b/codebase/performance_analyzers.py
+@@ -11,6 +11,7 @@
+ Semua analyzer mengonsumsi SharedGraph. Tidak ada os.walk() di sini.
+ """
+ 
++import os
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+@@ -207,23 +208,45 @@
+ EVAL_REGEX = re.compile(r"\beval\s*\(")
+ NEW_FUNC_REGEX = re.compile(r"\bnew\s+Function\s*\(")
+ 
++# perf.deopt patterns are V8/JavaScript constructs (G4): the `delete`
++# operator, `eval()` and `new Function()` do not exist in Kotlin, Rust or
++# Python, so this analyzer only reads JS/TS files. Without the gate a
++# Kotlin `file.delete()` call — and the English word "delete" inside a
++# string literal on the same line — was reported as a V8 deoptimization
++# (HelperPairing.kt, oopbot-trial audit).
++_DEOPT_JS_TS_EXTENSIONS = frozenset({
++    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts",
++})
++
+ 
+ def analyze_deopt(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+     """
+     Migrated dari deopt_checker.py.
+     Deteksi: delete_operator, eval_usage, new_function.
++
++    Scope (G4): JS/TS files only (see _DEOPT_JS_TS_EXTENSIONS). String
++    literals are blanked per line before the regexes run (see
++    _strip_strings): the word "delete" inside a string such as
++    "Can't delete $FILE" is not the `delete` operator. Blanking is
++    per-line on purpose — a whole-content blank would let an apostrophe
++    inside a double-quoted string hide real code on later lines.
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
+ 
+     for file_path, raw_content in sorted(file_map.items()):
++        if os.path.splitext(file_path)[1].lower() not in _DEOPT_JS_TS_EXTENSIONS:
++            continue
+         content = _strip_comments(raw_content)
+         lines = content.split("\n")
+ 
+         for i, line in enumerate(lines):
+             stripped = line.strip()
++            # Detection runs on the string-blanked line; the finding
++            # still records the original line as evidence.
++            probe = _strip_strings(line).strip()
+ 
+-            if DELETE_REGEX.search(stripped):
++            if DELETE_REGEX.search(probe):
+                 findings.append({
+                     "type": "delete_operator",
+                     "severity": "high",
+@@ -236,7 +259,7 @@
+                     ),
+                 })
+ 
+-            if EVAL_REGEX.search(stripped):
++            if EVAL_REGEX.search(probe):
+                 findings.append({
+                     "type": "eval_usage",
+                     "severity": "high",
+@@ -249,7 +272,7 @@
+                     ),
+                 })
+ 
+-            if NEW_FUNC_REGEX.search(stripped):
++            if NEW_FUNC_REGEX.search(probe):
+                 findings.append({
+                     "type": "new_function",
+                     "severity": "high",

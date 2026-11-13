@@ -270,6 +270,9 @@ grep -Fq 'kt_structural_v1' core/simplification_analyzer.py
 grep -Fq 'EXPERIMENTAL_SOURCE_EXTENSIONS = SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS' language_semantics.py
 grep -Fq 'RS semantic files=' plw_cli.py
 grep -Fq 'rs_rules=' plw_cli.py
+apply_reviewable_overlay "deopt_lang_gate_v1"
+grep -Fq '_DEOPT_JS_TS_EXTENSIONS' codebase/performance_analyzers.py
+grep -Fq 'probe = _strip_strings(line).strip()' codebase/performance_analyzers.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
