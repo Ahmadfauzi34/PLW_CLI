@@ -1,0 +1,81 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -1311,31 +1311,44 @@
+         candidates = result.get("candidates", [])
+ 
+     print("# Authority: structural_candidate_generation_only; equivalence requires separate proof validation.")
+-    for row in candidates[:10]:
+-        names = ",".join(row.get("names", []))
+-        files = ",".join(row.get("files", []))
+-        priority = row.get("priority", {}) or {}
+-        surface = row.get("proof_surface", {}) or {}
+-        save_loc = row.get("estimated_removable_loc", row.get("estimated_removable_duplicate_loc", 0))
+-        witness = row.get("semantic_witness", {}) or {}
+-        witness_text = f" | witness={witness.get('type')}" if witness else ""
+-        adjudication = row.get("adjudication", {}) or {}
+-        disposition_text = (
+-            f" | disposition={adjudication.get('disposition')}:{adjudication.get('owner_decision')}"
+-            if adjudication else ""
+-        )
+-        print(
+-            f"- priority={float(priority.get('score', 0.0)):.3f} | "
+-            f"kind={row.get('kind')} | "
+-            f"risk={surface.get('risk_level', 'unknown')}({surface.get('risk_units', '?')}) | "
+-            f"save≈{save_loc} LOC | "
+-            f"owners={surface.get('owner_file_count', len(row.get('files', [])))} | "
+-            f"domains={','.join(surface.get('owner_top_level_domains', [])) or '.'} | "
+-            f"neighbors={surface.get('direct_neighbor_count', '?')} | "
+-            f"lane={row.get('execution_lane', 'target')} | "
+-            f"recommend={priority.get('recommendation', 'unknown')} | "
+-            f"{names} | {files} | candidate={row.get('candidate_id')}{witness_text}{disposition_text}"
+-        )
++    grouped: Dict[str, List[Dict[str, Any]]] = {}
++    for row in candidates:
++        grouped.setdefault(str(row.get("kind", "unknown")), []).append(row)
++    for kind, rows in grouped.items():
++        print(f"# kind={kind} ({len(rows)} candidates)")
++        for row in rows:
++            names = ",".join(row.get("names", []))
++            files = ",".join(row.get("files", []))
++            priority = row.get("priority", {}) or {}
++            surface = row.get("proof_surface", {}) or {}
++            save_loc = row.get("estimated_removable_loc", row.get("estimated_removable_duplicate_loc", 0))
++            witness = row.get("semantic_witness", {}) or {}
++            witness_text = f" | witness={witness.get('type')}" if witness else ""
++            adjudication = row.get("adjudication", {}) or {}
++            disposition_text = (
++                f" | disposition={adjudication.get('disposition')}:{adjudication.get('owner_decision')}"
++                if adjudication else ""
++            )
++            locs = ",".join(
++                f"{m.get('file')}:{m.get('line_start')}-{m.get('line_end')}"
++                if m.get("line_start") is not None and m.get("line_end") is not None
++                else str(m.get("file", ""))
++                for m in (row.get("members", []) or [])
++                if m.get("file")
++            )
++            loc_text = f" | loc={locs}" if locs else ""
++            print(
++                f"- priority={float(priority.get('score', 0.0)):.3f} | "
++                f"kind={row.get('kind')} | "
++                f"risk={surface.get('risk_level', 'unknown')}({surface.get('risk_units', '?')}) | "
++                f"save≈{save_loc} LOC | "
++                f"owners={surface.get('owner_file_count', len(row.get('files', [])))} | "
++                f"domains={','.join(surface.get('owner_top_level_domains', [])) or '.'} | "
++                f"neighbors={surface.get('direct_neighbor_count', '?')} | "
++                f"lane={row.get('execution_lane', 'target')} | "
++                f"recommend={priority.get('recommendation', 'unknown')} | "
++                f"{names} | {files} | candidate={row.get('candidate_id')}{witness_text}{disposition_text}{loc_text}"
++            )
+     return 0
+ 
+ 
+@@ -4877,6 +4890,8 @@
+       -> Quick architectural and boundary violation check; --json includes high+medium findings (low/info stay in the analyzer cache)
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
++  plw simplify [root] [--reference stable-root] [--json]
++      -> Structural simplification candidates (duplicate bodies, forwarding wrappers, redundant branches); read-only candidate generation, never a patch
+   plw brief <file> [root] [--json]
+       -> Brief profile of a single file
+   plw impact <file> [root] [--json]

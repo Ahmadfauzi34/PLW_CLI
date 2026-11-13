@@ -259,6 +259,17 @@ grep -Fq 'PLAN_SCHEMA_VERSION = "plw-operation-plan-v1"' core/operation_plan.py
 grep -Fq 'RESOLUTION_SCHEMA_VERSION = "plw-operation-plan-resolution-v1"' core/operation_plan.py
 grep -Fq 'INPUT_VALUE_UNREPRESENTABLE_IN_ARGV' core/operation_plan.py
 grep -Fq 'dirty_content_digest' core/candidate_provenance.py
+apply_reviewable_overlay "simplify_surface_v1"
+grep -Fq 'plw simplify [root] [--reference stable-root] [--json]' plw_cli.py
+grep -Fq 'Structural simplification candidates (duplicate bodies, forwarding wrappers, redundant branches)' plw_cli.py
+grep -Fq 'grouped.setdefault(str(row.get("kind", "unknown")), []).append(row)' plw_cli.py
+grep -Fq 'loc_text = f" | loc={locs}" if locs else ""' plw_cli.py
+apply_reviewable_overlay "simplify_rs_kt_v1"
+grep -Fq 'rs_structural_v1' core/simplification_analyzer.py
+grep -Fq 'kt_structural_v1' core/simplification_analyzer.py
+grep -Fq 'EXPERIMENTAL_SOURCE_EXTENSIONS = SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS' language_semantics.py
+grep -Fq 'RS semantic files=' plw_cli.py
+grep -Fq 'rs_rules=' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

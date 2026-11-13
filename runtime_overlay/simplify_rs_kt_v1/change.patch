@@ -1,0 +1,1060 @@
+--- a/core/simplification_analyzer.py
++++ b/core/simplification_analyzer.py
+@@ -31,7 +31,7 @@
+ 
+ def _canonical_language_inventory(graph: Dict[str, Any]) -> Dict[str, Any]:
+     """Describe reference coverage separately from semantic-rule coverage."""
+-    suffix_counts = {".ts": 0, ".tsx": 0, ".js": 0, ".jsx": 0, ".py": 0}
++    suffix_counts = {".ts": 0, ".tsx": 0, ".js": 0, ".jsx": 0, ".py": 0, ".rs": 0, ".kt": 0}
+     for raw_path in graph.get("vertices", []) or []:
+         path = str(raw_path)
+         for suffix in suffix_counts:
+@@ -45,6 +45,8 @@
+         ".tsx": "js_structural_v2",
+         ".js": "js_structural_v2",
+         ".jsx": "js_structural_v2",
++        ".rs": "rs_structural_v1",
++        ".kt": "kt_structural_v1",
+     }
+     uncovered = [suffix for suffix in observed if suffix not in semantic_frontends]
+     python_count = suffix_counts[".py"]
+@@ -846,6 +848,839 @@
+             ))
+     return candidates
+ 
++RS_SEMANTIC_EXTENSIONS = (".rs",)
++KT_SEMANTIC_EXTENSIONS = (".kt",)
++
++
++def _brace_char_literal_end(source: str, start: int, end: int) -> int:
++    """Return the index just past a char literal starting at ``start``, or -1.
++
++    Accepts one plain character or one escape (``\\n``, ``\\x41``,
++    Rust ``\\u{41}``, Kotlin ``\\u0041``).  A lifetime (``'a``) has no
++    closing quote after one character/escape, so it returns -1 and the
++    quote stays visible instead of swallowing the rest of the file.
++    """
++    if start + 2 >= end or source[start] != "'":
++        return -1
++    j = start + 1
++    if source[j] == "\\":
++        j += 1
++        if j >= end:
++            return -1
++        esc = source[j]
++        if esc == "u":
++            if j + 1 < end and source[j + 1] == "{":
++                close = source.find("}", j + 2, end)
++                if close < 0:
++                    return -1
++                j = close + 1
++            else:
++                if j + 4 >= end:
++                    return -1
++                j += 5
++        elif esc == "x":
++            if j + 2 >= end:
++                return -1
++            j += 3
++        else:
++            j += 1
++    else:
++        j += 1
++    if j < end and source[j] == "'":
++        return j + 1
++    return -1
++
++
++def _mask_rs_noncode(source: str) -> str:
++    """Length-preserving conservative mask for Rust comments/strings/chars.
++
++    Lifetimes (``&'a str``) are NOT char literals: a quote is treated as a
++    char-literal start only when ``_brace_char_literal_end`` accepts it.
++    Raw strings (``r"..."`` / ``r#"..."#`` / ``br#"..."#``) are masked as a
++    unit so braces inside them never reach brace matching.  Nested block
++    comments are a known v1 limitation: only the first ``*/`` closes the
++    mask, like the JS mask's non-nested handling.
++    """
++    out, i, n = list(source), 0, len(source)
++    while i < n:
++        c = source[i]
++        if c == "/" and i + 1 < n and source[i + 1] in ("/", "*"):
++            block = source[i + 1] == "*"
++            out[i] = out[i + 1] = " "
++            i += 2
++            while i < n:
++                if block and source[i] == "*" and i + 1 < n and source[i + 1] == "/":
++                    out[i] = out[i + 1] = " "; i += 2; break
++                if not block and source[i] == "\n":
++                    break
++                if source[i] != "\n":
++                    out[i] = " "
++                i += 1
++            continue
++        # Raw string: r"..." / r#"..."# / br"..." / br#"..."#.
++        raw_start = -1
++        raw_hashes = 0
++        if c == "r" or (c == "b" and i + 1 < n and source[i + 1] == "r"):
++            j = i + 1 if c == "r" else i + 2
++            while j < n and source[j] == "#":
++                raw_hashes += 1; j += 1
++            if j < n and source[j] == '"':
++                raw_start = i
++        if raw_start >= 0:
++            closing = '"' + "#" * raw_hashes
++            close = source.find(closing, j + 1)
++            stop = n if close < 0 else close + len(closing)
++            for k in range(raw_start, stop):
++                if source[k] != "\n":
++                    out[k] = " "
++            i = stop
++            continue
++        if c == '"':
++            out[i] = " "; i += 1
++            escaped = False
++            while i < n:
++                ch = source[i]
++                if ch != "\n":
++                    out[i] = " "
++                if escaped:
++                    escaped = False
++                elif ch == "\\":
++                    escaped = True
++                elif ch == '"':
++                    i += 1; break
++                i += 1
++            continue
++        if c == "'":
++            char_end = _brace_char_literal_end(source, i, n)
++            if char_end > 0:
++                for k in range(i, char_end):
++                    if source[k] != "\n":
++                        out[k] = " "
++                i = char_end
++                continue
++            i += 1
++            continue
++        i += 1
++    return "".join(out)
++
++
++def _mask_kt_noncode(source: str) -> str:
++    """Length-preserving conservative mask for Kotlin comments/strings/chars.
++
++    Triple-quoted raw strings (``\"\"\"...\"\"\"``) are masked as a unit so
++    braces inside them never reach brace matching.  String templates
++    (``${...}``) are masked as a whole, like JS template literals: braces
++    inside a template are hidden, so a template containing a block is a
++    known v1 limitation.  Block comments are masked non-nested, like the
++    JS mask; Kotlin block comments can nest, so a nested comment containing
++    braces is a known v1 limitation.
++    """
++    out, i, n = list(source), 0, len(source)
++    while i < n:
++        c = source[i]
++        if c == "/" and i + 1 < n and source[i + 1] in ("/", "*"):
++            block = source[i + 1] == "*"
++            out[i] = out[i + 1] = " "
++            i += 2
++            while i < n:
++                if block and source[i] == "*" and i + 1 < n and source[i + 1] == "/":
++                    out[i] = out[i + 1] = " "; i += 2; break
++                if not block and source[i] == "\n":
++                    break
++                if source[i] != "\n":
++                    out[i] = " "
++                i += 1
++            continue
++        if c == '"' and source.startswith('"""', i):
++            close = source.find('"""', i + 3)
++            stop = n if close < 0 else close + 3
++            for k in range(i, stop):
++                if source[k] != "\n":
++                    out[k] = " "
++            i = stop
++            continue
++        if c == '"':
++            out[i] = " "; i += 1
++            escaped = False
++            while i < n:
++                ch = source[i]
++                if ch != "\n":
++                    out[i] = " "
++                if escaped:
++                    escaped = False
++                elif ch == "\\":
++                    escaped = True
++                elif ch == '"':
++                    i += 1; break
++                i += 1
++            continue
++        if c == "'":
++            char_end = _brace_char_literal_end(source, i, n)
++            if char_end > 0:
++                for k in range(i, char_end):
++                    if source[k] != "\n":
++                        out[k] = " "
++                i = char_end
++                continue
++            i += 1
++            continue
++        i += 1
++    return "".join(out)
++
++
++def _canonical_brace_source_snapshot(
++    graph: Dict[str, Any], root: Path, extensions: Tuple[str, ...], mask_fn,
++) -> List[Tuple[str, str, str]]:
++    """Return stable brace-language source plus one shared length-preserving code mask."""
++    file_map = graph.get("file_map", {}) or {}
++    rows: List[Tuple[str, str, str]] = []
++    for raw_path in graph.get("vertices", []) or []:
++        path = str(raw_path)
++        source = file_map.get(raw_path)
++        if path.endswith(extensions) and isinstance(source, str):
++            rows.append((_relative_graph_path(path, root), source, mask_fn(source)))
++    rows.sort(key=lambda row: row[0])
++    return rows
++
++
++def _canonical_rs_source_snapshot(graph: Dict[str, Any], root: Path) -> List[Tuple[str, str, str]]:
++    return _canonical_brace_source_snapshot(graph, root, RS_SEMANTIC_EXTENSIONS, _mask_rs_noncode)
++
++
++def _canonical_kt_source_snapshot(graph: Dict[str, Any], root: Path) -> List[Tuple[str, str, str]]:
++    return _canonical_brace_source_snapshot(graph, root, KT_SEMANTIC_EXTENSIONS, _mask_kt_noncode)
++
++
++def _split_top_level_commas(code: str) -> List[str]:
++    """Split a parameter list on top-level commas (mirrors the JS helper's scan)."""
++    pieces: List[str] = []
++    last = 0
++    paren = bracket = brace = angle = 0
++    for idx, ch in enumerate(code):
++        if ch == "(": paren += 1
++        elif ch == ")": paren -= 1
++        elif ch == "[": bracket += 1
++        elif ch == "]": bracket -= 1
++        elif ch == "{": brace += 1
++        elif ch == "}": brace -= 1
++        elif ch == "<": angle += 1
++        elif ch == ">" and angle: angle -= 1
++        elif ch == "," and paren == bracket == brace == angle == 0:
++            pieces.append(code[last:idx]); last = idx + 1
++    pieces.append(code[last:])
++    return pieces
++
++
++def _rs_simple_parameter_names(source: str, masked: str, open_pos: int, close_pos: int) -> Optional[List[str]]:
++    """Return simple Rust parameter names or None for patterns/complex forms."""
++    code = masked[open_pos + 1:close_pos]
++    pieces = _split_top_level_commas(code)
++    if len(pieces) == 1 and not pieces[0].strip():
++        return []
++    names: List[str] = []
++    for piece in pieces:
++        token = piece.strip()
++        if not token:
++            return None
++        if re.fullmatch(r"(?:mut\s+)?self", token) or re.fullmatch(
++            r"&(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?(?:mut\s+)?self", token
++        ):
++            names.append("self")
++            continue
++        match = re.fullmatch(
++            r"(?:mut\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:[\s\S]+",
++            token,
++        )
++        if not match:
++            return None
++        names.append(match.group("name"))
++    return names
++
++
++def _kt_simple_parameter_names(source: str, masked: str, open_pos: int, close_pos: int) -> Optional[List[str]]:
++    """Return simple Kotlin parameter names or None for destructuring/complex forms."""
++    code = masked[open_pos + 1:close_pos]
++    pieces = _split_top_level_commas(code)
++    if len(pieces) == 1 and not pieces[0].strip():
++        return []
++    names: List[str] = []
++    for piece in pieces:
++        token = piece.strip()
++        if not token or any(symbol in token for symbol in ("{", "[")):
++            return None
++        match = re.fullmatch(
++            r"(?:vararg\s+)?(?:crossinline\s+|noinline\s+)?"
++            r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:[\s\S]+",
++            token,
++        )
++        if not match:
++            return None
++        names.append(match.group("name"))
++    return names
++
++
++def _rs_function_body_open(masked: str, after_params: int) -> int:
++    """Find a conservative block-body brace after a Rust parameter list.
++
++    Skips the return type and ``where`` clause.  A ``;`` at depth 0 means a
++    declaration without a body (trait method, ``extern`` block item).
++    Bracket/paren/angle depth is tracked so ``-> [u8; 3]`` never ends the
++    scan early.  Returns -1 instead of guessing.
++    """
++    pos = _skip_js_space(masked, after_params)
++    paren = bracket = angle = 0
++    while pos < len(masked):
++        ch = masked[pos]
++        if ch == "(": paren += 1
++        elif ch == ")":
++            if paren == 0: return -1
++            paren -= 1
++        elif ch == "[": bracket += 1
++        elif ch == "]":
++            if bracket == 0: return -1
++            bracket -= 1
++        elif ch == "<": angle += 1
++        elif ch == ">" and angle: angle -= 1
++        elif ch == ";" and paren == bracket == angle == 0:
++            return -1
++        elif ch == "{" and paren == bracket == angle == 0:
++            return pos
++        elif ch == "}" and paren == bracket == angle == 0:
++            return -1
++        pos += 1
++    return -1
++
++
++_KT_DECLARATION_KEYWORDS = (
++    "fun", "val", "var", "class", "object", "interface", "enum", "sealed",
++    "data", "private", "public", "protected", "internal", "open", "override",
++    "suspend", "inline", "tailrec", "operator", "infix", "external", "actual",
++    "expect", "abstract", "companion", "init", "constructor", "import", "package",
++)
++
++
++def _kt_function_body_open(masked: str, after_params: int) -> Tuple[Optional[str], int]:
++    """Find a Kotlin function body: ("block", brace_pos) or ("expr", equals_pos).
++
++    Skips the return type.  A ``;`` or enclosing ``}`` at depth 0, or a
++    following declaration line, means a declaration without a body
++    (interface member, ``external fun``).  Expression bodies are detected
++    only when ``=`` opens them; multi-line expression bodies are not
++    resolved in v1 and fall through to the single-line capture in the
++    record builder.
++    """
++    pos = _skip_js_space(masked, after_params)
++    paren = bracket = angle = 0
++    while pos < len(masked):
++        ch = masked[pos]
++        if ch == "(": paren += 1
++        elif ch == ")":
++            if paren == 0: return None, -1
++            paren -= 1
++        elif ch == "[": bracket += 1
++        elif ch == "]":
++            if bracket == 0: return None, -1
++            bracket -= 1
++        elif ch == "<": angle += 1
++        elif ch == ">" and angle: angle -= 1
++        elif ch == ";" and paren == bracket == angle == 0:
++            return None, -1
++        elif ch == "}" and paren == bracket == angle == 0:
++            return None, -1
++        elif ch == "{" and paren == bracket == angle == 0:
++            return "block", pos
++        elif ch == "=" and paren == bracket == angle == 0:
++            if pos + 1 < len(masked) and masked[pos + 1] == "=":
++                return None, -1
++            return "expr", pos
++        elif ch == "\n" and paren == bracket == angle == 0:
++            nxt = _skip_js_space(masked, pos + 1)
++            if nxt < len(masked) and masked[nxt] in "}@":
++                return None, -1
++            keyword = re.match(
++                r"(?:" + "|".join(_KT_DECLARATION_KEYWORDS) + r")\b", masked[nxt:]
++            )
++            if keyword:
++                return None, -1
++        pos += 1
++    return None, -1
++
++
++def _rs_function_records(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    """Discover conservative block-bodied Rust functions and methods.
++
++    Functions inside ``macro_rules!`` definitions are excluded: their bodies
++    are template text, not top-level items, and grouping them with real
++    functions would mislabel macro template duplication as code duplication.
++    """
++    records: List[Dict[str, Any]] = []
++    seen: set[Tuple[str, int]] = set()
++    declaration = re.compile(
++        r"(?P<pub>\bpub(?:\s*\([^)]*\))?\s+)?"
++        r"(?P<mods>(?:(?:async|unsafe|const|extern\s+\"[^\"]*\")\s+)*)"
++        r"\bfn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\("
++    )
++    macro_def = re.compile(r"\bmacro_rules!\s*[A-Za-z_][A-Za-z0-9_]*\s*\{")
++    for rel, source, masked in sources:
++        macro_spans: List[Tuple[int, int]] = []
++        for macro_match in macro_def.finditer(masked):
++            macro_open = masked.find("{", macro_match.start(), macro_match.end())
++            macro_close = _matching_js_brace(masked, macro_open)
++            if macro_close >= 0:
++                macro_spans.append((macro_open, macro_close))
++        for match in declaration.finditer(masked):
++            if any(start <= match.start() <= end for start, end in macro_spans):
++                continue
++            params_open = masked.find("(", match.start(), match.end())
++            params_close = _matching_js_delimiter(masked, params_open, "(", ")")
++            if params_close < 0:
++                continue
++            body_open = _rs_function_body_open(masked, params_close + 1)
++            if body_open < 0 or (rel, body_open) in seen:
++                continue
++            body_close = _matching_js_brace(masked, body_open)
++            if body_close < 0:
++                continue
++            params = _rs_simple_parameter_names(source, masked, params_open, params_close)
++            seen.add((rel, body_open))
++            name = match.group("name")
++            exported = bool(match.group("pub"))
++            mods = match.group("mods") or ""
++            records.append({
++                "file": rel, "source": source, "masked": masked, "name": name,
++                "start": match.start(), "params_open": params_open, "params_close": params_close,
++                "params": params, "body_open": body_open, "body_close": body_close,
++                "line_start": source.count("\n", 0, match.start()) + 1,
++                "line_end": source.count("\n", 0, body_close) + 1,
++                "exported": exported, "private": not exported,
++                "async": "async" in mods.split(), "form": "function",
++                "expr_start": -1, "expr_end": -1,
++            })
++    records.sort(key=lambda row: (row["file"], row["start"], row["name"]))
++    return records
++
++
++def _kt_function_records(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    """Discover Kotlin functions: block bodies and single-line ``=`` bodies."""
++    records: List[Dict[str, Any]] = []
++    seen: set[Tuple[str, int]] = set()
++    declaration = re.compile(
++        r"(?P<mods>(?:(?:public|private|protected|internal|open|override|suspend|inline|tailrec|operator|infix|external|actual|expect|abstract)\s+)*)"
++        r"fun\s+(?:<[^;{}()]*>\s*)?(?:(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*)?"
++        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\("
++    )
++    for rel, source, masked in sources:
++        for match in declaration.finditer(masked):
++            params_open = masked.find("(", match.start(), match.end())
++            params_close = _matching_js_delimiter(masked, params_open, "(", ")")
++            if params_close < 0:
++                continue
++            form, body_pos = _kt_function_body_open(masked, params_close + 1)
++            if form is None:
++                continue
++            if form == "block":
++                body_open = body_pos
++                body_close = _matching_js_brace(masked, body_open)
++                if body_close < 0 or (rel, body_open) in seen:
++                    continue
++                seen.add((rel, body_open))
++                expr_start = expr_end = -1
++                line_end = source.count("\n", 0, body_close) + 1
++            else:
++                expr_start = body_pos + 1
++                line_end_pos = source.find("\n", expr_start)
++                semi = masked.find(";", expr_start)
++                expr_end = len(source)
++                if line_end_pos >= 0:
++                    expr_end = min(expr_end, line_end_pos)
++                if semi >= 0:
++                    expr_end = min(expr_end, semi)
++                body_open = body_close = -1
++                line_end = source.count("\n", 0, expr_end) + 1
++                # A single-line capture can truncate a multi-line expression:
++                # ``= JSONObject()`` followed by ``.put(...)`` on the next
++                # line is a builder chain, not a forwarding call.  When the
++                # expression ended at a newline (not ``;``), peek at the next
++                # line: a leading ``.`` or infix operator continues it, so
++                # the record is not a single-line expression body in v1.
++                expr_continues = False
++                if expr_end < len(source) and source[expr_end] == "\n":
++                    nxt = _skip_js_space(masked, expr_end)
++                    if nxt < len(masked) and masked[nxt] == ".":
++                        expr_continues = True
++                    elif nxt < len(masked) and re.match(
++                        r"(?:&&|\|\||[+\-*/%]|\?:|as\b|is\b|!in\b|in\b)",
++                        masked[nxt:],
++                    ):
++                        expr_continues = True
++            params = _kt_simple_parameter_names(source, masked, params_open, params_close)
++            name = match.group("name")
++            mods = match.group("mods") or ""
++            private = "private" in mods.split()
++            records.append({
++                "file": rel, "source": source, "masked": masked, "name": name,
++                "start": match.start(), "params_open": params_open, "params_close": params_close,
++                "params": params, "body_open": body_open, "body_close": body_close,
++                "line_start": source.count("\n", 0, match.start()) + 1,
++                "line_end": line_end,
++                "exported": not private, "private": private,
++                "async": False, "form": "function" if form == "block" else "expression",
++                "expr_start": expr_start, "expr_end": expr_end,
++                "expr_continues": expr_continues if form == "expr" else False,
++            })
++    records.sort(key=lambda row: (row["file"], row["start"], row["name"]))
++    return records
++
++
++def _brace_normalized_body_tokens(source: str, start: int, end: int) -> Optional[List[str]]:
++    """Tokenize a Rust/Kotlin body conservatively for exact-structure fingerprinting.
++
++    Comments/formatting are ignored, while string/char literal bytes and
++    punctuator boundaries are preserved.  Unlike the JS tokenizer there is no
++    regex/division ambiguity: ``/`` is always division in both languages.
++    Lifetimes (``'a``) tokenize as a quote plus an identifier; char literals
++    stay one token.  Rust raw strings (``r#"..."#``) and Kotlin raw strings
++    (``\"\"\"...\"\"\"``) are consumed as single tokens.
++    """
++    tokens: List[str] = []
++    i = start
++    punctuators = (
++        "::", "->", "=>", "..=", "...", "..", "?.", "?:", "==", "!=", "<=", ">=",
++        "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "++", "--",
++    )
++    while i < end:
++        ch = source[i]
++        if ch.isspace():
++            i += 1; continue
++        if ch == "/" and i + 1 < end and source[i + 1] == "/":
++            newline = source.find("\n", i + 2, end)
++            i = end if newline < 0 else newline + 1; continue
++        if ch == "/" and i + 1 < end and source[i + 1] == "*":
++            close = source.find("*/", i + 2, end)
++            if close < 0: return None
++            i = close + 2; continue
++        if ch == "r" or (ch == "b" and i + 1 < end and source[i + 1] == "r"):
++            j = i + 1 if ch == "r" else i + 2
++            hashes = 0
++            while j < end and source[j] == "#":
++                hashes += 1; j += 1
++            if j < end and source[j] == '"':
++                closing = '"' + "#" * hashes
++                close = source.find(closing, j + 1, end)
++                if close < 0: return None
++                tokens.append(source[i:close + len(closing)]); i = close + len(closing); continue
++        if ch == '"' and source.startswith('"""', i, end):
++            close = source.find('"""', i + 3, end)
++            if close < 0: return None
++            tokens.append(source[i:close + 3]); i = close + 3; continue
++        if ch == '"':
++            j, escaped = i + 1, False
++            while j < end:
++                current = source[j]
++                if escaped:
++                    escaped = False
++                elif current == "\\":
++                    escaped = True
++                elif current == '"':
++                    j += 1; break
++                j += 1
++            if j > end: return None
++            tokens.append(source[i:j]); i = j; continue
++        if ch == "'":
++            char_end = _brace_char_literal_end(source, i, end)
++            if char_end > 0:
++                tokens.append(source[i:char_end]); i = char_end; continue
++            tokens.append(ch); i += 1; continue
++        ident = re.match(r"[A-Za-z_][A-Za-z0-9_]*", source[i:end])
++        if ident:
++            value = ident.group(0); tokens.append(value); i += len(value); continue
++        number = re.match(
++            r"(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?)[A-Za-z]*",
++            source[i:end],
++        )
++        if number:
++            value = number.group(0); tokens.append(value); i += len(value); continue
++        matched = next((op for op in punctuators if source.startswith(op, i)), None)
++        if matched:
++            tokens.append(matched); i += len(matched); continue
++        tokens.append(ch); i += 1
++    return tokens
++
++
++def _brace_candidate_row(
++    *, rel: str, name: str, line_start: int, line_end: int,
++    kind: str, identity: Dict[str, Any], witness: Dict[str, Any], proof_rule: str,
++    validation: List[str],
++) -> Dict[str, Any]:
++    return _candidate(
++        identity={"file": rel, "kind": kind, "function": name, "line": line_start, **identity},
++        kind=kind, files=[rel], names=[name],
++        members=[_member(rel, name, line_start, line_end, private=True)], estimated_loc=1,
++        witness=witness, proof_rule=proof_rule, validation=validation,
++    )
++
++
++def _brace_direct_forwarding_wrapper_candidates(
++    *, sources: List[Tuple[str, str, str]], lang: str, records_fn,
++) -> List[Dict[str, Any]]:
++    """Find exact-parameter forwarding wrappers in a brace language.
++
++    Rust accepts a ``return`` statement or a bare tail-expression call;
++    a call followed by ``;`` without ``return`` discards its value and is
++    NOT forwarding.  Kotlin block bodies require ``return``; Kotlin
++    single-expression bodies (``= callee(args)``) are forwarding by shape.
++    Callees are plain identifiers, plus ``self.<name>`` in Rust (method
++    delegation); ``Self::``, ``super::`` and ``crate::`` paths are deferred.
++    """
++    candidates: List[Dict[str, Any]] = []
++    kind = f"{lang}_direct_forwarding_wrapper"
++    for fn in records_fn(sources=sources):
++        params = fn.get("params")
++        if params is None or fn.get("async"):
++            continue
++        forward_params = [p for p in params if p != "self"]
++        callee: Optional[str] = None
++        if fn["form"] == "expression":
++            # A truncated multi-line expression (e.g. ``= JSONObject()``
++            # continued by ``.put(...)``) is a builder chain, not a
++            # forwarding call; _kt_function_records flags it.
++            if fn.get("expr_continues"):
++                continue
++            body_text = fn["source"][fn["expr_start"]:fn["expr_end"]].strip()
++            match = re.fullmatch(
++                r"(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)",
++                body_text, flags=re.S,
++            )
++            if not match:
++                continue
++            callee = match.group("callee")
++            raw_args = [item.strip() for item in match.group("args").split(",") if item.strip()]
++        else:
++            body_mask = fn["masked"][fn["body_open"] + 1:fn["body_close"]].strip()
++            if lang == "rs":
++                callee_pattern = (
++                    r"(?P<callee>[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?)"
++                )
++                match = re.fullmatch(
++                    r"return\s+" + callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)\s*;?",
++                    body_mask, flags=re.S,
++                )
++                if not match:
++                    match = re.fullmatch(
++                        callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)",
++                        body_mask, flags=re.S,
++                    )
++            else:
++                match = re.fullmatch(
++                    r"return\s+(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)\s*;?",
++                    body_mask, flags=re.S,
++                )
++            if not match:
++                continue
++            callee = re.sub(r"\s+", "", match.group("callee"))
++            raw_args = [item.strip() for item in match.group("args").split(",") if item.strip()]
++        if not callee or callee.split(".")[-1] == fn["name"]:
++            continue
++        if raw_args != list(forward_params):
++            continue
++        private = bool(fn["private"])
++        is_self_callee = "." in callee
++        candidates.append(_candidate(
++            identity={"file": fn["file"], "kind": kind, "function": fn["name"], "callee": callee},
++            kind=kind, files=[fn["file"]], names=[fn["name"]],
++            members=[_member(fn["file"], fn["name"], fn["line_start"], fn["line_end"], private=private)],
++            estimated_loc=max(1, fn["line_end"] - fn["line_start"] + 1),
++            witness={
++                "type": f"{lang}_direct_forwarding_wrapper_v1", "same_owner_file": True,
++                "simple_parameters_only": True, "argument_forwarding_exact": True,
++                "direct_identifier_callee": not is_self_callee,
++                "self_receiver_callee": is_self_callee,
++                "async_wrapper_excluded": True,
++                "wrapper_exported": bool(fn["exported"]), "wrapper_private": private,
++                "function_form": fn["form"], "callee": callee,
++                "authority": f"bounded_{lang}_structural_forwarding_witness_only",
++            },
++            proof_rule=f"remove/share a {lang.upper()} forwarding wrapper only when callable/API identity and all consumers remain compatible",
++            validation=[
++                "preserve exported/public callable names unless compatibility is explicitly retained",
++                "preserve receiver binding by allowing only direct identifier or self-receiver callees in v1",
++                "preserve argument order and arity", f"run affected {lang.upper()} tests and type-check",
++            ],
++        ))
++    return candidates
++
++
++def _brace_exact_function_body_duplication_candidates(
++    *, sources: List[Tuple[str, str, str]], lang: str, records_fn,
++) -> List[Dict[str, Any]]:
++    """Find conservative exact structural body duplication in a brace language."""
++    kind = f"{lang}_exact_function_body_duplication"
++    grouped: Dict[str, List[Dict[str, Any]]] = {}
++    for fn in records_fn(sources=sources):
++        if fn["body_open"] < 0:
++            continue
++        tokens = _brace_normalized_body_tokens(fn["source"], fn["body_open"] + 1, fn["body_close"])
++        if tokens is None or len(tokens) < 8:
++            continue
++        fingerprint = _sha(json.dumps(tokens, ensure_ascii=False, separators=(",", ":")))
++        grouped.setdefault(fingerprint, []).append(fn)
++    candidates: List[Dict[str, Any]] = []
++    for fingerprint, members in grouped.items():
++        if len(members) < 2:
++            continue
++        files = sorted({row["file"] for row in members})
++        names = sorted({row["name"] for row in members})
++        locs = sorted((row["line_end"] - row["line_start"] + 1 for row in members), reverse=True)
++        removable = sum(locs[1:])
++        if removable <= 0:
++            continue
++        candidates.append(_candidate(
++            identity={"kind": kind, "body": fingerprint, "files": files, "names": names},
++            kind=kind, files=files, names=names,
++            members=[_member(row["file"], row["name"], row["line_start"], row["line_end"], private=row["private"]) for row in members],
++            estimated_loc=removable, duplicate_loc=removable,
++            witness={
++                "type": f"{lang}_exact_function_body_tokens_v1", "exact_token_body_identical": True,
++                "comments_and_formatting_ignored": True, "string_and_char_literal_bytes_preserved": True,
++                "nested_block_comment_bodies_excluded_by_mask_limitation": True,
++                "member_count": len(members), "body_fingerprint": fingerprint,
++                "authority": f"bounded_{lang}_token_body_duplication_witness_only",
++            },
++            proof_rule=f"share exact {lang.upper()} function-body implementations only behind a neutral owner while preserving every public callable surface",
++            validation=[
++                "preserve exported/public functions as compatibility wrappers when required",
++                "preserve module initialization and import behavior", f"run affected {lang.upper()} tests and type-check",
++            ],
++        ))
++    return candidates
++
++
++def _brace_redundant_else_after_terminal_candidates(
++    *, sources: List[Tuple[str, str, str]], lang: str, records_fn,
++) -> List[Dict[str, Any]]:
++    """Find a braced ``else`` following a directly terminal ``if`` branch.
++
++    Two guards beyond the JS rule, because Rust/Kotlin ``if`` can be an
++    expression: (1) the ``if`` must be in statement position (the previous
++    non-space character is not ``= ( [ ,`` and it is not preceded by
++    ``return`` or by ``else`` for an ``else if`` chain); (2) the ``else``
++    block must not end in a bare tail expression, which would be the value
++    of an expression-position ``if``.
++    """
++    kind = f"{lang}_redundant_else_after_terminal"
++    candidates: List[Dict[str, Any]] = []
++    records_by_file: Dict[str, List[Dict[str, Any]]] = {}
++    for fn in records_fn(sources=sources):
++        records_by_file.setdefault(fn["file"], []).append(fn)
++    terminal_kinds = ("return", "throw") if lang == "kt" else ("return",)
++    terminal_pattern = r"(?:^|;)\s*(?P<kind>" + "|".join(terminal_kinds) + r")\b[\s\S]*;?\s*$"
++    for rel, source, masked in sources:
++        for match in re.finditer(r"\bif\b", masked):
++            prev = match.start() - 1
++            while prev >= 0 and masked[prev].isspace():
++                prev -= 1
++            if prev >= 0 and masked[prev] in "=([,":
++                continue
++            before = masked[max(0, match.start() - 16):match.start()]
++            if re.search(r"\breturn\s*$", before) or re.search(r"\belse\s*$", before):
++                continue
++            pos = match.end()
++            paren = bracket = angle = 0
++            then_open = -1
++            while pos < len(masked):
++                ch = masked[pos]
++                if ch == "(": paren += 1
++                elif ch == ")":
++                    if paren == 0: break
++                    paren -= 1
++                elif ch == "[": bracket += 1
++                elif ch == "]":
++                    if bracket == 0: break
++                    bracket -= 1
++                elif ch == "<": angle += 1
++                elif ch == ">" and angle: angle -= 1
++                elif ch == "{" and paren == bracket == angle == 0:
++                    then_open = pos; break
++                elif ch in ";}" and paren == bracket == angle == 0:
++                    break
++                pos += 1
++            if then_open < 0:
++                continue
++            then_close = _matching_js_brace(masked, then_open)
++            if then_close < 0:
++                continue
++            then_body = masked[then_open + 1:then_close].strip()
++            terminal = re.search(terminal_pattern, then_body)
++            if not terminal:
++                continue
++            cursor = _skip_js_space(masked, then_close + 1)
++            if not masked.startswith("else", cursor):
++                continue
++            else_open = _skip_js_space(masked, cursor + 4)
++            if else_open >= len(masked) or masked[else_open] != "{":
++                continue
++            else_close = _matching_js_brace(masked, else_open)
++            if else_close < 0:
++                continue
++            else_body = masked[else_open + 1:else_close].strip()
++            if else_body and not else_body.endswith(";") and not re.search(
++                r"\breturn\b[\s\S]*;?\s*$", else_body
++            ):
++                continue
++            line_start = source.count("\n", 0, match.start()) + 1
++            line_end = source.count("\n", 0, else_close) + 1
++            enclosing = "unknown"
++            for fn in records_by_file.get(rel, []):
++                span_end = fn["body_close"] if fn["body_open"] >= 0 else fn["expr_end"]
++                if fn["start"] <= match.start() <= span_end:
++                    enclosing = fn["name"]
++                    break
++            candidates.append(_brace_candidate_row(
++                rel=rel, name=enclosing, line_start=line_start, line_end=line_end,
++                kind=kind,
++                identity={"terminal": terminal.group("kind"), "else_line": source.count("\n", 0, cursor) + 1},
++                witness={
++                    "type": f"{lang}_redundant_else_after_terminal_v1", "same_owner_file": True,
++                    "then_block_directly_terminal": True, "terminal_kind": terminal.group("kind"),
++                    "else_is_braced": True, "else_if_excluded": True,
++                    "else_if_chain_inner_if_excluded": True,
++                    "statement_position_if_only": True, "else_block_value_free": True,
++                    "condition_evaluation_preserved": True, "else_block_scope_must_be_preserved": True,
++                    "authority": f"bounded_{lang}_structural_control_flow_witness_only",
++                },
++                proof_rule="remove only the redundant else keyword while preserving the else block as a standalone block after a directly terminal then-branch",
++                validation=[
++                    "preserve condition evaluation exactly once", "preserve else-block lexical scope braces",
++                    "preserve return/throw control flow", f"run affected {lang.upper()} tests and type-check",
++                ],
++            ))
++    return candidates
++
++
++def _rs_direct_forwarding_wrapper_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_direct_forwarding_wrapper_candidates(sources=sources, lang="rs", records_fn=_rs_function_records)
++
++
++def _rs_exact_function_body_duplication_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_exact_function_body_duplication_candidates(sources=sources, lang="rs", records_fn=_rs_function_records)
++
++
++def _rs_redundant_else_after_terminal_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_redundant_else_after_terminal_candidates(sources=sources, lang="rs", records_fn=_rs_function_records)
++
++
++def _kt_direct_forwarding_wrapper_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_direct_forwarding_wrapper_candidates(sources=sources, lang="kt", records_fn=_kt_function_records)
++
++
++def _kt_exact_function_body_duplication_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_exact_function_body_duplication_candidates(sources=sources, lang="kt", records_fn=_kt_function_records)
++
++
++def _kt_redundant_else_after_terminal_candidates(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
++    return _brace_redundant_else_after_terminal_candidates(sources=sources, lang="kt", records_fn=_kt_function_records)
++
++
+ def _canonical_python_source_snapshot(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, str]]]:
+     """Return Python sources from the canonical SharedGraph discovery snapshot.
+ 
+@@ -1580,6 +2415,24 @@
+         recommendation = "defer_js_redundant_else_high_proof_surface" if risk == "high" else "candidate_js_redundant_else_elision"
+     elif kind == "js_boolean_guard_return" and _witness_has(witness, "condition_evaluated_once_before_and_after", "true_false_terminals_opposite"):
+         recommendation = "defer_js_boolean_return_high_proof_surface" if risk == "high" else "candidate_js_boolean_guard_collapse"
++    elif kind == "rs_direct_forwarding_wrapper" and _witness_has(witness, "argument_forwarding_exact") and (witness.get("direct_identifier_callee") or witness.get("self_receiver_callee")):
++        if witness.get("wrapper_exported") or not witness.get("wrapper_private"):
++            recommendation = "defer_rs_public_api_wrapper"
++        else:
++            recommendation = "defer_rs_forwarding_high_proof_surface" if risk == "high" else "candidate_rs_private_forwarding_wrapper"
++    elif kind == "kt_direct_forwarding_wrapper" and _witness_has(witness, "argument_forwarding_exact", "direct_identifier_callee"):
++        if witness.get("wrapper_exported") or not witness.get("wrapper_private"):
++            recommendation = "defer_kt_public_api_wrapper"
++        else:
++            recommendation = "defer_kt_forwarding_high_proof_surface" if risk == "high" else "candidate_kt_private_forwarding_wrapper"
++    elif kind == "rs_exact_function_body_duplication" and witness.get("exact_token_body_identical"):
++        recommendation = "defer_rs_duplicate_high_proof_surface" if risk == "high" else "candidate_rs_exact_body_dedup"
++    elif kind == "kt_exact_function_body_duplication" and witness.get("exact_token_body_identical"):
++        recommendation = "defer_kt_duplicate_high_proof_surface" if risk == "high" else "candidate_kt_exact_body_dedup"
++    elif kind == "rs_redundant_else_after_terminal" and _witness_has(witness, "then_block_directly_terminal", "else_is_braced", "condition_evaluation_preserved"):
++        recommendation = "defer_rs_redundant_else_high_proof_surface" if risk == "high" else "candidate_rs_redundant_else_elision"
++    elif kind == "kt_redundant_else_after_terminal" and _witness_has(witness, "then_block_directly_terminal", "else_is_braced", "condition_evaluation_preserved"):
++        recommendation = "defer_kt_redundant_else_high_proof_surface" if risk == "high" else "candidate_kt_redundant_else_elision"
+     elif kind == "repeated_direct_statement_sequence" and _witness_has(witness, "repeated_sequence_ast_identical", "control_transfer_free_under_v1", "same_owner_file"):
+         recommendation = "defer_sequence_no_positive_net_gain" if removable <= 0 else ("defer_sequence_high_proof_surface" if risk == "high" else "candidate_local_sequence_extraction")
+     elif (kind == "redundant_branch_identical_body" and witness.get("branch_body_ast_identical")) or (kind == "direct_forwarding_wrapper" and witness.get("argument_forwarding_exact")):
+@@ -1634,6 +2487,31 @@
+             "apply only in a target worktree after proving literal value/order preservation and passing affected TS/JS tests",
+         )
+     if recommendation in {
++        "candidate_rs_private_forwarding_wrapper",
++        "candidate_rs_exact_body_dedup", "candidate_rs_redundant_else_elision",
++        "candidate_kt_private_forwarding_wrapper",
++        "candidate_kt_exact_body_dedup", "candidate_kt_redundant_else_elision",
++    }:
++        return _adjudication(
++            "DEFER", "RS_KT_STRUCTURAL_V1_CANDIDATE_REQUIRES_BEHAVIORAL_PROOF",
++            "apply only in a target worktree after Rust/Kotlin tests, type-check where applicable, and bounded reference validation",
++        )
++    if recommendation in {"defer_rs_public_api_wrapper", "defer_kt_public_api_wrapper"}:
++        return _adjudication(
++            "API_PROOF_CANDIDATE", "RS_KT_EXPORTED_OR_PUBLIC_WRAPPER_COMPATIBILITY_MUST_BE_PROVEN",
++            "preserve the callable surface or prove all consumers before wrapper removal",
++        )
++    if recommendation in {
++        "defer_rs_forwarding_high_proof_surface", "defer_rs_duplicate_high_proof_surface",
++        "defer_rs_redundant_else_high_proof_surface",
++        "defer_kt_forwarding_high_proof_surface", "defer_kt_duplicate_high_proof_surface",
++        "defer_kt_redundant_else_high_proof_surface",
++    }:
++        return _adjudication(
++            "DEFER", "RS_KT_STRUCTURAL_V1_HIGH_PROOF_SURFACE",
++            "reduce the affected proof surface or provide domain-specific differential evidence before patching",
++        )
++    if recommendation in {
+         "candidate_js_terminal_expression_temporary_inline", "candidate_js_private_forwarding_wrapper",
+         "candidate_js_exact_body_dedup", "candidate_js_redundant_else_elision",
+         "candidate_js_boolean_guard_collapse",
+@@ -1728,6 +2606,8 @@
+ 
+     graph, source_snapshot = _canonical_python_source_snapshot(root_path)
+     js_source_snapshot = _canonical_js_source_snapshot(graph, root_path)
++    rs_source_snapshot = _canonical_rs_source_snapshot(graph, root_path)
++    kt_source_snapshot = _canonical_kt_source_snapshot(graph, root_path)
+     language_inventory = _canonical_language_inventory(graph)
+     for rel, source in source_snapshot:
+         try:
+@@ -1825,10 +2705,28 @@
+         + js_boolean_return_candidates
+         + js_terminal_expression_candidates
+     )
++    rs_forwarding_candidates = _rs_direct_forwarding_wrapper_candidates(sources=rs_source_snapshot)
++    rs_duplicate_body_candidates = _rs_exact_function_body_duplication_candidates(sources=rs_source_snapshot)
++    rs_redundant_else_candidates = _rs_redundant_else_after_terminal_candidates(sources=rs_source_snapshot)
++    rs_candidates = (
++        rs_forwarding_candidates
++        + rs_duplicate_body_candidates
++        + rs_redundant_else_candidates
++    )
++    kt_forwarding_candidates = _kt_direct_forwarding_wrapper_candidates(sources=kt_source_snapshot)
++    kt_duplicate_body_candidates = _kt_exact_function_body_duplication_candidates(sources=kt_source_snapshot)
++    kt_redundant_else_candidates = _kt_redundant_else_after_terminal_candidates(sources=kt_source_snapshot)
++    kt_candidates = (
++        kt_forwarding_candidates
++        + kt_duplicate_body_candidates
++        + kt_redundant_else_candidates
++    )
+     all_candidates = (
+         duplicate_groups
+         + [candidate for name, _, _, _ in detector_specs for candidate in detected[name]]
+         + js_candidates
++        + rs_candidates
++        + kt_candidates
+     )
+ 
+     for group in all_candidates:
+@@ -1922,7 +2820,7 @@
+         rows = detected[name]
+         detector_metrics[count_key] = len(rows)
+         detector_metrics[removable_key] = sum(int(g.get("estimated_removable_loc", 0)) for g in rows)
+-    detector_metrics["semantic_candidates_total"] = sum(len(rows) for rows in detected.values()) + len(js_candidates)
++    detector_metrics["semantic_candidates_total"] = sum(len(rows) for rows in detected.values()) + len(js_candidates) + len(rs_candidates) + len(kt_candidates)
+     detector_metrics["semantic_js_try_catch_candidates"] = len(js_try_catch_candidates)
+     detector_metrics["estimated_removable_js_try_catch_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in js_try_catch_candidates)
+     detector_metrics["semantic_js_terminal_literal_temporary_candidates"] = len(js_terminal_temporary_candidates)
+@@ -1939,6 +2837,22 @@
+     detector_metrics["estimated_removable_js_terminal_expression_temporary_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in js_terminal_expression_candidates)
+     detector_metrics["js_semantic_files_scanned"] = len(js_source_snapshot)
+     detector_metrics["js_semantic_source_loc"] = sum(len(source.splitlines()) for _, source, _ in js_source_snapshot)
++    detector_metrics["semantic_rs_forwarding_wrapper_candidates"] = len(rs_forwarding_candidates)
++    detector_metrics["estimated_removable_rs_forwarding_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in rs_forwarding_candidates)
++    detector_metrics["semantic_rs_exact_duplicate_body_candidates"] = len(rs_duplicate_body_candidates)
++    detector_metrics["estimated_removable_rs_duplicate_body_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in rs_duplicate_body_candidates)
++    detector_metrics["semantic_rs_redundant_else_candidates"] = len(rs_redundant_else_candidates)
++    detector_metrics["estimated_removable_rs_redundant_else_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in rs_redundant_else_candidates)
++    detector_metrics["rs_semantic_files_scanned"] = len(rs_source_snapshot)
++    detector_metrics["rs_semantic_source_loc"] = sum(len(source.splitlines()) for _, source, _ in rs_source_snapshot)
++    detector_metrics["semantic_kt_forwarding_wrapper_candidates"] = len(kt_forwarding_candidates)
++    detector_metrics["estimated_removable_kt_forwarding_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in kt_forwarding_candidates)
++    detector_metrics["semantic_kt_exact_duplicate_body_candidates"] = len(kt_duplicate_body_candidates)
++    detector_metrics["estimated_removable_kt_duplicate_body_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in kt_duplicate_body_candidates)
++    detector_metrics["semantic_kt_redundant_else_candidates"] = len(kt_redundant_else_candidates)
++    detector_metrics["estimated_removable_kt_redundant_else_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in kt_redundant_else_candidates)
++    detector_metrics["kt_semantic_files_scanned"] = len(kt_source_snapshot)
++    detector_metrics["kt_semantic_source_loc"] = sum(len(source.splitlines()) for _, source, _ in kt_source_snapshot)
+     return {
+         "schema_version": SIMPLIFICATION_SCHEMA_VERSION,
+         "root": ".",
+@@ -1957,6 +2871,12 @@
+                 "ts_js_rule_count": 7,
+                 "ts_js_rule_families": ["try_catch_terminal_return", "terminal_literal_temporary", "direct_forwarding_wrapper", "exact_function_body_duplication", "redundant_else_after_terminal", "boolean_guard_return", "terminal_expression_temporary"],
+                 "ts_js_shared_primitives": ["shared_graph.file_map", "_mask_js_noncode", "_js_function_records", "_matching_js_delimiter", "_js_normalized_body_tokens"],
++                "rs_kt": "shared structural v1 frontend for Rust/Kotlin with three conservative mechanical rules per language; still not a full language parser",
++                "rs_rule_count": 3,
++                "kt_rule_count": 3,
++                "rs_rule_families": ["direct_forwarding_wrapper", "exact_function_body_duplication", "redundant_else_after_terminal"],
++                "kt_rule_families": ["direct_forwarding_wrapper", "exact_function_body_duplication", "redundant_else_after_terminal"],
++                "rs_kt_shared_primitives": ["shared_graph.file_map", "_mask_rs_noncode", "_mask_kt_noncode", "_rs_function_records", "_kt_function_records", "_matching_js_delimiter", "_brace_normalized_body_tokens"],
+                 "independent_second_lexer_or_scanner": False,
+             },
+             "single_discovery_snapshot": True,
+@@ -2043,6 +2963,11 @@
+             "js_rule2_reuses_v1_lexical_substrate": True,
+             "js_rule2_does_not_add_independent_lexer_or_scanner": True,
+             "js_terminal_literal_temporary_requires_nonthrowing_literal": True,
++            "rs_structural_frontend_v1_is_not_a_full_rust_parser": True,
++            "kt_structural_frontend_v1_is_not_a_full_kotlin_parser": True,
++            "rs_kt_forwarding_wrapper_requires_exact_parameter_forwarding": True,
++            "rs_kt_redundant_else_requires_statement_position_and_value_free_else_block": True,
++            "rs_kt_else_if_chain_inner_if_excluded": True,
+         },
+     }
+ 
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -26,7 +26,13 @@
+ # they live in the crate like any module, so they stay in.
+ RUST_SOURCE_EXTENSIONS = (".rs",)
+ SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + KOTLIN_SOURCE_EXTENSIONS + RUST_SOURCE_EXTENSIONS
+-EXPERIMENTAL_SOURCE_EXTENSIONS = JS_SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS
++# Experimental/self-host path: the DEFAULT contract plus Python.  K5/R1
++# expanded the default to Kotlin/Rust, but this set was never updated, so a
++# self-host scan silently dropped .kt/.rs from the graph — the simplification
++# analyzer scans targets through this path, which is why its Rust/Kotlin
++# frontends saw zero files.  The experimental set must never drop a stable
++# extension; it only adds Python.
++EXPERIMENTAL_SOURCE_EXTENSIONS = SOURCE_EXTENSIONS + PYTHON_SOURCE_EXTENSIONS
+ JS_RESOLUTION_EXTENSIONS = JS_SOURCE_EXTENSIONS
+ PYTHON_RESOLUTION_EXTENSIONS = PYTHON_SOURCE_EXTENSIONS
+ KOTLIN_RESOLUTION_EXTENSIONS = KOTLIN_SOURCE_EXTENSIONS
+@@ -103,6 +109,8 @@
+     Stable/default callers see the TS/JS + Kotlin + Rust boundary (Kotlin
+     joined the default in K5, Rust in R1; .kts Gradle scripts stay out).
+     Python is exposed only through an explicit experimental/self-host path.
++    The experimental set is the stable boundary plus Python; it never drops
++    a stable extension.
+     """
+     return EXPERIMENTAL_SOURCE_EXTENSIONS if include_python else SOURCE_EXTENSIONS
+ 
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -1276,6 +1276,8 @@
+             f"# Python files={metrics.get('python_files', 0)} | "
+             f"LOC={metrics.get('source_loc', 0)} | AST={metrics.get('ast_nodes', 0)} | "
+             f"TS/JS semantic files={metrics.get('js_semantic_files_scanned', 0)} | "
++            f"RS semantic files={metrics.get('rs_semantic_files_scanned', 0)} | "
++            f"KT semantic files={metrics.get('kt_semantic_files_scanned', 0)} | "
+             f"duplicate_groups={metrics.get('exact_duplicate_groups', 0)} | "
+             f"duplicate_debt_loc={metrics.get('estimated_removable_duplicate_loc', 0)} | "
+             f"semantic_candidates={metrics.get('semantic_candidates_total', 0)}"
+@@ -1289,7 +1291,9 @@
+         print(
+             f"# Anatomy bridge: inventory={bridge.get('inventory_authority', 'unknown')} | "
+             f"observed={observed} | semantic_frontend={bridge.get('semantic_frontend', 'unknown')} | "
+-            f"ts_js_rules={frontend_scope.get('ts_js_rule_count', 0)} | rules_pending={pending}"
++            f"ts_js_rules={frontend_scope.get('ts_js_rule_count', 0)} | "
++            f"rs_rules={frontend_scope.get('rs_rule_count', 0)} | "
++            f"kt_rules={frontend_scope.get('kt_rule_count', 0)} | rules_pending={pending}"
+         )
+         if not inventory.get("zero_candidate_is_clean_evidence", True):
+             print("# Coverage note: zero candidates is NOT clean evidence for source languages without an active semantic simplification frontend.")
