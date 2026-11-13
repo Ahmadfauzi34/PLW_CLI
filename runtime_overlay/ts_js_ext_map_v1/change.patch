@@ -1,0 +1,35 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -37,6 +37,16 @@
+ PYTHON_RESOLUTION_EXTENSIONS = PYTHON_SOURCE_EXTENSIONS
+ KOTLIN_RESOLUTION_EXTENSIONS = KOTLIN_SOURCE_EXTENSIONS
+ 
++# TypeScript ESM: source files import the compiled name (`./framing.js`)
++# while the file on disk is the `.ts` source (G3a). One-directional — a
++# `.ts` literal never maps back to `.js`.
++_TS_COMPILED_TO_SOURCE_EXTENSIONS = {
++    ".js": ".ts",
++    ".jsx": ".tsx",
++    ".mjs": ".mts",
++    ".cjs": ".cts",
++}
++
+ 
+ _TOOL_IMPLEMENTATION_ROOT = os.path.abspath(os.path.dirname(__file__))
+ 
+@@ -188,6 +198,15 @@
+             add(resolved_base + ext)
+         for ext in JS_RESOLUTION_EXTENSIONS:
+             add(f"{resolved_base}/index{ext}")
++    else:
++        # G3a: a base that already carries a JS extension is imported by
++        # its compiled name; the source on disk may be the TS twin.
++        # The literal path stays first (added above), so a real `.js`
++        # file next to the `.ts` source still wins.
++        for compiled, source in _TS_COMPILED_TO_SOURCE_EXTENSIONS.items():
++            if resolved_base.endswith(compiled):
++                add(resolved_base[: -len(compiled)] + source)
++                break
+     return candidates
+ 
+ 

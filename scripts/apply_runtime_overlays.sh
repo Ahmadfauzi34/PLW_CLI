@@ -273,6 +273,9 @@ grep -Fq 'rs_rules=' plw_cli.py
 apply_reviewable_overlay "deopt_lang_gate_v1"
 grep -Fq '_DEOPT_JS_TS_EXTENSIONS' codebase/performance_analyzers.py
 grep -Fq 'probe = _strip_strings(line).strip()' codebase/performance_analyzers.py
+apply_reviewable_overlay "ts_js_ext_map_v1"
+grep -Fq '_TS_COMPILED_TO_SOURCE_EXTENSIONS' language_semantics.py
+grep -Fq 'add(resolved_base[: -len(compiled)] + source)' language_semantics.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
