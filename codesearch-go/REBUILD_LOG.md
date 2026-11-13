@@ -317,3 +317,24 @@ unit test F2), black-box 91/91, F2 battery 7/7. Binary commit
 `05c7fa3a8e63`, digest
 `f7ef3778d9407a1daa5da223bc959d64ee85a7000597a9ca0fe3d228884dedca`,
 schema tetap go9.
+
+## 2026-11-13 — vendored build (Track 4, K5)
+
+`go mod vendor` (offline, GOPROXY=off, module already in the local
+cache) + `-mod=vendor` on `go build`/`go vet`/`go test` in build.sh.
+The build no longer touches the module proxy; a stale vendor tree
+fails loudly instead of silently downloading. Two build.sh fixes
+the vendoring exposed: the gofmt gate now excludes vendor/ (upstream
+`linguist_gen.go` is unformatted; `gofmt -w` on vendor would dirty
+the tree — the `grep -v` needs `|| true` under pipefail or a clean
+tree kills the script), and the COMMIT hash computation excludes
+vendor/ (it used to sweep 1333 vendored .go files into the hash).
+Digest: the vendored binary CANNOT match the old module-mode pin
+(vendor mode drops the dep h1 hash from buildinfo — measured:
+-mod=mod + CGO_ENABLED=0 reproduces the old pin c251454d… exactly
+from the same source, the vendored build is 54ff5908…; two
+independent local builds agree). PINNED_ENGINE_DIGESTS moved to
+54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295
+(go9 8da8dea19350, -mod=vendor); the v0.2.5 asset pin is untouched.
+vendor/ is 1555 files / 32M (206 grammar .bin blobs are go:embed,
+not prunable).

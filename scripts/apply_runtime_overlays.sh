@@ -139,6 +139,9 @@ grep -Fq '05c7fa3a8e63' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v3"
 grep -Fq 'c251454d970ae19b76f727e65476a9b945bd7f21711c86d5a9b41efe041ed1cb' core/codesearch_engine.py
 grep -Fq '8da8dea19350' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v4"
+grep -Fq '54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295' core/codesearch_engine.py
+grep -Fq '8da8dea19350' core/codesearch_engine.py
 grep -Fq '"kotlin"' core/codesearch_engine.py
 apply_reviewable_overlay "discovery_v1"
 grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
@@ -226,6 +229,12 @@ apply_reviewable_overlay "parser_fail_closed_v1"
 grep -Fq '_PlwArgumentParser' plw_cli.py
 grep -Fq '_cli_error' plw_cli.py
 grep -Fq 'parse_intermixed_args' plw_cli.py
+apply_reviewable_overlay "adapter_build_v1"
+grep -Fq 'binary = Path(binary)' core/codesearch_engine.py
+grep -Fq '{"static", "map"' plw_cli.py
+grep -Fq 'adapter_runtime_unavailable' agent_tool.py
+grep -Fq 'Track 4 (K5 follow-up)' core/shared_graph.py
+grep -Fq 'BATCH_CHUNK_SIZE = 500' core/codesearch_engine.py
 grep -Fq 'opts.cache_dir, opts.limit' plw_cli.py
 grep -Fq '"stable_target_topology_ready"' core/portable_agent.py
 grep -Fq '"task_postcondition": "UNPROVEN"' hott_kernel.py

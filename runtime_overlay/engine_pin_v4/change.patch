@@ -1,0 +1,19 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -108,8 +108,14 @@
+ # entry pins the published release asset (verified against its
+ # published .sha256), so an old released engine keeps working.
+ PINNED_ENGINE_DIGESTS = {
+-    "c251454d970ae19b76f727e65476a9b945bd7f21711c86d5a9b41efe041ed1cb":
+-        "go9 8da8dea19350 (reproducible build.sh)",
++    # Track 4 (K5): the vendored build. -mod=vendor drops the dep h1
++    # hash from the binary's buildinfo, so the vendored binary can
++    # never be byte-identical to the old module-mode pin (c251454d…,
++    # verified reproducible from the same source with -mod=mod +
++    # CGO_ENABLED=0 before the switch); the pin moves to the
++    # vendored digest. Two independent local builds agree.
++    "54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295":
++        "go9 8da8dea19350 (reproducible build.sh, -mod=vendor)",
+     "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
+         "go9 8c5d6ffe8685 (v0.2.5 release asset)",
+ }

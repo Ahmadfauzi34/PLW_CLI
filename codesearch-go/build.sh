@@ -56,20 +56,26 @@ GOFMT="$(dirname "$(command -v "$GO")")/gofmt"
 [ -x "$GOFMT" ] || GOFMT=gofmt
 
 echo "== gofmt gate =="
-DIRTY="$("$GOFMT" -l .)"
+# vendor/ is upstream source (Track 4, K5): gofmt -w on it would dirty
+# the vendored tree, so the gate covers our own files only.
+DIRTY="$("$GOFMT" -l . | grep -v '^vendor/' || true)"
 if [ -n "$DIRTY" ]; then
   echo "build.sh: unformatted files (run gofmt -w first): $DIRTY" >&2
   exit 1
 fi
 
 echo "== go vet =="
-"$GO" vet ./...
+"$GO" vet -mod=vendor ./...
 
 echo "== go test =="
-"$GO" test ./...
+"$GO" test -mod=vendor ./...
 
 echo "== go build =="
-COMMIT="$( (find . -name '*.go' -not -name '*_test.go' | sort | xargs sha256sum; sha256sum go.mod go.sum) | sha256sum | cut -c1-12 )"
-"$GO" build -trimpath -buildvcs=false -ldflags "-X main.buildCommit=$COMMIT" -o codesearch-go .
+COMMIT="$( (find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' | sort | xargs sha256sum; sha256sum go.mod go.sum) | sha256sum | cut -c1-12 )"
+# -mod=vendor (Track 4, K5): the build never touches the module
+# proxy — vendor/ is committed, so a build without network works
+# and a vendor/modules.txt mismatch fails loudly instead of
+# silently falling back to a download.
+"$GO" build -mod=vendor -trimpath -buildvcs=false -ldflags "-X main.buildCommit=$COMMIT" -o codesearch-go .
 echo "built ./codesearch-go"
 ./codesearch-go --version

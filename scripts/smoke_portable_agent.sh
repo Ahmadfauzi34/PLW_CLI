@@ -68,6 +68,8 @@ export XDG_CACHE_HOME="$TMP/cache"
 # and an unknown flag under --json is a JSON envelope rc 2.
 ./plw context --root "$TMP/target" value --json > "$TMP/context-root-first.json"
 ./plw check --json "$TMP/target" --not-a-flag > "$TMP/check-unknown-flag.json" || test $? -eq 2
+# Track 4 (H5): ui-reference routes static to cmd_ui_static.
+./plw ui-reference static value "$TMP/target" --json > "$TMP/ui-ref-static.json"
 
 python - "$TMP" "$ROOT/VERSION" <<'PY'
 import json
@@ -197,6 +199,11 @@ check_uf = json.loads((root / "check-unknown-flag.json").read_text())
 if check_uf.get("error") != "invalid_arguments":
     raise SystemExit(f"unknown flag under --json was not a JSON envelope: {check_uf}")
 
+# Track 4 (H5): ui-reference static routes to the static reference.
+ui_ref = json.loads((root / "ui-ref-static.json").read_text())
+if ui_ref.get("schema_version") != "plw-static-ui-reference-v1" or ui_ref.get("query") != "value":
+    raise SystemExit(f"ui-reference static did not route to cmd_ui_static: {ui_ref}")
+
 actual = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
 if actual != ["src/guards.js", "src/main.ts", "src/value.ts"]:
     raise SystemExit(f"target repository polluted: {actual}")
@@ -207,6 +214,6 @@ print(
     f"skills={skills['embedded_count']}/{skills['skill_count']} "
     "candidate_handoff=CONDITIONAL_DISCOVERY task_text_used=false "
     "candidate_selection=RESOLVED/AMBIGUOUS capability_match=read-only "
-    "kotlin_languages=1 rust_self_unresolved=0 install_removed=1 parser_fail_closed=1"
+    "kotlin_languages=1 rust_self_unresolved=0 install_removed=1 parser_fail_closed=1 adapter_build=1"
 )
 PY

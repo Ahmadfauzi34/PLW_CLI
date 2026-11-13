@@ -1,0 +1,244 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -2933,7 +2933,10 @@
+ 
+ def cmd_ui_reference(args: List[str]) -> int:
+     """Validate geometry↔code reference state or expose practical UI mapping subcommands."""
+-    if args and args[0] in {"map", "inspect", "scenarios", "scenario-map", "scenario_map", "responsive", "diff", "geometry-diff", "geometry_diff", "compare", "hunt", "bugs", "bug-hunt", "bug_hunt", "bug-hunter", "bug_hunter", "diagnose", "diagnosis", "cross-domain", "cross_domain", "trace-bug", "trace_bug", "reproduce", "reproduction", "runtime-reproduce", "runtime_reproduce", "probe-plan", "probe_plan", "causal-plan", "causal_plan", "isolate", "causal-isolate", "causal_isolate", "root-cause-probe", "root_cause_probe", "fix-plan", "fix_plan", "bounded-fix", "bounded_fix", "verify-fix", "verify_fix", "post-fix", "post_fix", "capture-script", "capture_script"}:
++    # Track 4 (H5): "static" routes to cmd_ui_static via cmd_ui —
++    # without it, `ui-reference static …` fell through to the snapshot
++    # parser and died with "requires <snapshot.json>".
++    if args and args[0] in {"static", "map", "inspect", "scenarios", "scenario-map", "scenario_map", "responsive", "diff", "geometry-diff", "geometry_diff", "compare", "hunt", "bugs", "bug-hunt", "bug_hunt", "bug-hunter", "bug_hunter", "diagnose", "diagnosis", "cross-domain", "cross_domain", "trace-bug", "trace_bug", "reproduce", "reproduction", "runtime-reproduce", "runtime_reproduce", "probe-plan", "probe_plan", "causal-plan", "causal_plan", "isolate", "causal-isolate", "causal_isolate", "root-cause-probe", "root_cause_probe", "fix-plan", "fix_plan", "bounded-fix", "bounded_fix", "verify-fix", "verify_fix", "post-fix", "post_fix", "capture-script", "capture_script"}:
+         return cmd_ui(args)
+     parsed = _parse_ui_reference_args(args, command="ui-reference", allow_store_dir=False)
+     if parsed is None:
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -127,6 +127,17 @@
+ # exact file and are never expanded to candidates.
+ PATH_CANDIDATES = ("codesearch", "codesearch-go", "codesearch-go-linux-x86_64")
+ DEFAULT_TIMEOUT_S = 120
++
++# Track 4 (K5 follow-up): one engine call must stay well under
++# DEFAULT_TIMEOUT_S. A defs batch costs ~65ms per name on a slow CPU
++# (measured 2026-11-13, warm index: 100 names 8s, 500 names 56s,
++# 1880 names 123s — past the 120s timeout), so run_batch_query
++# splits a large batch into chunks of at most this many names.
++# Each chunk is one engine call; the per-chunk envelopes are merged
++# below. The bound is per call, so it holds as the tree grows —
++# raising the timeout instead would weaken the fail-closed bound
++# for every engine call and break again on the next growth step.
++BATCH_CHUNK_SIZE = 500
+ VERSION_TIMEOUT_S = 10
+ PROBE_TIMEOUT_S = 5
+ INDEX_TIMEOUT_S = 120
+@@ -211,6 +222,10 @@
+     cannot be read (e.g. executable without read permission) —
+     callers treat that as unpinned, never as pinned.
+     """
++    # Track 4 (H3): accept a str path too — a str has no .stat(),
++    # and the audit showed _engine_digest('/usr/local/bin/codesearch')
++    # crashing with AttributeError instead of hashing the file.
++    binary = Path(binary)
+     try:
+         st = binary.stat()
+     except OSError:
+@@ -366,6 +381,9 @@
+         "pinned": info.get("pinned", False),
+         "engine_digest": (info.get("digest") or "")[:12] or None,
+         "pin_label": info.get("pin_label"),
++        # Track 4 (H3): forward the opt-out warning — version_info sets
++        # it, but this dict used to drop it, so doctor_status never saw it.
++        "pin_warning": info.get("pin_warning"),
+         "tree_sitter_ready": True,
+         "tree_sitter_languages": list(TREE_SITTER_LANGUAGES),
+         "tree_sitter_library": "gotreesitter v0.55.1 (pure Go, no cgo)",
+@@ -400,6 +418,8 @@
+             "pinned": status["pinned"],
+             "engine_digest": status["engine_digest"],
+             "pin_label": status["pin_label"],
++            # Track 4 (H3): the opt-out warning, None when pinned.
++            "pin_warning": status.get("pin_warning"),
+             "languages": list(TREE_SITTER_LANGUAGES),
+             "cache_dir": str(resolved_cache),
+             "cache_dir_supported": status["cache_dir_supported"],
+@@ -764,6 +784,17 @@
+     ``limit`` (F3) slices every row list — flat and grouped — to at
+     most that many rows per list; ``summary.total`` is the count
+     before slicing and ``summary.shown`` the count after.
++
++    A batch larger than ``BATCH_CHUNK_SIZE`` names is split into
++    chunks (Track 4, K5 follow-up): one engine call per chunk, the
++    per-chunk envelopes merged — ``result["queries"]`` concatenated
++    for defs (a one-name chunk answers with flat ``"hits"``, which
++    is re-wrapped as one queries entry so ``_apply_batch_limit``
++    sees every name), the flat row list concatenated for callers
++    and related. ``batch_mode`` stays ``"batch"`` when every chunk
++    answered as a batch; one chunk answering as an old engine flips
++    the whole result to ``"fallback"`` and the per-name rebuild
++    below covers all names.
+     """
+     if limit is not None and limit < 0:
+         raise EngineError("limit must be >= 0")
+@@ -773,59 +804,71 @@
+     if not names:
+         raise EngineError("run_batch_query requires at least one query")
+     engine = engine_status(binary, discovered_via, cache_dir)
+-    if mode == "defs":
+-        argv = ["--defs-only", *names]
+-    elif mode == "callers":
+-        argv = ["--callers", ",".join(names)]
+-    else:
+-        argv = ["--related", ",".join(names)]
+-    result = _run_codesearch(
+-        binary, root, argv, timeout_s,
+-        Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),
+-    )
+     batch_mode = "batch"
+     grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in names}
+-    if mode == "defs":
+-        per_query = result.get("queries")
+-        if isinstance(per_query, list):
+-            for entry in per_query:
+-                if isinstance(entry, dict) and entry.get("query") in grouped:
+-                    grouped[entry["query"]] = list(entry.get("hits") or [])
+-        elif len(names) == 1 and isinstance(result.get("hits"), list):
+-            grouped[names[0]] = list(result["hits"])
++    result: Dict[str, Any] = {}
++    chunks = [names[i:i + BATCH_CHUNK_SIZE]
++              for i in range(0, len(names), BATCH_CHUNK_SIZE)]
++    for chunk in chunks:
++        if mode == "defs":
++            argv = ["--defs-only", *chunk]
++        elif mode == "callers":
++            argv = ["--callers", ",".join(chunk)]
+         else:
+-            batch_mode = "fallback"
+-    else:
+-        if len(names) > 1 and not result.get("batch"):
+-            batch_mode = "fallback"
++            argv = ["--related", ",".join(chunk)]
++        chunk_result = _run_codesearch(
++            binary, root, argv, timeout_s,
++            Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),
++        )
++        if mode == "defs":
++            per_query = chunk_result.get("queries")
++            if isinstance(per_query, list):
++                result.setdefault("queries", []).extend(per_query)
++                for entry in per_query:
++                    if isinstance(entry, dict) and entry.get("query") in grouped:
++                        grouped[entry["query"]] = list(entry.get("hits") or [])
++            elif len(chunk) == 1 and isinstance(chunk_result.get("hits"), list):
++                hits = list(chunk_result["hits"])
++                result.setdefault("queries", []).append(
++                    {"query": chunk[0], "total": len(hits), "hits": hits})
++                grouped[chunk[0]] = hits
++            else:
++                batch_mode = "fallback"
+         else:
+             key = "calls" if mode == "callers" else "related"
+             field = "callee" if mode == "callers" else "symbol"
+-            # Callers rows carry the full callee expression; reduce it
+-            # to its base and fan the row out to every requested query
+-            # with that base, so `pkg.Foo` receives its rows instead of
+-            # stranding them under an orphan `Foo` key (H2). The engine
+-            # matches by trailing identifier, so one row may fan out to
+-            # several queries sharing a base (`pkg.Foo`, `other.Foo`).
+-            base_to_queries: Dict[str, List[str]] = {}
+-            if mode == "callers":
+-                for name in names:
+-                    base_to_queries.setdefault(_callee_base(name), []).append(name)
+-            for row in result.get(key) or []:
+-                if not isinstance(row, dict):
+-                    continue
+-                owner = row.get(field)
++            if len(chunk) > 1 and not chunk_result.get("batch"):
++                batch_mode = "fallback"
++            else:
++                result.setdefault(key, []).extend(chunk_result.get(key) or [])
++                if len(chunk) > 1:
++                    result["batch"] = bool(result.get("batch", True)
++                                           and chunk_result.get("batch"))
++                # Callers rows carry the full callee expression; reduce it
++                # to its base and fan the row out to every requested query
++                # with that base, so `pkg.Foo` receives its rows instead of
++                # stranding them under an orphan `Foo` key (H2). The engine
++                # matches by trailing identifier, so one row may fan out to
++                # several queries sharing a base (`pkg.Foo`, `other.Foo`).
++                base_to_queries: Dict[str, List[str]] = {}
+                 if mode == "callers":
+-                    owner = _callee_base(owner)
+-                    targets = base_to_queries.get(owner)
+-                    if targets:
+-                        for target in targets:
+-                            grouped[target].append(row)
++                    for name in chunk:
++                        base_to_queries.setdefault(_callee_base(name), []).append(name)
++                for row in chunk_result.get(key) or []:
++                    if not isinstance(row, dict):
+                         continue
+-                if owner in grouped:
+-                    grouped[owner].append(row)
+-                else:
+-                    grouped.setdefault(str(owner), []).append(row)
++                    owner = row.get(field)
++                    if mode == "callers":
++                        owner = _callee_base(owner)
++                        targets = base_to_queries.get(owner)
++                        if targets:
++                            for target in targets:
++                                grouped[target].append(row)
++                            continue
++                    if owner in grouped:
++                        grouped[owner].append(row)
++                    else:
++                        grouped.setdefault(str(owner), []).append(row)
+     if batch_mode == "fallback":
+         # The engine predates batch: rebuild the batch result from one
+         # run_query per name, so the envelope keeps exactly the shape a
+--- a/agent_tool.py
++++ b/agent_tool.py
+@@ -387,6 +387,26 @@
+         )
+ 
+     executable = TOOL_ROOT / ("hott_kernel.py" if surface == "kernel" else "plw_cli.py")
++    # Track 4 (K2): fail closed before spawning. The wrapper assumes a
++    # source checkout next to it; in a frozen binary (PyInstaller
++    # one-file: sys.executable is the ELF, the .py files are not
++    # there) or when the wrapper was copied alone, spawning
++    # [sys.executable, "<missing>.py", ...] fails cryptically — the
++    # frozen ELF would even misread the .py name as a mode. A
++    # structured error with the remedy beats either failure.
++    if getattr(sys, "frozen", False) or not executable.is_file():
++        return _error(
++            "adapter_runtime_unavailable",
++            "The PLW source entry point is not present next to this "
++            f"adapter ({executable}); the adapter cannot spawn it. "
++            "Run from a PLW source checkout, or call the frozen "
++            "`plw` binary directly instead of this wrapper.",
++            surface=surface,
++            mode=mode,
++            executable=str(executable),
++            frozen=bool(getattr(sys, "frozen", False)),
++            remedy="source checkout or frozen `plw` binary",
++        )
+     environment = os.environ.copy()
+     for field, env_name in (
+         ("cache_mode", "AI_STUDIO_GRAPH_CACHE"),
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -59,6 +59,13 @@
+ DEFAULT_IGNORE_DIRS = {
+     "node_modules", ".git", "dist", ".angular",
+     ".Jules", "coverage", ".next", "out", "fixtures_min",
++    # Track 4 (K5 follow-up): "vendor" is third-party code vendored
++    # into the repo (Go `go mod vendor`), not the repo's own code —
++    # without it, the whole-repo topology walk swallowed 1555 vendor
++    # files (11,488 symbols) and the batch defs query blew the 120s
++    # timeout on a slow CPU, even though both engine binaries answer
++    # the same batch identically.
++    "vendor",
+ }
+ 
+ IMPORT_EXPORT_REGEX = re.compile(
