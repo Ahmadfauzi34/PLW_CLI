@@ -143,6 +143,9 @@ apply_reviewable_overlay "engine_pin_v4"
 grep -Fq '54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295' core/codesearch_engine.py
 grep -Fq '8da8dea19350' core/codesearch_engine.py
 grep -Fq '"kotlin"' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v5"
+grep -Fq 'b6f0ec48ec1bfba35a3b4f0a50906bc19bd0063caa33e26ae289069996a921a1' core/codesearch_engine.py
+grep -Fq '9a3db30a5027' core/codesearch_engine.py
 apply_reviewable_overlay "discovery_v1"
 grep -Fq 'PATH_CANDIDATES' core/codesearch_engine.py
 grep -Fq 'codesearch-go-linux-x86_64' core/codesearch_engine.py

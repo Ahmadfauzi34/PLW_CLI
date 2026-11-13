@@ -23,14 +23,16 @@
 # when the Kotlin engine (K1-K4) rotated it again, then to
 # engine_pin_v4 when the vendored build (Track 4, K5) rotated it:
 # -mod=vendor drops the dep h1 hash from buildinfo, so the vendored
-# binary can never match the module-mode pin; if a later overlay
+# binary can never match the module-mode pin; then to engine_pin_v5
+# when the defs-only opsi 1 fix rotated it (digest b6f0ec48…,
+# commit 9a3db30a5027; local + CI builds agree). If a later overlay
 # moves either constant again, update the patch paths below — the
 # script then fails closed with "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v1/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v4/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v5/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 

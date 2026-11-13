@@ -1,0 +1,24 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -108,14 +108,13 @@
+ # entry pins the published release asset (verified against its
+ # published .sha256), so an old released engine keeps working.
+ PINNED_ENGINE_DIGESTS = {
+-    # Track 4 (K5): the vendored build. -mod=vendor drops the dep h1
+-    # hash from the binary's buildinfo, so the vendored binary can
+-    # never be byte-identical to the old module-mode pin (c251454d…,
+-    # verified reproducible from the same source with -mod=mod +
+-    # CGO_ENABLED=0 before the switch); the pin moves to the
+-    # vendored digest. Two independent local builds agree.
+-    "54ff590871b6bce075e1dc46be65dae72eeeb8b4af80ab539a56b642074e9295":
+-        "go9 8da8dea19350 (reproducible build.sh, -mod=vendor)",
++    # defs-only opsi 1 (2026-11-13): filterDefChunks trusts the
++    # AST-recorded name; the reproducible-build digest moves to the
++    # new engine commit. The superseded vendored digest (54ff5908…,
++    # Track 4/K5) leaves the pin, as in v1-v4; the v0.2.5
++    # release-asset entry stays. Local + CI builds agree.
++    "b6f0ec48ec1bfba35a3b4f0a50906bc19bd0063caa33e26ae289069996a921a1":
++        "go9 9a3db30a5027 (reproducible build.sh, -mod=vendor)",
+     "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
+         "go9 8c5d6ffe8685 (v0.2.5 release asset)",
+ }
