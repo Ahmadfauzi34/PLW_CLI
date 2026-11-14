@@ -1,0 +1,1405 @@
+--- a/core/target_topology.py
++++ b/core/target_topology.py
+@@ -382,7 +382,7 @@
+     if engine_layer is not None:
+         result["engine"] = engine_layer
+         result["engine_layer_schema"] = str(
+-            engine_layer.get("schema_version") or "plw-topology-engine-v1"
++            engine_layer.get("schema_version") or "plw-topology-engine-v2"
+         )
+         if engine_layer.get("available"):
+             result["technical_model"]["engine_edge_semantics"] = (
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -1,12 +1,13 @@
+-"""Engine-backed symbol layer for the SharedGraph topology (topology-engine-v1).
++"""Engine-backed symbol layer for the SharedGraph topology (topology-engine-v2).
+ 
+ The stable topology graph (``core/shared_graph.py``) only sees files and
+-file->file import edges, and only for TS/JS (``SOURCE_EXTENSIONS`` in
+-``language_semantics.py``).  Go/Rust/Python files are not vertices at all.
++file->file import edges for TS/JS/Kotlin/Rust (``SOURCE_EXTENSIONS`` in
++``language_semantics.py``).  Go/Python files are not vertices at all.
+ This module adds a second, clearly-marked layer on top of that graph,
+ built from the ``codesearch-go`` tree-sitter engine (``core/codesearch_engine.py``):
+ 
+-* symbol nodes — definitions verified by the engine AST (``defs``);
++* symbol nodes — definitions verified by the engine AST (``defs``); ``window``
++  fallback chunks and generated/declaration assets are excluded;
+ * symbol edges — ``calls`` / ``related`` rows, which are name-based
+   (callee normalised to its trailing identifier) and therefore LEADS,
+   never proof;
+@@ -15,8 +16,8 @@
+ 
+ Contract
+ --------
+-* Read-only.  Nothing is written into the target root.  The engine keeps
+-  its own index cache outside the target, per PLW's own rule.
++* Read-only.  Nothing is written into the target root.  Both codesearch's
++  gob index and the engine_layer JSON cache live under PLW's own cache root.
+ * Additive.  This layer never mutates the SharedGraph it is built from
+   and never writes into the cached graph: the caller merges it at
+   projection time (``core/target_topology.py``).
+@@ -24,29 +25,28 @@
+   (or partial) layer on every failure, so topology keeps working without
+   an engine.  A per-symbol engine failure is recorded and the remaining
+   symbols are still queried.
+-* Bounded.  The engine has no enumerate-all-definitions mode, so
+-  candidates come from the target files' imports and usages plus
+-  definition patterns in engine-language files.  Since G8 the queries
+-  run as three batch calls (defs, callers, related) — one engine scan
+-  each — so the default has no symbol cap (``max_symbols=None``) and
+-  the layer covers the whole repo; an explicit ``max_symbols`` still
+-  caps it.  All candidate lists are sorted, so the layer is
+-  deterministic for a fixed target.  On a pre-batch engine the adapter
+-  falls back to one query per symbol (correct, just slow); the layer
+-  reports that in ``coverage.batch_mode``.
++* Bounded.  When ``target_files`` is provided (target-grounded or
++  1-hop neighborhood), all non-noise candidates in scope are queried. In
++  whole-repo mode, a relevance-ranked default budget (``300`` symbols)
++  keeps agent calls bounded and fast; pass ``full_engine=True`` to lift
++  the budget.
++* Compact v2 (default).  Layer-level provenance lives in ``engine`` and
++  call edges reference ``symbol_nodes`` via ``candidate_ids`` instead of
++  repeating full candidate/provenance objects per edge.  Pass
++  ``full_engine_edges=True`` for the legacy ``plw-topology-engine-v1`` shape.
+ * Authority.  Every node/edge carries ``authority`` (``definition`` for
+-  AST-verified definitions, ``lead-name-based`` for calls/relations) and
+-  ``provenance`` (engine binary, schema, commit, query).  Same-named
+-  definitions in different files are separate nodes; a call edge lists
+-  every definition candidate and never picks one itself.
++  AST-verified definitions, ``lead-name-based`` for calls/relations).
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import os
+ import re
++import tempfile
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional, Set
++from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+ 
+ from core.codesearch_engine import (
+     AUTHORITY_NOTE,
+@@ -55,30 +55,70 @@
+     doctor_status,
+     run_batch_query,
+ )
+-from core.shared_graph import DEFAULT_IGNORE_DIRS, parse_imports_with_nature
+-from language_semantics import normalize_path as _normalize_path
++from core.runtime_paths import cache_path, ensure_private_directory
++from core.shared_graph import DEFAULT_IGNORE_DIRS, graph_content_signature, parse_imports_with_nature
++from language_semantics import (
++    is_declaration_file as _is_declaration_file,
++    is_generated_or_vendored_asset as _is_generated_or_vendored_asset,
++    kotlin_top_level_names as _kotlin_top_level_names,
++    normalize_path as _normalize_path,
++    rust_top_level_names as _rust_top_level_names,
++    strip_js_comments as _strip_js_comments,
++)
+ 
+-ENGINE_LAYER_SCHEMA_VERSION = "plw-topology-engine-v1"
++LEGACY_ENGINE_LAYER_SCHEMA_VERSION = "plw-topology-engine-v1"
++ENGINE_LAYER_SCHEMA_VERSION = "plw-topology-engine-v2"
++ENGINE_CACHE_SCHEMA_VERSION = "engine-layer-cache-v2"
++DEFAULT_WHOLE_REPO_MAX_SYMBOLS = 300
++HIGH_CALLER_NOISE_CAP = 80
+ 
+ # Files the stable graph never sees as vertices, but the engine parses.
+ ENGINE_FILE_EXTENSIONS = {".go": "go", ".rs": "rust", ".py": "python"}
+ 
+ # Extension -> engine language, for definition nodes in any language.
+ # G2 (2026-11-14): ".kt" -> "kotlin" — without it every Kotlin symbol
+-# node was labeled "unknown" (1,327 of 1,332 on oopbot-trial). The
+-# engine already parses Kotlin (TREE_SITTER_LANGUAGES); only the
+-# label was missing. ".kts" stays out on purpose (out of scope).
++# node was labeled "unknown". Modern module extensions (.mjs/.cjs/.mts/.cts)
++# map to their respective javascript/typescript languages. ".kts" stays
++# out on purpose (out of scope).
+ FILE_LANGUAGE_BY_EXTENSION = {
+     ".go": "go",
+     ".rs": "rust",
+     ".py": "python",
+     ".js": "javascript",
++    ".mjs": "javascript",
++    ".cjs": "javascript",
+     ".jsx": "jsx",
+     ".ts": "typescript",
++    ".mts": "typescript",
++    ".cts": "typescript",
+     ".tsx": "tsx",
+     ".kt": "kotlin",
+ }
+ 
++# Common stdlib / collection / UI primitive identifiers that cause high-fan-out
++# query noise across JS/TS, Kotlin Compose, and Rust. Filtered via signal-based
++# gating (only suppressed pre-query when no internal definition exists in
++# scope, or post-query when caller fan-out exceeds HIGH_CALLER_NOISE_CAP).
++COMMON_NOISE_SYMBOLS: Set[str] = {
++    "get", "set", "has", "add", "delete", "clear", "map", "filter", "reduce",
++    "forEach", "find", "some", "every", "includes", "indexOf", "slice", "splice",
++    "push", "pop", "shift", "unshift", "join", "split", "trim", "replace", "match",
++    "keys", "values", "entries", "from", "of", "assign", "create", "freeze",
++    "toString", "valueOf", "toJSON", "then", "catch", "finally", "resolve", "reject",
++    "next", "done", "error", "warn", "info", "debug", "log", "close", "open",
++    "start", "stop", "init", "read", "write", "send", "emit", "on", "off", "once",
++    "default", "new", "value", "data", "item", "items", "name", "type", "id",
++    "size", "length", "count", "index", "key", "result", "state", "status", "ok",
++    "Text", "Column", "Row", "Box", "Spacer", "Modifier", "Icon", "Button", "Card",
++    "Surface", "Scaffold", "padding", "fillMaxWidth", "fillMaxSize", "weight", "align",
++    "copy", "equals", "hashCode", "let", "apply", "also", "with", "into",
++    "try_into", "try_from", "clone", "unwrap", "expect", "as_ref", "as_str",
++    "to_string", "len", "is_empty", "iter", "collect", "fmt", "drop",
++    "JSON", "JSONObject", "JSONArray", "Promise", "Array", "Object", "String",
++    "Number", "Boolean", "Error", "Map", "Set", "WeakMap", "WeakSet", "List",
++    "MutableList", "Pair", "Result", "Unit",
++}
++
+ # Definition patterns are CANDIDATE generators only: a name found here is
+ # a query for the engine, and only the engine's AST answer becomes a node.
+ _DEFINITION_PATTERNS = {
+@@ -95,13 +135,24 @@
+     ],
+ }
+ 
++_JS_TS_DECL_PATTERN = re.compile(
++    r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?"
++    r"(?:function\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)",
++    re.MULTILINE,
++)
++
+ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ 
+ 
+-def unavailable_layer(reason: str) -> Dict[str, Any]:
++def unavailable_layer(reason: str, *, full_engine_edges: bool = False) -> Dict[str, Any]:
+     """The explicit no-engine layer. Never raises."""
++    schema_version = (
++        LEGACY_ENGINE_LAYER_SCHEMA_VERSION
++        if full_engine_edges
++        else ENGINE_LAYER_SCHEMA_VERSION
++    )
+     return {
+-        "schema_version": ENGINE_LAYER_SCHEMA_VERSION,
++        "schema_version": schema_version,
+         "available": False,
+         "engine": None,
+         "reason": str(reason),
+@@ -117,7 +168,15 @@
+             "symbol_edges": 0,
+             "scope": "target-grounded",
+             "symbols_total": 0,
++            "symbols_filtered_common": 0,
++            "budget": None,
++            "truncated": False,
++            "window_hits_dropped": 0,
++            "generated_files_excluded": 0,
++            "self_edges_excluded": 0,
++            "high_caller_suppressed": [],
+             "batch_mode": None,
++            "cache_status": "miss",
+             "symbols_queried": [],
+             "symbols_without_definition": [],
+             "symbols_failed": [],
+@@ -142,22 +201,38 @@
+             value = os.path.relpath(value, root).replace("\\", "/")
+         except (OSError, ValueError):
+             pass
+-    return value
++    return _normalize_path(value)
++
+ 
++def _canon_rel(path: str, root_abs: str) -> str:
++    """Normalize a repo, CWD-relative, or root-relative path to root-relative POSIX."""
++    text = _normalize_path(str(path))
++    if os.path.isabs(text):
++        return _relpath(os.path.abspath(text), root_abs)
++    abs_cwd = os.path.abspath(text)
++    try:
++        if os.path.commonpath([abs_cwd, root_abs]) == root_abs:
++            return _normalize_path(os.path.relpath(abs_cwd, root_abs))
++    except ValueError:
++        pass
++    return text
+ 
+-def _walk_engine_files(root: str, target_files: Optional[Set[str]]) -> Dict[str, str]:
+-    """Engine-language files under root: path (normalised) -> language.
+ 
+-    When target_files is given, only those files are considered.
+-    Directory discipline mirrors discover_source_files (DEFAULT_IGNORE_DIRS
+-    + skip dot-dirs).
+-    """
++def _walk_engine_files(
++    root: str,
++    wanted_rel: Optional[Set[str]],
++    root_abs: str,
++) -> Dict[str, str]:
++    """Engine-language files under root: normalized path -> language."""
+     found: Dict[str, str] = {}
+-    if target_files is not None:
+-        for fp in sorted(target_files):
+-            ext = os.path.splitext(fp)[1]
++    if wanted_rel is not None:
++        for rel in sorted(wanted_rel):
++            ext = os.path.splitext(rel)[1].lower()
+             language = ENGINE_FILE_EXTENSIONS.get(ext)
+-            if language is not None and os.path.isfile(fp):
++            if language is None:
++                continue
++            fp = rel if os.path.isabs(rel) else os.path.join(root_abs, rel)
++            if os.path.isfile(fp):
+                 found[_normalize_path(fp)] = language
+         return found
+     ignored = set(DEFAULT_IGNORE_DIRS)
+@@ -166,7 +241,7 @@
+             d for d in dirnames if d not in ignored and not d.startswith(".")
+         )
+         for filename in sorted(filenames):
+-            ext = os.path.splitext(filename)[1]
++            ext = os.path.splitext(filename)[1].lower()
+             language = ENGINE_FILE_EXTENSIONS.get(ext)
+             if language is None:
+                 continue
+@@ -184,37 +259,232 @@
+     return names
+ 
+ 
+-def _graph_candidates(graph: Dict[str, Any], target_files: Optional[Set[str]]) -> Set[str]:
+-    """Imported/used symbols + type names for the graph files in scope."""
+-    names: Set[str] = set()
++def _source_top_level_definitions(content: str, path: str) -> Set[str]:
++    """Lightweight definition-name extractor for internal symbol verification."""
++    ext = os.path.splitext(path)[1].lower()
++    if ext == ".kt":
++        return {n for n in _kotlin_top_level_names(content) if _is_candidate(n)}
++    if ext == ".rs":
++        return {n for n in _rust_top_level_names(content) if _is_candidate(n)}
++    if ext in FILE_LANGUAGE_BY_EXTENSION and FILE_LANGUAGE_BY_EXTENSION[ext] in (
++        "javascript", "jsx", "typescript", "tsx",
++    ):
++        clean = _strip_js_comments(content)
++        return {m.group(1) for m in _JS_TS_DECL_PATTERN.finditer(clean) if _is_candidate(m.group(1))}
++    lang = ENGINE_FILE_EXTENSIONS.get(ext)
++    if lang:
++        return _definition_candidates(content, lang)
++    return set()
++
++
++def _harvest_graph_candidates(
++    graph: Dict[str, Any],
++    wanted_rel: Optional[Set[str]],
++    root_abs: str,
++) -> Tuple[Set[str], Dict[str, int], Set[str], Set[str], Set[str], Set[str]]:
++    """Collect candidates, import counts, type names, and internal definitions.
++
++    When ``wanted_rel`` is provided, only vertices and ``type_shapes`` entries
++    belonging to ``wanted_rel`` are included.  Internal definitions across all
++    non-generated ``file_map`` entries are still recorded in
++    ``internal_defined`` so signal-based stopword suppression never drops a
++    genuinely project-defined symbol like ``class Box``.
++    """
++    candidates: Set[str] = set()
++    import_counts: Dict[str, int] = {}
++    internal_defined: Set[str] = set()
++    scoped_defined: Set[str] = set()
++    type_shape_names: Set[str] = set()
++    generated_excluded: Set[str] = set()
++    scoped_generated_excluded: Set[str] = set()
++
+     file_map = graph.get("file_map") or {}
+     vertices = list(graph.get("vertices") or [])
+-    if target_files is not None:
+-        wanted = set(target_files)
+-        vertices = [v for v in vertices if _normalize_path(str(v)) in wanted]
++
+     for fp in vertices:
++        fp_str = str(fp)
++        rel = _canon_rel(fp_str, root_abs)
+         content = file_map.get(fp)
+-        if isinstance(content, str) and content:
++        content_str = content if isinstance(content, str) else ""
++        in_scope = wanted_rel is None or rel in wanted_rel
++        if _is_generated_or_vendored_asset(rel, content_str):
++            generated_excluded.add(rel)
++            if in_scope:
++                scoped_generated_excluded.add(rel)
++            continue
++        defs_here = _source_top_level_definitions(content_str, rel) if content_str else set()
++        internal_defined |= defs_here
++
++        if not in_scope:
++            continue
++        # Include locally defined top-level symbols in scope (even if unimported
++        # entrypoints/leaves) so internal definitions outrank external imports.
++        scoped_defined |= defs_here
++        candidates |= defs_here
++        if content_str:
+             try:
+-                for item in parse_imports_with_nature(content, str(fp)):
++                seen_in_file: Set[str] = set()
++                for item in parse_imports_with_nature(content_str, fp_str):
+                     for name in list(item.get("symbols") or []) + list(
+                         item.get("semantic_usages") or []
+                     ):
+                         if _is_candidate(name):
+-                            names.add(name)
++                            candidates.add(name)
++                            seen_in_file.add(name)
++                for name in seen_in_file:
++                    import_counts[name] = import_counts.get(name, 0) + 1
+             except Exception:
+-                # A single unparsable file must not lose the other candidates.
+-                continue
+-    for shapes in (graph.get("type_shapes") or {}).values():
++                pass
++
++    for fp, shapes in (graph.get("type_shapes") or {}).items():
++        rel = _canon_rel(str(fp), root_abs)
++        if _is_declaration_file(rel):
++            if wanted_rel is None or rel in wanted_rel:
++                scoped_generated_excluded.add(rel)
++            continue
++        if wanted_rel is not None and rel not in wanted_rel:
++            continue
++        if rel in generated_excluded:
++            continue
+         if isinstance(shapes, dict):
+             for name in shapes:
+                 if _is_candidate(name):
+-                    names.add(name)
+-    return names
++                    candidates.add(name)
++                    type_shape_names.add(name)
++
++    return (
++        candidates,
++        import_counts,
++        internal_defined,
++        scoped_defined,
++        type_shape_names,
++        scoped_generated_excluded,
++    )
++
++
++def _rank_symbol(
++    symbol: str,
++    *,
++    engine_defined: Set[str],
++    scoped_defined: Set[str],
++    internal_defined: Set[str],
++    import_counts: Dict[str, int],
++    type_shape_names: Set[str],
++) -> int:
++    score = 0
++    if symbol in engine_defined or symbol in scoped_defined:
++        score += 8
++    if symbol in internal_defined:
++        score += 4
++    score += min(6, import_counts.get(symbol, 0) * 2)
++    if symbol in type_shape_names:
++        score += 2
++    if any(ch.isupper() for ch in symbol) or "_" in symbol:
++        score += 2
++    if len(symbol) <= 3 and symbol.islower():
++        score -= 2
++    return score
+ 
+ 
+ def _file_language(path: str) -> str:
+-    return FILE_LANGUAGE_BY_EXTENSION.get(os.path.splitext(path)[1], "unknown")
++    return FILE_LANGUAGE_BY_EXTENSION.get(os.path.splitext(path)[1].lower(), "unknown")
++
++
++def _engine_cache_key(
++    *,
++    root_abs: str,
++    graph: Optional[Dict[str, Any]],
++    engine_files: Dict[str, str],
++    engine_status: Dict[str, Any],
++    wanted_rel: Optional[Set[str]],
++    effective_max_symbols: Optional[int],
++    full_engine: bool,
++    full_engine_edges: bool,
++) -> str:
++    graph_sig = ""
++    if graph is not None:
++        graph_sig = str((graph.get("cache") or {}).get("graph_content_signature") or "")
++        if not graph_sig:
++            graph_sig = graph_content_signature(graph)
++
++    engine_stats: List[Tuple[str, int, int]] = []
++    for fp in sorted(engine_files):
++        try:
++            st = os.stat(fp)
++            engine_stats.append((_canon_rel(fp, root_abs), int(st.st_size), int(st.st_mtime_ns)))
++        except OSError:
++            engine_stats.append((_canon_rel(fp, root_abs), -1, -1))
++
++    identity = {
++        "cache_schema": ENGINE_CACHE_SCHEMA_VERSION,
++        "schema_version": (
++            LEGACY_ENGINE_LAYER_SCHEMA_VERSION if full_engine_edges else ENGINE_LAYER_SCHEMA_VERSION
++        ),
++        "root_abs": root_abs,
++        "graph_signature": graph_sig,
++        "engine_digest": str(engine_status.get("digest") or ""),
++        "engine_schema": str(engine_status.get("schema") or ""),
++        "engine_commit": str(engine_status.get("commit") or ""),
++        "engine_files": engine_stats,
++        "wanted": sorted(wanted_rel) if wanted_rel is not None else None,
++        "max_symbols": effective_max_symbols,
++        "full_engine": bool(full_engine),
++        "full_engine_edges": bool(full_engine_edges),
++        "noise_cap": HIGH_CALLER_NOISE_CAP,
++    }
++    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    return hashlib.sha256(encoded).hexdigest()[:24]
++
++
++def _engine_cache_path(cache_key: str) -> Path:
++    return cache_path("codebase", "engine_layer", f"engine_layer_{cache_key}.json")
++
++
++def _load_engine_cache(cache_key: str, engine_block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    path = _engine_cache_path(cache_key)
++    try:
++        if not path.is_file():
++            return None
++        data = json.loads(path.read_text(encoding="utf-8"))
++        if not isinstance(data, dict) or not data.get("available") or data.get("error"):
++            return None
++        data["engine"] = dict(engine_block)
++        coverage = dict(data.get("coverage") or {})
++        coverage["cache_status"] = "hit"
++        data["coverage"] = coverage
++        return data
++    except (OSError, ValueError):
++        return None
++
++
++def _save_engine_cache(cache_key: str, layer: Dict[str, Any]) -> None:
++    if not layer.get("available") or layer.get("error"):
++        return
++    path = _engine_cache_path(cache_key)
++    ensure_private_directory(path.parent)
++    tmp_path: Optional[Path] = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            "w",
++            encoding="utf-8",
++            dir=str(path.parent),
++            prefix=f".engine_layer_{cache_key}_",
++            suffix=".tmp",
++            delete=False,
++        ) as handle:
++            tmp_path = Path(handle.name)
++            json.dump(layer, handle, separators=(",", ":"), ensure_ascii=False)
++        try:
++            os.chmod(tmp_path, 0o600)
++        except OSError:
++            pass
++        os.replace(tmp_path, path)
++    except OSError:
++        if tmp_path is not None:
++            try:
++                tmp_path.unlink(missing_ok=True)
++            except OSError:
++                pass
+ 
+ 
+ def build_engine_layer(
+@@ -225,23 +495,36 @@
+     max_symbols: Optional[int] = None,
+     timeout_s: int = DEFAULT_TIMEOUT_S,
+     binary: Optional[str] = None,
++    full_engine: bool = False,
++    full_engine_edges: bool = False,
++    cache_mode: str = "auto",
+ ) -> Dict[str, Any]:
+     """Build the engine symbol layer for a target root. Never raises.
+ 
+     root is the scan root; graph is the SharedGraph dict (or None);
+-    target_files, when given, restricts the layer to those files.
+-    max_symbols caps the candidate list (None = whole repo, G8).
++    target_files, when given, restricts candidate collection to those files;
++    max_symbols overrides the default whole-repo 300-symbol budget;
++    full_engine disables the default 300-symbol budget;
++    full_engine_edges emits legacy plw-topology-engine-v1 expanded provenance.
+     """
+     root_path = Path(root)
+     if not root_path.is_dir():
+-        return unavailable_layer(f"root is not a directory: {root}")
++        return unavailable_layer(
++            f"root is not a directory: {root}",
++            full_engine_edges=full_engine_edges,
++        )
+     try:
+         return _build_engine_layer(
+             root, graph, target_files=target_files,
+             max_symbols=max_symbols, timeout_s=timeout_s, binary=binary,
++            full_engine=full_engine, full_engine_edges=full_engine_edges,
++            cache_mode=cache_mode,
+         )
+     except Exception as exc:  # never break topology for the engine layer
+-        layer = unavailable_layer(f"topology engine layer failed: {exc}")
++        layer = unavailable_layer(
++            f"topology engine layer failed: {exc}",
++            full_engine_edges=full_engine_edges,
++        )
+         layer["error"] = str(exc)
+         return layer
+ 
+@@ -254,30 +537,45 @@
+     max_symbols: Optional[int],
+     timeout_s: int,
+     binary: Optional[str],
++    full_engine: bool,
++    full_engine_edges: bool,
++    cache_mode: str,
+ ) -> Dict[str, Any]:
+     root_path = Path(root)
+     root_abs = _normalize_path(os.path.abspath(root))
+-    wanted: Optional[Set[str]] = None
++    wanted_rel: Optional[Set[str]] = None
+     if target_files is not None:
+-        wanted = set()
+-        for tf in target_files:
+-            tf_abs = tf if os.path.isabs(tf) else os.path.join(root_abs, tf)
+-            wanted.add(_normalize_path(tf_abs))
++        wanted_rel = {_canon_rel(tf, root_abs) for tf in target_files}
+ 
+     # The walk needs no engine: even the unavailable layer reports how
+     # many engine-language files exist, so the projection can say
+     # honestly that they are uncovered.
+-    engine_files = _walk_engine_files(root, wanted)
+-    if wanted is not None:
+-        target_file_count = len(wanted)
++    engine_files = _walk_engine_files(root, wanted_rel, root_abs)
++    if wanted_rel is not None:
++        target_file_count = len(wanted_rel)
+     elif graph is not None:
+-        target_file_count = len(graph.get("vertices") or []) + len(engine_files)
++        unique_files: Set[str] = {
++            _canon_rel(str(v), root_abs) for v in (graph.get("vertices") or [])
++        }
++        unique_files |= {_canon_rel(fp, root_abs) for fp in engine_files}
++        target_file_count = len(unique_files)
+     else:
+         target_file_count = len(engine_files)
+ 
++    effective_max_symbols: Optional[int]
++    if max_symbols is not None:
++        effective_max_symbols = max(0, int(max_symbols))
++    elif wanted_rel is None and not full_engine:
++        effective_max_symbols = DEFAULT_WHOLE_REPO_MAX_SYMBOLS
++    else:
++        effective_max_symbols = None
++
+     status = doctor_status(binary)
+     if not status.get("available"):
+-        layer = unavailable_layer(str(status.get("reason") or "codesearch engine unavailable"))
++        layer = unavailable_layer(
++            str(status.get("reason") or "codesearch engine unavailable"),
++            full_engine_edges=full_engine_edges,
++        )
+         layer["coverage"]["engine_language_files"] = len(engine_files)
+         layer["coverage"]["target_files"] = target_file_count
+         return layer
+@@ -291,76 +589,195 @@
+         "commit": status.get("commit"),
+     }
+ 
++    cache_mode_norm = str(cache_mode or "auto").strip().lower()
++    cache_key: Optional[str] = None
++    if cache_mode_norm in ("auto", "refresh"):
++        cache_key = _engine_cache_key(
++            root_abs=root_abs,
++            graph=graph,
++            engine_files=engine_files,
++            engine_status=status,
++            wanted_rel=wanted_rel,
++            effective_max_symbols=effective_max_symbols,
++            full_engine=full_engine,
++            full_engine_edges=full_engine_edges,
++        )
++        if cache_mode_norm == "auto":
++            cached = _load_engine_cache(cache_key, engine_block)
++            if cached is not None:
++                return cached
++
+     candidates: Set[str] = set()
++    import_counts: Dict[str, int] = {}
++    internal_defined: Set[str] = set()
++    scoped_defined: Set[str] = set()
++    type_shape_names: Set[str] = set()
++    engine_defined: Set[str] = set()
++    generated_excluded_files: Set[str] = set()
++    languages: Set[str] = set()
+     if graph is not None:
+-        candidates |= _graph_candidates(graph, wanted)
++        (
++            g_cands,
++            import_counts,
++            internal_defined,
++            scoped_defined,
++            type_shape_names,
++            scoped_generated_excluded,
++        ) = _harvest_graph_candidates(graph, wanted_rel, root_abs)
++        candidates |= g_cands
++        generated_excluded_files |= scoped_generated_excluded
+     for fp, language in engine_files.items():
++        rel_ef = _canon_rel(fp, root_abs)
+         try:
+             with open(fp, "r", encoding="utf-8", errors="replace") as handle:
+-                candidates |= _definition_candidates(handle.read(), language)
++                raw_ef = handle.read()
+         except OSError:
+             continue
++        if _is_generated_or_vendored_asset(rel_ef, raw_ef):
++            generated_excluded_files.add(rel_ef)
++            continue
++        languages.add(language)
++        edefs = _definition_candidates(raw_ef, language)
++        candidates |= edefs
++        engine_defined |= edefs
++        internal_defined |= edefs
++
++    # Review Guardrail #3: Signal-based stopword filtering — only drop common
++    # stdlib/UI tokens when no internal definition exists in target scope.
++    eligible: List[str] = []
++    filtered_common = 0
++    for sym in sorted(candidates):
++        if sym in COMMON_NOISE_SYMBOLS and sym not in internal_defined:
++            filtered_common += 1
++            continue
++        eligible.append(sym)
+ 
+-    symbols = sorted(candidates)
+     truncated = False
+-    if max_symbols is not None:
+-        capped = symbols[: max(0, int(max_symbols))]
+-        truncated = len(capped) < len(symbols)
+-        symbols = capped
++    if effective_max_symbols is not None and len(eligible) > effective_max_symbols:
++        ranked = sorted(
++            eligible,
++            key=lambda sym: (
++                -_rank_symbol(
++                    sym,
++                    engine_defined=engine_defined,
++                    scoped_defined=scoped_defined,
++                    internal_defined=internal_defined,
++                    import_counts=import_counts,
++                    type_shape_names=type_shape_names,
++                ),
++                sym,
++            ),
++        )
++        symbols = sorted(ranked[:effective_max_symbols])
++        truncated = True
++    else:
++        symbols = sorted(eligible)
+ 
+     symbol_nodes: List[Dict[str, Any]] = []
+     symbol_edges: List[Dict[str, Any]] = []
+     symbols_queried: List[str] = list(symbols)
+     symbols_without_definition: List[str] = []
+     symbols_failed: List[str] = []
+-    languages: Set[str] = {lang for lang in engine_files.values()}
+     batch_modes: Set[str] = set()
++    window_hits_dropped = 0
++    high_caller_suppressed: Set[str] = set()
++    self_edges_excluded = 0
++
++    file_map_by_rel: Dict[str, str] = {}
++    if graph is not None:
++        for fp, content in (graph.get("file_map") or {}).items():
++            if isinstance(content, str):
++                file_map_by_rel[_canon_rel(str(fp), root_abs)] = content
++
++    _excluded_cache: Dict[str, bool] = {}
++
++    def _is_excluded_hit_file(rel: str) -> bool:
++        cached_val = _excluded_cache.get(rel)
++        if cached_val is not None:
++            return cached_val
++        if _is_generated_or_vendored_asset(rel, ""):
++            _excluded_cache[rel] = True
++            generated_excluded_files.add(rel)
++            return True
++        head = file_map_by_rel.get(rel, "")
++        if not head:
++            disk_path = rel if os.path.isabs(rel) else os.path.join(root_abs, rel)
++            try:
++                with open(disk_path, "r", encoding="utf-8", errors="replace") as handle:
++                    head = handle.read(8192)
++            except OSError:
++                head = ""
++        flag = _is_generated_or_vendored_asset(rel, head)
++        _excluded_cache[rel] = flag
++        if flag:
++            generated_excluded_files.add(rel)
++        return flag
+ 
+-    # G8: three batch calls for the whole candidate list — one engine
+-    # scan each — instead of three subprocesses per symbol.
+     defs_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+     defs_batch_failed = False
+-    try:
+-        defs = run_batch_query("defs", root_path, symbols, binary_path, discovered_via, timeout_s)
+-        batch_modes.add(str(defs.get("batch_mode") or "batch"))
+-        defs_by_symbol = defs.get("grouped") or {}
+-    except EngineError:
+-        symbols_failed.extend(symbols)
+-        defs_batch_failed = True
++    if symbols:
++        try:
++            defs = run_batch_query("defs", root_path, symbols, binary_path, discovered_via, timeout_s)
++            batch_modes.add(str(defs.get("batch_mode") or "batch"))
++            defs_by_symbol = defs.get("grouped") or {}
++        except EngineError:
++            symbols_failed.extend(symbols)
++            defs_batch_failed = True
+ 
+     defs_for: Dict[str, List[Dict[str, Any]]] = {}
+     for symbol in symbols:
+         if defs_batch_failed:
+             continue
+-        nodes: List[Dict[str, Any]] = []
++        nodes_by_loc: Dict[Tuple[str, Optional[int]], Dict[str, Any]] = {}
+         for hit in defs_by_symbol.get(symbol) or []:
+             if not isinstance(hit, dict):
+                 continue
++            hit_kind = hit.get("kind")
++            if str(hit_kind or "") == "window":
++                window_hits_dropped += 1
++                continue
+             rel = _relpath(str(hit.get("path", "")), root_abs)
+-            if not rel:
++            if not rel or _is_excluded_hit_file(rel):
+                 continue
+-            node = {
++            line_no = hit.get("start")
++            loc_key = (rel, line_no)
++            existing = nodes_by_loc.get(loc_key)
++            if existing is not None:
++                # Prefer "sig" over "body" if both start at the exact same location.
++                if existing.get("kind") != "sig" and hit_kind == "sig":
++                    existing["kind"] = "sig"
++                continue
++            node: Dict[str, Any] = {
+                 "symbol": symbol,
+                 "file": rel,
+-                "line": hit.get("start"),
+-                "kind": hit.get("kind"),
++                "line": line_no,
++                "kind": hit_kind,
+                 "language": _file_language(rel),
+                 "authority": "definition",
+-                "provenance": {
++            }
++            if full_engine_edges:
++                node["provenance"] = {
+                     "engine": "codesearch-go",
+                     "schema": status.get("schema"),
+                     "commit": status.get("commit"),
+                     "query": symbol,
+-                },
+-            }
+-            nodes.append(node)
++                }
++            nodes_by_loc[loc_key] = node
+             languages.add(node["language"])
++        nodes = sorted(nodes_by_loc.values(), key=lambda n: (n["file"], n["line"] or 0, n["symbol"]))
+         if not nodes:
+             symbols_without_definition.append(symbol)
+             continue
+         defs_for[symbol] = nodes
+         symbol_nodes.extend(nodes)
+ 
++    symbol_nodes.sort(key=lambda n: (n["file"], n["line"] or 0, n["symbol"]))
++    node_id_by_key: Dict[Tuple[str, Optional[int], str], int] = {}
++    for idx, node in enumerate(symbol_nodes):
++        if not full_engine_edges:
++            node["id"] = idx
++        node_id_by_key[(node["file"], node["line"], node["symbol"])] = idx
++
+     with_defs = sorted(defs_for)
+     calls_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+     related_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+@@ -378,61 +795,113 @@
+         except EngineError:
+             symbols_failed.extend(with_defs)
+ 
++    file_edges: Set[Tuple[str, str]] = set()
+     for symbol in with_defs:
+         defs_for_symbol = defs_for[symbol]
+-        for call in calls_by_symbol.get(symbol) or []:
++        candidate_ids = [
++            node_id_by_key[(n["file"], n["line"], n["symbol"])]
++            for n in defs_for_symbol
++        ]
++        raw_calls = calls_by_symbol.get(symbol) or []
++        valid_calls: List[Tuple[str, Dict[str, Any]]] = []
++        for call in raw_calls:
+             if not isinstance(call, dict):
+                 continue
+             rel = _relpath(str(call.get("path", "")), root_abs)
+-            if not rel:
++            if not rel or _is_excluded_hit_file(rel):
+                 continue
+-            symbol_edges.append({
+-                "kind": "calls",
+-                "caller": {
+-                    "file": rel,
+-                    "line": call.get("line"),
+-                    "symbol": call.get("caller"),
+-                },
+-                "callee": {
+-                    "symbol": symbol,
+-                    "candidates": [
+-                        {"file": n["file"], "line": n["line"], "kind": n["kind"]}
+-                        for n in defs_for_symbol
+-                    ],
+-                },
+-                "authority": "lead-name-based",
+-                "evidence": {"text": call.get("text")},
+-                "provenance": {
+-                    "engine": "codesearch-go",
+-                    "schema": status.get("schema"),
+-                    "commit": status.get("commit"),
+-                    "query": symbol,
+-                },
+-            })
++            valid_calls.append((rel, call))
++
++        # Review Guardrail #3: post-query suppression when a stopword with an
++        # internal definition matches > HIGH_CALLER_NOISE_CAP generic call sites.
++        if symbol in COMMON_NOISE_SYMBOLS and len(valid_calls) > HIGH_CALLER_NOISE_CAP:
++            high_caller_suppressed.add(symbol)
++            valid_calls = []
++
++        for rel, call in valid_calls:
++            for def_node in defs_for_symbol:
++                dst = def_node["file"]
++                if not dst:
++                    continue
++                if rel == dst:
++                    self_edges_excluded += 1
++                    if not full_engine_edges:
++                        continue
++                file_edges.add((rel, dst))
++
++            if full_engine_edges:
++                symbol_edges.append({
++                    "kind": "calls",
++                    "caller": {
++                        "file": rel,
++                        "line": call.get("line"),
++                        "symbol": call.get("caller"),
++                    },
++                    "callee": {
++                        "symbol": symbol,
++                        "candidates": [
++                            {"file": n["file"], "line": n["line"], "kind": n["kind"]}
++                            for n in defs_for_symbol
++                        ],
++                    },
++                    "authority": "lead-name-based",
++                    "evidence": {"text": call.get("text")},
++                    "provenance": {
++                        "engine": "codesearch-go",
++                        "schema": status.get("schema"),
++                        "commit": status.get("commit"),
++                        "query": symbol,
++                    },
++                })
++            else:
++                symbol_edges.append({
++                    "kind": "calls",
++                    "caller": {
++                        "file": rel,
++                        "line": call.get("line"),
++                        "symbol": call.get("caller"),
++                    },
++                    "callee": {
++                        "symbol": symbol,
++                        "candidate_ids": candidate_ids,
++                        "candidate_count": len(candidate_ids),
++                    },
++                    "authority": "lead-name-based",
++                    "evidence": {"text": call.get("text")},
++                })
++
+         for row in related_by_symbol.get(symbol) or []:
+             if not isinstance(row, dict):
+                 continue
+             if row.get("kind") == "def":
+                 continue  # already a definition node
+             rel = _relpath(str(row.get("path", "")), root_abs)
+-            if not rel:
++            if not rel or _is_excluded_hit_file(rel):
+                 continue
+-            symbol_edges.append({
+-                "kind": "related",
+-                "relation": row.get("kind"),
+-                "file": rel,
+-                "symbol": symbol,
+-                "authority": "lead-name-based",
+-                "evidence": {},
+-                "provenance": {
+-                    "engine": "codesearch-go",
+-                    "schema": status.get("schema"),
+-                    "commit": status.get("commit"),
+-                    "query": symbol,
+-                },
+-            })
++            if full_engine_edges:
++                symbol_edges.append({
++                    "kind": "related",
++                    "relation": row.get("kind"),
++                    "file": rel,
++                    "symbol": symbol,
++                    "authority": "lead-name-based",
++                    "evidence": {},
++                    "provenance": {
++                        "engine": "codesearch-go",
++                        "schema": status.get("schema"),
++                        "commit": status.get("commit"),
++                        "query": symbol,
++                    },
++                })
++            else:
++                symbol_edges.append({
++                    "kind": "related",
++                    "relation": row.get("kind"),
++                    "file": rel,
++                    "symbol": symbol,
++                    "authority": "lead-name-based",
++                })
+ 
+-    symbol_nodes.sort(key=lambda n: (n["file"], n["line"] or 0, n["symbol"]))
+     symbol_edges.sort(key=lambda e: (
+         e.get("caller", {}).get("file", "") if isinstance(e.get("caller"), dict) else e.get("file", ""),
+         e.get("caller", {}).get("line", 0) if isinstance(e.get("caller"), dict) else 0,
+@@ -440,14 +909,6 @@
+         (e.get("callee") or {}).get("symbol", "") if isinstance(e.get("callee"), dict) else e.get("symbol", ""),
+     ))
+ 
+-    file_edges: Set[Tuple[str, str]] = set()
+-    for edge in symbol_edges:
+-        if edge.get("kind") != "calls":
+-            continue
+-        caller = edge.get("caller") or {}
+-        for cand in (edge.get("callee") or {}).get("candidates") or []:
+-            if caller.get("file") and cand.get("file"):
+-                file_edges.add((str(caller["file"]), str(cand["file"])))
+     engine_file_edges = [
+         {
+             "source": src,
+@@ -463,7 +924,11 @@
+         error = (
+             "engine queries failed for symbols: " + ", ".join(sorted(set(symbols_failed)))
+         )
+-    if batch_modes == {"batch"} and not truncated:
++    if wanted_rel is not None:
++        scope = "target-grounded"
++    elif truncated:
++        scope = "whole-repo-bounded"
++    elif batch_modes == {"batch"}:
+         scope = "whole-repo"
+     else:
+         scope = "target-grounded"
+@@ -471,10 +936,18 @@
+         batch_mode = "fallback"
+     elif batch_modes:
+         batch_mode = "batch"
++    elif not symbols:
++        batch_mode = "batch"
+     else:
+         batch_mode = "failed"
+-    return {
+-        "schema_version": ENGINE_LAYER_SCHEMA_VERSION,
++
++    schema_version = (
++        LEGACY_ENGINE_LAYER_SCHEMA_VERSION
++        if full_engine_edges
++        else ENGINE_LAYER_SCHEMA_VERSION
++    )
++    layer: Dict[str, Any] = {
++        "schema_version": schema_version,
+         "available": True,
+         "engine": engine_block,
+         "reason": None,
+@@ -489,14 +962,25 @@
+             "symbol_nodes": len(symbol_nodes),
+             "symbol_edges": len(symbol_edges),
+             "scope": scope,
+-            "symbols_total": len(candidates),
++            "symbols_total": len(eligible),
++            "symbols_filtered_common": filtered_common,
++            "budget": effective_max_symbols,
++            "truncated": truncated,
++            "window_hits_dropped": window_hits_dropped,
++            "generated_files_excluded": len(generated_excluded_files),
++            "self_edges_excluded": self_edges_excluded,
++            "high_caller_suppressed": sorted(high_caller_suppressed),
+             "batch_mode": batch_mode,
++            "cache_status": "miss",
+             "symbols_queried": symbols_queried,
+             "symbols_without_definition": sorted(set(symbols_without_definition)),
+             "symbols_failed": sorted(set(symbols_failed)),
+         },
+         "authority_note": AUTHORITY_NOTE,
+     }
++    if cache_key is not None and cache_mode_norm in ("auto", "refresh") and not error:
++        _save_engine_cache(cache_key, layer)
++    return layer
+ 
+ 
+ def engine_lead_impact(
+@@ -510,7 +994,7 @@
+     reported as leads; the import-graph impact is reported separately.
+     """
+     root_abs = _normalize_path(os.path.abspath(scan_root))
+-    target_rel = _relpath(target_file, root_abs)
++    target_rel = _canon_rel(target_file, root_abs)
+     upstream_adj: Dict[str, Set[str]] = {}
+     downstream_adj: Dict[str, Set[str]] = {}
+     endpoints: Set[str] = set()
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -417,7 +417,7 @@
+ # (memory/fiber). Only modes listed here answer --help; every other mode
+ # keeps its existing behavior.
+ _MODE_HELP_USAGE = {
+-    "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep]",
++    "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep] [--full-engine] [--full-engine-edges]",
+     "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+     "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+     "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
+@@ -574,10 +574,19 @@
+     return graph
+ 
+ 
+-def _topology_engine_unavailable(reason: str) -> Dict[str, Any]:
++def _topology_engine_unavailable(
++    reason: str,
++    *,
++    full_engine_edges: bool = False,
++) -> Dict[str, Any]:
+     """Explicit no-engine layer for the topology path. Never raises."""
++    schema_version = (
++        "plw-topology-engine-v1"
++        if full_engine_edges
++        else "plw-topology-engine-v2"
++    )
+     return {
+-        "schema_version": "plw-topology-engine-v1",
++        "schema_version": schema_version,
+         "available": False,
+         "engine": None,
+         "reason": str(reason),
+@@ -592,6 +601,16 @@
+             "symbol_nodes": 0,
+             "symbol_edges": 0,
+             "scope": "target-grounded",
++            "symbols_total": 0,
++            "symbols_filtered_common": 0,
++            "budget": None,
++            "truncated": False,
++            "window_hits_dropped": 0,
++            "generated_files_excluded": 0,
++            "self_edges_excluded": 0,
++            "high_caller_suppressed": [],
++            "batch_mode": None,
++            "cache_status": "miss",
+             "symbols_queried": [],
+             "symbols_without_definition": [],
+             "symbols_failed": [],
+@@ -608,6 +627,10 @@
+     scan_root: str,
+     graph: Dict[str, Any],
+     target_files: Optional[List[str]] = None,
++    *,
++    max_symbols: Optional[int] = None,
++    full_engine: bool = False,
++    full_engine_edges: bool = False,
+ ) -> Dict[str, Any]:
+     """Best-effort engine symbol layer for topology/impact. Never raises.
+ 
+@@ -619,16 +642,72 @@
+         from core.topology_engine import build_engine_layer
+     except ImportError as exc:
+         return _topology_engine_unavailable(
+-            f"topology engine module unavailable: {exc}"
++            f"topology engine module unavailable: {exc}",
++            full_engine_edges=full_engine_edges,
+         )
+     try:
+-        return build_engine_layer(scan_root, graph, target_files=target_files)
++        return build_engine_layer(
++            scan_root,
++            graph,
++            target_files=target_files,
++            max_symbols=max_symbols,
++            full_engine=full_engine,
++            full_engine_edges=full_engine_edges,
++            cache_mode=_ACTIVE_GRAPH_CACHE_MODE,
++        )
+     except Exception as exc:
+         return _topology_engine_unavailable(
+-            f"topology engine layer failed: {exc}"
++            f"topology engine layer failed: {exc}",
++            full_engine_edges=full_engine_edges,
+         )
+ 
+ 
++def _resolve_engine_target_files(
++    scan_root: str,
++    graph: Dict[str, Any],
++    *,
++    explicit_targets: List[str],
++    target_resolution: Dict[str, Any],
++    full_engine: bool,
++) -> Optional[List[str]]:
++    """Derive target-grounded engine scope (1-hop neighborhood) for kernel_work.
++
++    Guardrail #2: when target_resolution resolves one or more graph targets
++    without full_engine, scope the engine to resolved_targets union
++    direct_imports union direct_importers so blast-radius leads remain intact
++    while keeping large repositories fast.
++    """
++    if full_engine:
++        return None
++    resolution = (target_resolution or {}).get("resolution") or {}
++    state = str(resolution.get("state") or "")
++    selected = [str(item) for item in (resolution.get("selected_targets") or []) if item]
++    if state in ("RESOLVED", "MULTI_TARGET_RESOLVED") and selected:
++        try:
++            from core.topology_engine import _canon_rel
++        except ImportError:
++            _canon_rel = lambda p, _r: str(p).replace("\\", "/")
++        root_abs = os.path.abspath(scan_root or ".").replace("\\", "/")
++        seed_scope = {_canon_rel(item, root_abs) for item in selected}
++        for item in explicit_targets:
++            if str(item).strip():
++                seed_scope.add(_canon_rel(str(item), root_abs))
++        one_hop = set(seed_scope)
++        for edge in (graph.get("edges") or []):
++            if not isinstance(edge, (list, tuple)) or len(edge) != 2:
++                continue
++            src = _canon_rel(str(edge[0]), root_abs)
++            dst = _canon_rel(str(edge[1]), root_abs)
++            if src in seed_scope:
++                one_hop.add(dst)
++            if dst in seed_scope:
++                one_hop.add(src)
++        return sorted(one_hop)
++    if explicit_targets:
++        return sorted({str(item) for item in explicit_targets if str(item).strip()}) or None
++    return None
++
++
+ def _engine_lead_impact_for(
+     scan_root: str,
+     graph: Dict[str, Any],
+@@ -1886,6 +1965,8 @@
+     *,
+     top_n: int = 8,
+     include_edges: bool = False,
++    full_engine: bool = False,
++    full_engine_edges: bool = False,
+ ) -> Dict[str, Any]:
+     """Bounded first-contact topology orientation for an unfamiliar target repo."""
+     if not SHARED_GRAPH_AVAILABLE or not TARGET_TOPOLOGY_AVAILABLE:
+@@ -1900,7 +1981,12 @@
+             top_n=top_n, minimum=1, maximum=50,
+         )
+     graph = _build_kernel_graph(scan_root)
+-    engine_layer = _build_topology_engine_layer(scan_root, graph)
++    engine_layer = _build_topology_engine_layer(
++        scan_root,
++        graph,
++        full_engine=full_engine,
++        full_engine_edges=full_engine_edges,
++    )
+     try:
+         orientation = build_target_topology_orientation(
+             graph, top_n=top_n, include_edges=include_edges, engine_layer=engine_layer
+@@ -2238,7 +2324,6 @@
+ 
+     graph = _build_kernel_graph(scan_root)
+     result = query_impact(graph, target_file)
+-    engine_lead_impact = _engine_lead_impact_for(scan_root, graph, target_file)
+ 
+     if output_mode == "summary":
+         return {
+@@ -2254,6 +2339,13 @@
+             "target_fan_in": result.get("target_fan_in", 0),
+         }
+ 
++    engine_target = (
++        str(result.get("target"))
++        if result.get("exists") and result.get("target")
++        else target_file
++    )
++    engine_lead_impact = _engine_lead_impact_for(scan_root, graph, engine_target)
++
+     return {
+         "schema_version": "3.0.0-kernel",
+         "mode": "impact",
+@@ -3258,6 +3350,8 @@
+     proactive_truth: bool = True,
+     truth_scope: Optional[str] = None,
+     ui_selector: Optional[str] = None,
++    full_engine: bool = False,
++    full_engine_edges: bool = False,
+ ) -> Dict[str, Any]:
+     """Build one adaptive, bounded work pack from one canonical graph snapshot.
+ 
+@@ -3396,17 +3490,30 @@
+         build_ui_agent_handoff(task, graph, selector=ui_selector)
+         if build_ui_agent_handoff is not None else {"status": "UNAVAILABLE"}
+     )
+-    engine_layer = _build_topology_engine_layer(scan_root, graph, target_files=targets or None)
+-    target_orientation = (
+-        build_target_topology_orientation(graph, top_n=8, include_edges=False, engine_layer=engine_layer)
+-        if TARGET_TOPOLOGY_AVAILABLE else {}
+-    )
+     target_resolution = (
+         build_target_resolution(
+             graph, task, explicit_targets=targets or None, top_n=8, neighborhood_limit=8
+         )
+         if TARGET_RESOLUTION_AVAILABLE else {}
+     )
++    engine_targets = _resolve_engine_target_files(
++        scan_root,
++        graph,
++        explicit_targets=targets,
++        target_resolution=target_resolution,
++        full_engine=full_engine,
++    )
++    engine_layer = _build_topology_engine_layer(
++        scan_root,
++        graph,
++        target_files=engine_targets,
++        full_engine=full_engine,
++        full_engine_edges=full_engine_edges,
++    )
++    target_orientation = (
++        build_target_topology_orientation(graph, top_n=8, include_edges=False, engine_layer=engine_layer)
++        if TARGET_TOPOLOGY_AVAILABLE else {}
++    )
+     if targets and ui_source_handoff.get("source_target_hint"):
+         selected_work_targets = list(
+             (target_resolution.get("resolution") or {}).get("selected_targets", []) or []
+@@ -4179,6 +4286,8 @@
+         proactive_truth = True
+         truth_scope = None
+         ui_selector = None
++        full_engine = False
++        full_engine_edges = False
+         receipt_arg = None
+         parse_error = None
+         for i, arg in enumerate(sys.argv):
+@@ -4223,6 +4332,10 @@
+                 ui_selector = sys.argv[i + 1]
+             elif arg == "--no-proactive-truth":
+                 proactive_truth = False
++            elif arg == "--full-engine":
++                full_engine = True
++            elif arg == "--full-engine-edges":
++                full_engine_edges = True
+             elif arg == "--receipt" and i + 1 < len(sys.argv):
+                 receipt_arg = sys.argv[i + 1]
+         if receipt_arg is not None:
+@@ -4245,6 +4358,8 @@
+             proactive_truth=proactive_truth,
+             truth_scope=truth_scope,
+             ui_selector=ui_selector,
++            full_engine=full_engine,
++            full_engine_edges=full_engine_edges,
+         )
+         _emit_cli_result(_attach_task_receipt(work_result, "work", task, root))
+ 
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -12,8 +12,8 @@
+   plw operation-plan resolve <plan.json|-> [--json]
+   plw skill list [--json]
+   plw skill show <command-or-skill-path> [--json]
+-  plw topology [root] [--top N] [--full-edges] [--json]
+-  plw work <task> [root] [--target file] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep]
++  plw topology [root] [--top N] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
++  plw work <task> [root] [--target file] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep] [--full-engine] [--full-engine-edges]
+   plw semantic describe <command> [--json]
+   plw semantic route <task> [--goal GOAL] [--json]
+   plw context <query> [root] [--target file] [--budget N] [--cache-mode MODE] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]
+@@ -4015,11 +4015,17 @@
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--full-edges", action="store_true")
++    parser.add_argument("--full-engine", action="store_true")
++    parser.add_argument("--full-engine-edges", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     result = hott_kernel.kernel_topology(
+-        opts.root, top_n=opts.top, include_edges=opts.full_edges
++        opts.root,
++        top_n=opts.top,
++        include_edges=opts.full_edges,
++        full_engine=opts.full_engine,
++        full_engine_edges=opts.full_engine_edges,
+     )
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+@@ -4613,6 +4619,8 @@
+     parser.add_argument("--ui-selector", default=None)
+     parser.add_argument("--goal", default="auto")
+     parser.add_argument("--depth", default="auto")
++    parser.add_argument("--full-engine", action="store_true")
++    parser.add_argument("--full-engine-edges", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--receipt", default=None)
+     opts = _parse_cli_args(parser, args)
+@@ -4628,6 +4636,8 @@
+         goal=opts.goal,
+         depth=opts.depth,
+         ui_selector=opts.ui_selector,
++        full_engine=opts.full_engine,
++        full_engine_edges=opts.full_engine_edges,
+     )
+     support = (portable_doctor(opts.root).get("target_support", {}) or {})
+     if isinstance(result, dict):
+@@ -4863,7 +4873,7 @@
+       -> Verifies standalone binary/embedded skill readiness; Chromium is optional for static capabilities
+   plw ast <defs|callers|related|search|doctor> [root] [query] [--root DIR] [--binary PATH] [--timeout N] [--limit N] [--json]
+       -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); two positionals are always root-first, a single positional is the query unless it names a directory, and --root DIR is explicit; callers are name-based leads, not proof
+-  plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--json]
++  plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--full-engine] [--full-engine-edges] [--json]
+       -> Official target-first agent entrypoint; orientation only, no runtime/source mutation authority
+   plw capability list [--json]
+   plw capability describe <command> [--json]
+@@ -4871,7 +4881,7 @@
+   plw skill list [--json]
+   plw skill show <command-or-skill-path> [--json]
+       -> Lists or reads exact version-aligned embedded skill contracts
+-  plw topology [root] [--top N] [--full-edges] [--json]
++  plw topology [root] [--top N] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
+       -> First-contact target-codebase map: file→import→file graph, hubs, entrypoints/tests, SCCs, unresolved/external imports
+   plw resolve-target <task> [root] [--target file] [--top N] [--neighbors N] [--json]
+       -> Grounds task to graph nodes; ambiguity/unresolved blocks specialized routing
+@@ -4886,7 +4896,7 @@
+       -> Binds task selection to a complete simplification candidate-set snapshot; unresolved evidence stays ambiguous
+   plw candidate capability-match <task> [root] [--json]
+       -> Selects and matches source facts to an internal contract in one snapshot; no authorization or execution
+-  plw work <task> [root] [--target file] [--goal GOAL] [--depth DEPTH]
++  plw work <task> [root] [--target file] [--goal GOAL] [--depth DEPTH] [--full-engine] [--full-engine-edges]
+       -> Task work on the same graph; returns target_orientation + target_resolution before specialized capability semantics
+   plw semantic describe <command> [--json]
+   plw semantic route <task> [--goal GOAL] [--json]

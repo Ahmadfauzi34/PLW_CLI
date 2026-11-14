@@ -723,3 +723,45 @@ func TestDiversifyFull(t *testing.T) {
 		t.Errorf("--full without body = %v, want [sig doc 0]", got)
 	}
 }
+
+func TestFilterDefChunksExcludesWindowsDocsDeclsAndGenerated(t *testing.T) {
+	ix := newMemIndex("/r")
+	add := func(path, text, kind, name string, line int, meta FileMeta) {
+		d := ChunkDoc{Path: path, Line: line, Text: text, Kind: kind, Name: name}
+		ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
+		ix.files[path] = meta
+	}
+	// 1. AST-chunked file: window chunk mentioning "func helper" in comment/import must not pass,
+	//    while real sig chunk does pass.
+	add("a.go", "// func helper() is imported below\nimport \"pkg\"\n", "window", "", 1, FileMeta{AST: true})
+	add("a.go", "func helper() {\n", "sig", "helper", 5, FileMeta{AST: true})
+	// 2. Doc file (.md), declaration file (.d.ts), generated JS file must all be excluded.
+	add("README.md", "```go\nfunc helper() {}\n```", "", "", 1, FileMeta{AST: false})
+	add("types.d.ts", "export declare function helper(): void;", "", "", 1, FileMeta{AST: false, Generated: true})
+	add("gen.js", "export function helper() {}", "", "", 1, FileMeta{AST: false, Generated: true})
+
+	_, scored := ix.searchBody(parseQuery("helper"), nil, 50)
+	got := filterDefChunks(scored, ix, parseQuery("helper"))
+	if len(got) != 1 {
+		t.Fatalf("filterDefChunks helper: got %d chunks, want 1", len(got))
+	}
+	if p := ix.chunks[got[0].doc].Path; p != "a.go" || ix.chunks[got[0].doc].Kind != "sig" {
+		t.Errorf("kept chunk = %+v, want a.go [sig]", ix.chunks[got[0].doc])
+	}
+
+	// 3. Fallback chunk (AST: false): definition keyword only in comment must not pass,
+	//    non-comment definition line must pass.
+	ix2 := newMemIndex("/r")
+	d1 := ChunkDoc{Path: "script.sh", Line: 1, Text: "# def ghost()\ndef realDef() {\n}", Kind: "window", Name: ""}
+	ix2.addChunkDoc(d1, tokenize(splitCamel(d1.Text)), tokenize(d1.Path))
+	ix2.files["script.sh"] = FileMeta{AST: false}
+
+	_, scGhost := ix2.searchBody(parseQuery("ghost"), nil, 50)
+	if gotGhost := filterDefChunks(scGhost, ix2, parseQuery("ghost")); len(gotGhost) != 0 {
+		t.Errorf("comment-only ghost leaked in fallback chunk: %d hits", len(gotGhost))
+	}
+	_, scReal := ix2.searchBody(parseQuery("realDef"), nil, 50)
+	if gotReal := filterDefChunks(scReal, ix2, parseQuery("realDef")); len(gotReal) != 1 {
+		t.Errorf("realDef in fallback chunk got %d hits, want 1", len(gotReal))
+	}
+}

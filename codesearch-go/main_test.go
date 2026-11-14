@@ -31,8 +31,8 @@ func TestVersionLine(t *testing.T) {
 
 	buildCommit, buildDate = "unknown", "unknown"
 	line := versionLine()
-	if !strings.Contains(line, "schema=go10") {
-		t.Errorf("versionLine default = %q, want schema=go10", line)
+	if !strings.Contains(line, "schema=go11") {
+		t.Errorf("versionLine default = %q, want schema=go11", line)
 	}
 	if !strings.Contains(line, "commit=unknown") || !strings.Contains(line, "built=unknown") {
 		t.Errorf("versionLine default = %q, want commit=unknown built=unknown", line)
@@ -90,6 +90,16 @@ func TestParseArgsTable(t *testing.T) {
 			want: func() options {
 				o := def
 				o.callers, o.callersSet = "getGraphParametersFlat", true
+				return o
+			}(),
+		},
+		{
+			name: "cached callers flag",
+			args: []string{"--cached", "--callers", "foo"},
+			want: func() options {
+				o := def
+				o.cached = true
+				o.callers, o.callersSet = "foo", true
 				return o
 			}(),
 		},
@@ -156,8 +166,10 @@ func TestCheckQueryAndFlags(t *testing.T) {
 		{"single empty query", options{queries: []string{"  "}}, "query must not be empty"},
 		{"json and paths-only conflict", options{queries: []string{"x"}, jsonOut: true, pathsOnly: true}, "--json and --paths-only are mutually exclusive"},
 		{"all with limit conflict", options{queries: []string{"x"}, all: true, limitSet: true}, "--all is mutually exclusive with --limit and --per-file-cap"},
+		{"cached and once conflict", options{queries: []string{"x"}, cached: true, once: true}, "--cached and --once are mutually exclusive"},
 		{"valid single query", options{queries: []string{"x"}}, ""},
 		{"callers mode needs no query", options{callersSet: true, callers: "foo"}, ""},
+		{"cached callers allowed", options{callersSet: true, callers: "foo", cached: true}, ""},
 		{"batch blank query is allowed", options{queries: []string{"", "foo"}}, ""},
 	}
 	for _, c := range cases {

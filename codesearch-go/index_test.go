@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Batch 2-6 (2026-10-26): one definition of "files" (content) across the
@@ -61,10 +62,10 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected the just-saved go10 index")
+		t.Fatal("loadDiskIndex rejected the just-saved go11 index")
 	}
-	if di.SchemaV != "go10" {
-		t.Errorf("SchemaV = %q, want go10", di.SchemaV)
+	if di.SchemaV != "go11" {
+		t.Errorf("SchemaV = %q, want go11", di.SchemaV)
 	}
 	if got := di.Files["bin.rs"].Skip; got != "binary" {
 		t.Errorf("reloaded bin.rs Skip = %q, want binary", got)
@@ -72,10 +73,11 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 }
 
 func TestOldSchemaRejected(t *testing.T) {
-	// A go8 cache (no Skip field) must not load under schema go9: stale
-	// caches rebuild automatically instead of serving Skip-less rows.
+	// A go10 cache (no CallSites/Generated fields) must not load under
+	// schema go11: stale caches rebuild automatically instead of serving
+	// incomplete rows.
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go8", Files: map[string]FileMeta{}}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go10", Files: map[string]FileMeta{}}); err != nil {
 		t.Fatal(err)
 	}
 	db := filepath.Join(t.TempDir(), "old.gob")
@@ -83,7 +85,7 @@ func TestOldSchemaRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := loadDiskIndex(db); ok {
-		t.Error("loadDiskIndex accepted a go8 index, want rejection")
+		t.Error("loadDiskIndex accepted a go10 index, want rejection")
 	}
 }
 
@@ -204,5 +206,100 @@ func TestCheckIndexFlags(t *testing.T) {
 	}
 	if err := checkIndexFlags(options{once: true}, "index-clean"); err == nil {
 		t.Error("--once accepted with --index-clean, want rejection")
+	}
+	if err := checkIndexFlags(options{cached: true}, "index-warm"); err == nil {
+		t.Error("--cached accepted with --index-warm, want rejection")
+	}
+}
+
+func TestCachedCallsAndGeneratedPersistAcrossSync(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, body string, mtime time.Time) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(full, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t0 := time.Now().Add(-10 * time.Second).Truncate(time.Second)
+	write("src/app.ts", "export function greet() { return helper(); }\nexport function helper() { return 1; }\n", t0)
+	write("src/types.d.ts", "export declare function fakeCall(): void;\n", t0)
+	write("public/assets/bundle.js", "/* @ts-self-types=\"./x.d.ts\" */\nfunction wasmCall() { helper(); }\n", t0)
+
+	ix, _ := buildFull(root, defaultScanConfig())
+	if ix.files["src/app.ts"].Generated {
+		t.Error("src/app.ts should not be flagged generated")
+	}
+	if !ix.files["src/types.d.ts"].Generated {
+		t.Error("src/types.d.ts should be flagged generated")
+	}
+	if !ix.files["public/assets/bundle.js"].Generated {
+		t.Error("public/assets/bundle.js should be flagged generated")
+	}
+	for _, c := range ix.callSites {
+		if c.Path == "src/types.d.ts" || c.Path == "public/assets/bundle.js" {
+			t.Errorf("unexpected callSite from generated file: %+v", c)
+		}
+	}
+	if len(ix.callSites) != 1 || ix.callSites[0].Callee != "helper" || ix.callSites[0].Caller != "greet" {
+		t.Errorf("callSites = %+v, want [helper in greet]", ix.callSites)
+	}
+
+	db := filepath.Join(t.TempDir(), "index.gob")
+	if err := ix.save(db); err != nil {
+		t.Fatal(err)
+	}
+	di, ok := loadDiskIndex(db)
+	if !ok {
+		t.Fatal("loadDiskIndex rejected saved go11 index")
+	}
+	if !di.Files["src/types.d.ts"].Generated || !di.Files["public/assets/bundle.js"].Generated {
+		t.Errorf("FileMeta.Generated lost across gob save/load: %+v", di.Files)
+	}
+	if len(di.CallSites) != 1 || di.CallSites[0].Callee != "helper" {
+		t.Errorf("di.CallSites = %+v, want [helper]", di.CallSites)
+	}
+
+	ix2 := memFromDisk(di)
+	t1 := t0.Add(2 * time.Second)
+	write("src/app.ts", "export function greet() { return other(); }\nexport function other() { return 2; }\n", t1)
+	write("src/extra.jsx", "export function Card() { return other(); }\n", t1)
+	a, m, d := ix2.sync(root, defaultScanConfig())
+	if a != 1 || m != 1 || d != 0 {
+		t.Errorf("sync 1 counts = (%d,%d,%d), want (1,1,0)", a, m, d)
+	}
+	gotCallees := map[string]int{}
+	for _, c := range ix2.callSites {
+		gotCallees[c.Path+":"+calleeBase(c.Callee)]++
+	}
+	if gotCallees["src/app.ts:helper"] != 0 || gotCallees["src/app.ts:other"] != 1 || gotCallees["src/extra.jsx:other"] != 1 {
+		t.Errorf("callSites after edit+add sync = %+v (counts=%v)", ix2.callSites, gotCallees)
+	}
+
+	// File becomes generated and extra file deleted -> old callSites and relDefs evicted.
+	t2 := t1.Add(2 * time.Second)
+	write("src/app.ts", "/* @ts-self-types=\"./app.d.ts\" */\nexport function greet() { return other(); }\n", t2)
+	if err := os.Remove(filepath.Join(root, "src/extra.jsx")); err != nil {
+		t.Fatal(err)
+	}
+	a, m, d = ix2.sync(root, defaultScanConfig())
+	if a != 0 || m != 1 || d != 1 {
+		t.Errorf("sync 2 counts = (%d,%d,%d), want (0,1,1)", a, m, d)
+	}
+	if !ix2.files["src/app.ts"].Generated {
+		t.Error("src/app.ts should be flagged Generated after adding @ts-self-types header")
+	}
+	if len(ix2.callSites) != 0 {
+		t.Errorf("callSites after generated+delete = %+v, want empty", ix2.callSites)
+	}
+	for _, rd := range ix2.relDefs {
+		if rd.Path == "src/app.ts" || rd.Path == "src/extra.jsx" {
+			t.Errorf("stale relDef survived sync: %+v", rd)
+		}
 	}
 }

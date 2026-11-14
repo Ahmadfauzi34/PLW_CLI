@@ -291,6 +291,39 @@ grep -Fq 'Selection (G6):' hott_kernel.py
 grep -Fq 'by_analyzer' hott_kernel.py
 grep -Fq 'all_findings' plw_cli.py
 grep -Fq '[--limit N] [--all]' plw_cli.py
+apply_reviewable_overlay "simplify_precision_v1"
+grep -Fq 'DECLARATION_FILE_EXTENSIONS' language_semantics.py
+grep -Fq 'def is_generated_or_vendored_asset(' language_semantics.py
+grep -Fq '".mts": "js_structural_v2"' core/simplification_analyzer.py
+grep -Fq '"generated_files_excluded"' core/simplification_analyzer.py
+grep -Fq 'def _terminal_top_level_statement_kind(' core/simplification_analyzer.py
+apply_reviewable_overlay "topology_engine_v2"
+grep -Fq 'ENGINE_LAYER_SCHEMA_VERSION = "plw-topology-engine-v2"' core/topology_engine.py
+grep -Fq 'HIGH_CALLER_NOISE_CAP = 80' core/topology_engine.py
+grep -Fq 'def _resolve_engine_target_files(' hott_kernel.py
+grep -Fq -- '--full-engine-edges' plw_cli.py
+apply_reviewable_overlay "engine_state_v3"
+grep -Fq 'KNOWN_SCHEMA = "go11"' core/codesearch_engine.py
+grep -Fq '"go11": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+grep -Fq 'def _supports_cached_structural(' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v9"
+grep -Fq '696333c3492abdd6eda85d3b7a5e18b4147a8288c309ec9c8d6ac202c27d29e6' core/codesearch_engine.py
+grep -Fq '7900e083dc7c' core/codesearch_engine.py
+apply_reviewable_overlay "topology_resolution_v1"
+grep -Fq 'def kotlin_same_package_declarations(' language_semantics.py
+grep -Fq 'def rust_manifest_entrypoints(' language_semantics.py
+grep -Fq 'def package_json_entrypoints(' language_semantics.py
+grep -Fq 'kotlin_same_pkg_index' core/shared_graph.py
+grep -Fq '"same_package"' codebase/topology_analyzers.py
+grep -Fq '"same_package_edges"' core/target_topology.py
+apply_reviewable_overlay "check_signal_hardening_v1"
+grep -Fq '_JS_COMMENT_REGEX' language_semantics.py
+grep -Fq '_IMMUTABLE_EXPORT_CTOR_NAMES' codebase/hott_analyzers.py
+grep -Fq '_is_bounded_retry_loop' codebase/performance_analyzers.py
+grep -Fq '_is_cli_or_tooling_context' codebase/performance_analyzers.py
+grep -Fq '_LISTENER_AUTO_CLEANUP_REGEX' codebase/performance_analyzers.py
+grep -Fq '_is_non_escaping_local_container' codebase/performance_analyzers.py
+grep -Fq '_has_cache_eviction_guard' codebase/performance_analyzers.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

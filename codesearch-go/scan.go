@@ -14,8 +14,8 @@ import (
 	"unicode/utf8"
 )
 
-var defaultExts = []string{".rs", ".js", ".mjs", ".ts", ".tsx", ".py", ".go",
-	".java", ".kt", ".c", ".h", ".cpp", ".md", ".txt", ".rst", ".adoc"}
+var defaultExts = []string{".rs", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx",
+	".py", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".md", ".txt", ".rst", ".adoc"}
 
 var skipDirs = map[string]bool{
 	".git": true, "target": true, "node_modules": true,

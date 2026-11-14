@@ -33,14 +33,17 @@
 # is still go9) and to engine_pin_v7 when that engine rotated the
 # digest (828eeeab…, commit b6e9a95c06a9; local + CI builds agree)
 # and to engine_pin_v8 when the G1 defs-only fix rotated the digest
-# (0a3f6179…, commit efff2b7dd3ad; local + CI builds agree).
+# (0a3f6179…, commit efff2b7dd3ad; local + CI builds agree), then to
+# engine_state_v3 when go11 added persistent CallSites/Generated in .gob
+# + --cached + filterDefChunks and to engine_pin_v9 when that engine
+# rotated the digest (696333c3…, commit 7900e083dc7c).
 # If a later overlay moves either constant again, update the patch
 # paths below — the script then fails closed with "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v2/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v8/change.patch"
+ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v3/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v9/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 

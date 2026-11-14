@@ -1,0 +1,1222 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -494,6 +494,85 @@
+ )
+ 
+ 
++_KOTLIN_STDLIB_COMMON_FUNS = frozenset({
++    "run", "let", "apply", "also", "with", "get", "set", "add", "map",
++    "filter", "listOf", "setOf", "mapOf", "emptyList", "emptyMap",
++    "emptySet", "mutableListOf", "mutableMapOf", "mutableSetOf",
++    "println", "print", "todo", "TODO", "check", "require", "error",
++    "lazy", "main",
++})
++
++_KOTLIN_SAME_PKG_DECL_REGEX = re.compile(
++    r"^(?:@[\w.]+(?:\([^)]*\))?\s+)*"
++    r"(?P<mods>(?:" + _KOTLIN_DECL_MODIFIERS + r")*)"
++    r"(?P<kw>class|interface|object|fun|val|var|typealias|enum)"
++    r"(?:\s+(?:class|interface))?\s+"
++    r"(?:<[^>]*>\s+)?"
++    r"(?P<recv>[\w]+(?:<[^>]*>)?\??\.)?"
++    r"(?P<name>[A-Za-z_][\w]*)",
++    re.MULTILINE,
++)
++
++
++_KOTLIN_STRIP_TOKEN_REGEX = re.compile(
++    r"//[^\n]*"
++    r'|"""(?:[\s\S]*?"""\"*|[\s\S]*$)'
++    r'|"(?:\\[^\n]|[^"\\\n])*\\?(?:"|(?=\n)|$)'
++    r"|'(?:\\[^\n]|[^'\\\n])*\\?(?:'|(?=\n)|$)"
++    r"|/\*"
++)
++
++
++def kotlin_strip_comments_and_strings(content: str) -> str:
++    """Strip Kotlin comments (incl. nested /* /* */ */) and string/char literals.
++
++    Preserves exact newline count so line numbers never shift and avoids false
++    token matches inside comments, KDoc, raw strings, and string literals.
++    """
++    if not content:
++        return content
++    out: List[str] = []
++    pos = 0
++    n = len(content)
++    while pos < n:
++        match = _KOTLIN_STRIP_TOKEN_REGEX.search(content, pos)
++        if not match:
++            out.append(content[pos:])
++            break
++        start = match.start()
++        if start > pos:
++            out.append(content[pos:start])
++        tok = match.group(0)
++        if tok == "/*":
++            depth = 1
++            cur = match.end()
++            while cur < n and depth > 0:
++                idx_open = content.find("/*", cur)
++                idx_close = content.find("*/", cur)
++                if idx_close == -1:
++                    cur = n
++                    break
++                if idx_open != -1 and idx_open < idx_close:
++                    depth += 1
++                    cur = idx_open + 2
++                else:
++                    depth -= 1
++                    cur = idx_close + 2
++            span = content[start:cur]
++            if "\n" in span:
++                out.append("\n".join(" " * len(line) for line in span.split("\n")))
++            else:
++                out.append(" " * len(span))
++            pos = cur
++        else:
++            if "\n" in tok:
++                out.append("\n".join(" " * len(line) for line in tok.split("\n")))
++            else:
++                out.append(" " * len(tok))
++            pos = match.end()
++    return "".join(out)
++
++
+ def kotlin_package_of(content: str) -> str:
+     """Return the declared `package a.b.c` of a Kotlin file, or ""."""
+     match = KOTLIN_PACKAGE_REGEX.search(strip_js_comments(content))
+@@ -512,6 +591,41 @@
+     return KOTLIN_DECL_REGEX.findall(strip_js_comments(content))
+ 
+ 
++def kotlin_same_package_declarations(
++    content: str,
++    _stripped: Optional[str] = None,
++) -> Dict[str, str]:
++    """Extract non-private top-level Kotlin declarations safe for same-package linking.
++
++    Returns {symbol_name: kind} with kind in {"pascal", "const", "fun"}:
++    - Excludes file-`private` top-level declarations (visibility boundary in Kotlin).
++    - Excludes extension declarations (`Modifier.onUnhandledTap`) which require dot syntax.
++    - Requires len(name) >= 3; types/vals must start uppercase; common stdlib fun names dropped.
++    """
++    clean = _stripped if _stripped is not None else kotlin_strip_comments_and_strings(content)
++    decls: Dict[str, str] = {}
++    for match in _KOTLIN_SAME_PKG_DECL_REGEX.finditer(clean):
++        mods = set((match.group("mods") or "").split())
++        if "private" in mods:
++            continue
++        if match.group("recv"):
++            continue
++        kw = match.group("kw")
++        name = match.group("name")
++        if len(name) < 3:
++            continue
++        if kw in ("class", "interface", "object", "typealias", "enum"):
++            if name[0].isupper():
++                decls.setdefault(name, "pascal")
++        elif kw in ("val", "var"):
++            if name[0].isupper():
++                decls.setdefault(name, "const")
++        elif kw == "fun":
++            if name not in _KOTLIN_STDLIB_COMMON_FUNS:
++                decls.setdefault(name, "fun")
++    return decls
++
++
+ def kotlin_source_root(file_path: str, package: str) -> str:
+     """Derive the source root from a file path + its declared package (K5).
+ 
+@@ -919,7 +1033,75 @@
+ 
+ 
+ _RUST_TOML_SECTION_REGEX = re.compile(r"^\[(.+?)\]\s*$", re.MULTILINE)
+-_RUST_TOML_NAME_REGEX = re.compile(r"^name\s*=\s*\"([^\"]+)\"", re.MULTILINE)
++_RUST_TOML_NAME_REGEX = re.compile(r'^name\s*=\s*"([^"]+)"', re.MULTILINE)
++_RUST_TOML_PATH_REGEX = re.compile(r'^path\s*=\s*"([^"]+)"', re.MULTILINE)
++_RUST_TOML_BUILD_REGEX = re.compile(r'^build\s*=\s*(?:"([^"]+)"|(false))', re.MULTILINE)
++_RUST_TOML_AUTOBINS_REGEX = re.compile(r"^autobins\s*=\s*(true|false)\b", re.MULTILINE)
++_RUST_TOML_CRATE_TYPE_REGEX = re.compile(r"^crate-type\s*=\s*\[([^\]]*)\]", re.MULTILINE | re.DOTALL)
++
++
++def rust_cargo_targets(manifest_text: str) -> Dict[str, Any]:
++    """Parse [package], [lib], and [[bin]] targets from a Cargo.toml manifest."""
++    chunks: List[Tuple[str, str]] = []
++    current = ""
++    start = 0
++    for match in _RUST_TOML_SECTION_REGEX.finditer(manifest_text):
++        chunks.append((current, manifest_text[start : match.start()]))
++        current = match.group(1).strip()
++        start = match.end()
++    chunks.append((current, manifest_text[start:]))
++
++    package_text = ""
++    for sec, body in chunks:
++        if sec == "package":
++            package_text = body
++            break
++
++    pkg_match = _RUST_TOML_NAME_REGEX.search(package_text)
++    package = pkg_match.group(1) if pkg_match else ""
++    build_match = _RUST_TOML_BUILD_REGEX.search(package_text)
++    build_script: Optional[str] = "build.rs"
++    if build_match:
++        build_script = None if build_match.group(2) == "false" else build_match.group(1)
++    autobins_match = _RUST_TOML_AUTOBINS_REGEX.search(package_text)
++    autobins = (autobins_match.group(1) != "false") if autobins_match else True
++
++    lib_declared = False
++    lib_name = package.replace("-", "_") if package else ""
++    lib_path = "src/lib.rs"
++    crate_types: List[str] = []
++    bins: List[Dict[str, str]] = []
++
++    for sec, body in chunks:
++        if sec == "lib":
++            lib_declared = True
++            nm = _RUST_TOML_NAME_REGEX.search(body)
++            if nm:
++                lib_name = nm.group(1)
++            pm = _RUST_TOML_PATH_REGEX.search(body)
++            if pm:
++                lib_path = pm.group(1)
++            ct = _RUST_TOML_CRATE_TYPE_REGEX.search(body)
++            if ct:
++                crate_types = re.findall(r'"([^"]+)"', ct.group(1))
++        elif sec == "[bin]":
++            nm = _RUST_TOML_NAME_REGEX.search(body)
++            pm = _RUST_TOML_PATH_REGEX.search(body)
++            bins.append({
++                "name": nm.group(1) if nm else "",
++                "path": pm.group(1) if pm else "",
++            })
++
++    return {
++        "package_name": package,
++        "lib_name": lib_name,
++        "has_lib": lib_declared,
++        "lib_path": lib_path,
++        "crate_types": crate_types,
++        "bins": bins,
++        "autobins": autobins,
++        "build_script": build_script,
++    }
+ 
+ 
+ def rust_cargo_package_name(manifest_text: str) -> Tuple[str, str]:
+@@ -929,22 +1111,284 @@
+     an explicit `[lib] name` overrides it. Returns ("", "") when no
+     `[package] name` is present.
+     """
+-    sections: Dict[str, str] = {}
+-    current = ""
+-    start = 0
+-    for match in _RUST_TOML_SECTION_REGEX.finditer(manifest_text):
+-        sections[current] = manifest_text[start : match.start()]
+-        current = match.group(1).strip()
+-        start = match.end()
+-    sections[current] = manifest_text[start:]
+-    package_text = sections.get("package", "")
+-    pkg_match = _RUST_TOML_NAME_REGEX.search(package_text)
+-    if not pkg_match:
++    parsed = rust_cargo_targets(manifest_text)
++    if not parsed["package_name"]:
+         return "", ""
+-    package = pkg_match.group(1)
+-    lib_match = _RUST_TOML_NAME_REGEX.search(sections.get("lib", ""))
+-    lib_name = lib_match.group(1) if lib_match else package.replace("-", "_")
+-    return package, lib_name
++    return parsed["package_name"], parsed["lib_name"]
++
++
++_ENTRYPOINT_KIND_PRIORITY = {
++    "android_manifest": 100,
++    "ssr_bootstrap": 95,
++    "browser_bootstrap": 95,
++    "package_bin": 92,
++    "binary_entry": 90,
++    "rust_lib_crate": 88,
++    "package_script": 86,
++    "package_main": 85,
++    "server_http": 84,
++    "cli_shebang": 80,
++    "app_bootstrap": 78,
++    "rust_build_script": 76,
++    "rust_example": 74,
++    "tool_config_entry": 70,
++}
++
++_CLI_SHEBANG_REGEX = re.compile(
++    r"^#!\s*(?:/usr/bin/env\s+(?:-\S+\s+)*(?:node|tsx|ts-node|bun|deno|python3?|sh|bash)|/\S+/(?:node|python3?|sh|bash))\b"
++)
++
++_TOOL_CONFIG_REGEX = re.compile(
++    r"^(?:(?:vite|vitest|eslint|tailwind|postcss|next|nuxt|astro|svelte|"
++    r"webpack|rollup|jest|playwright|babel|prettier|tsup|esbuild|"
++    r"drizzle|prisma|turbo)\.config\.(?:js|mjs|cjs|ts|mts|cts)|"
++    r"\.(?:eslint|prettier)rc\.(?:js|cjs|mjs))$"
++)
++
++_DEFAULT_MANIFEST_SKIP_DIRS = frozenset({
++    ".git", "node_modules", "dist", "build", ".gradle", ".angular",
++    ".next", "out", "target", "coverage", "vendor", "fixtures_min",
++})
++
++
++def has_cli_shebang(content: str) -> bool:
++    """Return True when *content* begins with a script/CLI interpreter shebang."""
++    if not content:
++        return False
++    first_line = content.split("\n", 1)[0].strip()
++    return _CLI_SHEBANG_REGEX.match(first_line) is not None
++
++
++def is_tool_config_file(file_path: str) -> bool:
++    """Return True for build/linter/test tool config files (never app modules)."""
++    return _TOOL_CONFIG_REGEX.match(os.path.basename(str(file_path))) is not None
++
++
++def pick_preferred_entrypoint(
++    *candidates: Tuple[bool, str, float],
++) -> Tuple[bool, str, float]:
++    """Choose the highest-priority entrypoint classification deterministically."""
++    best: Tuple[int, float, str] = (-1, -1.0, "none")
++    for is_ep, kind, conf in candidates:
++        if not is_ep or not kind or kind == "none":
++            continue
++        score = (_ENTRYPOINT_KIND_PRIORITY.get(kind, 50), float(conf), kind)
++        if score > best:
++            best = score
++    if best[0] < 0:
++        return False, "none", 0.0
++    return True, best[2], best[1]
++
++
++def _set_ep_candidate(
++    table: Dict[str, Tuple[str, float]],
++    file_path: str,
++    kind: str,
++    confidence: float,
++) -> None:
++    if file_path in table:
++        existing_kind, existing_conf = table[file_path]
++        _, chosen_kind, chosen_conf = pick_preferred_entrypoint(
++            (True, existing_kind, existing_conf),
++            (True, kind, confidence),
++        )
++        table[file_path] = (chosen_kind, chosen_conf)
++    else:
++        table[file_path] = (kind, confidence)
++
++
++def rust_manifest_entrypoints(
++    scan_root: str,
++    all_files_set: Set[str],
++    ignore_dirs: Optional[Set[str]] = None,
++) -> Dict[str, Tuple[str, float]]:
++    """Identify Rust crate library/binary/build/example entrypoints from Cargo.toml."""
++    if not scan_root or not os.path.isdir(scan_root):
++        return {}
++    ignored = set(_DEFAULT_MANIFEST_SKIP_DIRS)
++    if ignore_dirs:
++        ignored.update(ignore_dirs)
++
++    manifest_dirs: List[str] = []
++    for dirpath, dirnames, filenames in os.walk(scan_root):
++        dirnames[:] = sorted(
++            d for d in dirnames if d not in ignored and not d.startswith(".")
++        )
++        if "Cargo.toml" in filenames:
++            manifest_dirs.append(dirpath)
++
++    entrypoints: Dict[str, Tuple[str, float]] = {}
++    for pkg_dir in sorted(manifest_dirs):
++        manifest_file = os.path.join(pkg_dir, "Cargo.toml")
++        try:
++            with open(manifest_file, "r", encoding="utf-8", errors="ignore") as fh:
++                text = fh.read()
++        except OSError:
++            continue
++
++        targets = rust_cargo_targets(text)
++        pkg_norm = normalize_path(pkg_dir)
++
++        def _join(rel_target: str) -> str:
++            rel_norm = normalize_path(rel_target)
++            if pkg_norm in ("", "."):
++                return rel_norm
++            return normalize_path(os.path.join(pkg_norm, rel_norm))
++
++        lib_cand = _join(targets.get("lib_path") or "src/lib.rs")
++        if lib_cand in all_files_set:
++            _set_ep_candidate(entrypoints, lib_cand, "rust_lib_crate", 0.90)
++
++        for bin_entry in targets.get("bins") or []:
++            raw_path = bin_entry.get("path") or ""
++            b_name = bin_entry.get("name") or ""
++            cands: List[str] = []
++            if raw_path:
++                cands.append(_join(raw_path))
++            else:
++                if b_name:
++                    cands.append(_join(f"src/bin/{b_name}.rs"))
++                    cands.append(_join(f"src/bin/{b_name}/main.rs"))
++                if not b_name or b_name == targets.get("package_name"):
++                    cands.append(_join("src/main.rs"))
++            for cand in cands:
++                if cand in all_files_set:
++                    _set_ep_candidate(entrypoints, cand, "binary_entry", 0.90)
++
++        if targets.get("autobins", True):
++            main_cand = _join("src/main.rs")
++            if main_cand in all_files_set:
++                _set_ep_candidate(entrypoints, main_cand, "binary_entry", 0.90)
++            bin_prefix = _join("src/bin") + "/"
++            for fp in sorted(all_files_set):
++                if fp.startswith(bin_prefix) and fp.endswith(".rs"):
++                    rel_bin = fp[len(bin_prefix):]
++                    if "/" not in rel_bin or rel_bin.endswith("/main.rs"):
++                        _set_ep_candidate(entrypoints, fp, "binary_entry", 0.90)
++
++        build_rel = targets.get("build_script")
++        if build_rel:
++            build_cand = _join(build_rel)
++            if build_cand in all_files_set:
++                _set_ep_candidate(entrypoints, build_cand, "rust_build_script", 0.85)
++
++        ex_prefix = _join("examples") + "/"
++        for fp in sorted(all_files_set):
++            if fp.startswith(ex_prefix) and fp.endswith(".rs"):
++                rel_ex = fp[len(ex_prefix):]
++                if "/" not in rel_ex or rel_ex.endswith("/main.rs"):
++                    _set_ep_candidate(entrypoints, fp, "rust_example", 0.80)
++
++    return entrypoints
++
++
++def _collect_export_targets(value: Any) -> List[str]:
++    targets: List[str] = []
++    if isinstance(value, str):
++        targets.append(value)
++    elif isinstance(value, list):
++        for item in value:
++            targets.extend(_collect_export_targets(item))
++    elif isinstance(value, dict):
++        for k in sorted(value.keys()):
++            targets.extend(_collect_export_targets(value[k]))
++    return targets
++
++
++def package_json_entrypoints(
++    scan_root: str,
++    all_files_set: Set[str],
++    ignore_dirs: Optional[Set[str]] = None,
++) -> Dict[str, Tuple[str, float]]:
++    """Identify JS/TS entrypoints referenced by package.json main/bin/exports/scripts."""
++    if not scan_root or not os.path.isdir(scan_root):
++        return {}
++    ignored = set(_DEFAULT_MANIFEST_SKIP_DIRS)
++    if ignore_dirs:
++        ignored.update(ignore_dirs)
++
++    manifest_dirs: List[str] = []
++    for dirpath, dirnames, filenames in os.walk(scan_root):
++        dirnames[:] = sorted(
++            d for d in dirnames if d not in ignored and not d.startswith(".")
++        )
++        if "package.json" in filenames:
++            manifest_dirs.append(dirpath)
++
++    entrypoints: Dict[str, Tuple[str, float]] = {}
++    for pkg_dir in sorted(manifest_dirs):
++        pkg_file = os.path.join(pkg_dir, "package.json")
++        try:
++            with open(pkg_file, "r", encoding="utf-8", errors="ignore") as fh:
++                data = json.loads(fh.read())
++        except Exception:
++            continue
++        if not isinstance(data, dict):
++            continue
++        pkg_norm = normalize_path(pkg_dir)
++
++        def _resolve_ref(raw_ref: str) -> Optional[str]:
++            token = raw_ref.strip().strip('"').strip("'").rstrip(";,")
++            if not token or token in (".", "..") or token.startswith("-"):
++                return None
++            if "*" in token or "://" in token or "node_modules/" in token:
++                return None
++            if "=" in token and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
++                token = token.split("=", 1)[1].strip().strip('"').strip("'")
++                if not token:
++                    return None
++            rel_norm = normalize_path(token)
++            joined = rel_norm if pkg_norm in ("", ".") else normalize_path(os.path.join(pkg_norm, rel_norm))
++            for cand in [joined] + candidate_targets(joined, "javascript"):
++                if cand in all_files_set:
++                    return cand
++            return None
++
++        bin_val = data.get("bin")
++        if isinstance(bin_val, str):
++            matched = _resolve_ref(bin_val)
++            if matched:
++                _set_ep_candidate(entrypoints, matched, "package_bin", 0.95)
++        elif isinstance(bin_val, dict):
++            for _, target in sorted(bin_val.items()):
++                if isinstance(target, str):
++                    matched = _resolve_ref(target)
++                    if matched:
++                        _set_ep_candidate(entrypoints, matched, "package_bin", 0.95)
++
++        for field in ("main", "module", "browser"):
++            val = data.get(field)
++            if isinstance(val, str):
++                matched = _resolve_ref(val)
++                if matched:
++                    _set_ep_candidate(entrypoints, matched, "package_main", 0.90)
++
++        for target in _collect_export_targets(data.get("exports")):
++            matched = _resolve_ref(target)
++            if matched:
++                _set_ep_candidate(entrypoints, matched, "package_main", 0.90)
++
++        scripts = data.get("scripts")
++        if isinstance(scripts, dict):
++            for _, cmd in sorted(scripts.items()):
++                if not isinstance(cmd, str) or not cmd.strip():
++                    continue
++                for q1, q2 in re.findall(r'"([^"]+)"|\'([^\']+)\'', cmd):
++                    matched = _resolve_ref(q1 or q2)
++                    if matched:
++                        _set_ep_candidate(entrypoints, matched, "package_script", 0.90)
++                for seg in re.split(r"&&|\|\||[;|]", cmd):
++                    tokens = seg.strip().split()
++                    for idx in range(len(tokens)):
++                        for span in (1, 2, 3):
++                            if idx + span > len(tokens):
++                                break
++                            phrase = " ".join(tokens[idx : idx + span])
++                            matched = _resolve_ref(phrase)
++                            if matched:
++                                _set_ep_candidate(entrypoints, matched, "package_script", 0.90)
++
++    return entrypoints
+ 
+ 
+ __all__ = [
+@@ -959,8 +1403,11 @@
+     "RUST_STDLIB_CRATES",
+     "SOURCE_EXTENSIONS",
+     "EXPERIMENTAL_SOURCE_EXTENSIONS",
++    "android_manifest_entrypoints",
++    "has_cli_shebang",
+     "is_declaration_file",
+     "is_generated_or_vendored_asset",
++    "is_tool_config_file",
+     "is_tool_implementation_path",
+     "source_path_allowed",
+     "source_extensions",
+@@ -970,21 +1417,28 @@
+     "is_source_file",
+     "load_alias_rules",
+     "normalize_path",
++    "package_json_entrypoints",
+     "parse_python_imports",
++    "pick_preferred_entrypoint",
+     "kotlin_is_generated_import",
+     "kotlin_is_internal_import",
+     "kotlin_module_candidates",
+     "kotlin_package_of",
++    "kotlin_same_package_declarations",
+     "kotlin_source_root",
++    "kotlin_strip_comments_and_strings",
+     "kotlin_top_level_names",
+     "parse_kotlin_imports",
+     "parse_rust_imports",
+     "python_module_candidates",
+     "resolve_relative_import_path",
+     "rust_cargo_package_name",
++    "rust_cargo_targets",
++    "rust_manifest_entrypoints",
+     "rust_module_path_of",
+     "rust_top_level_names",
+     "source_language",
+     "strip_js_comments",
+     "strip_jsonc_comments",
+ ]
++
+--- a/codebase/file_scanner.py
++++ b/codebase/file_scanner.py
+@@ -11,12 +11,17 @@
+     android_manifest_entrypoints as _android_manifest_entrypoints,
+     candidate_targets as _candidate_targets,
+     classify_js_import_nature as classify_import_nature,
++    has_cli_shebang as _has_cli_shebang,
+     is_source_file as _is_source_file,
++    is_tool_config_file as _is_tool_config_file,
+     load_alias_rules as _load_alias_rules,
+     normalize_path as _normalize_path,
++    package_json_entrypoints as _package_json_entrypoints,
+     parse_python_imports,
++    pick_preferred_entrypoint as _pick_preferred_entrypoint,
+     python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
++    rust_manifest_entrypoints as _rust_manifest_entrypoints,
+     source_language,
+     source_extensions,
+     source_path_allowed,
+@@ -406,7 +411,20 @@
+                 node_type = _classify_node(full_path, content)
+                 main_name = _extract_main_name(full_path, content)
+ 
+-                is_entrypoint, entrypoint_kind, entrypoint_confidence = _detect_entrypoint(full_path)
++                base_ep = _detect_entrypoint(full_path)
++                shebang_ep = (
++                    (True, "cli_shebang", 0.85)
++                    if _has_cli_shebang(content)
++                    else (False, "none", 0.0)
++                )
++                config_ep = (
++                    (True, "tool_config_entry", 0.75)
++                    if _is_tool_config_file(full_path)
++                    else (False, "none", 0.0)
++                )
++                is_entrypoint, entrypoint_kind, entrypoint_confidence = _pick_preferred_entrypoint(
++                    base_ep, shebang_ep, config_ep
++                )
+                 is_test = _detect_test_file(full_path)
+ 
+                 nodes.append(
+@@ -451,17 +469,56 @@
+                                 }
+                             )
+ 
+-    # G5a: AndroidManifest.xml entrypoints (same helper as shared_graph).
++    # G5a + Phase 3: Manifest/tool/Cargo entrypoints (same helpers as shared_graph).
+     # Node flags are patched here, before fan_in/unreferenced are
+     # computed below, so both surfaces agree.
+     manifest_entrypoints: Set[str] = set()
++    rust_entrypoints: Dict[str, Tuple[str, float]] = {}
++    pkg_entrypoints: Dict[str, Tuple[str, float]] = {}
+     for _root in roots:
+         manifest_entrypoints |= _android_manifest_entrypoints(_root, kt_sources)
++        for _fp, (_kind, _conf) in _rust_manifest_entrypoints(
++            _root, file_map, ignore_dirs=ignore_dirs
++        ).items():
++            prev = rust_entrypoints.get(_fp)
++            if prev is None:
++                rust_entrypoints[_fp] = (_kind, _conf)
++            else:
++                _, ck, cc = _pick_preferred_entrypoint((True, prev[0], prev[1]), (True, _kind, _conf))
++                rust_entrypoints[_fp] = (ck, cc)
++        for _fp, (_kind, _conf) in _package_json_entrypoints(
++            _root, file_map, ignore_dirs=ignore_dirs
++        ).items():
++            prev = pkg_entrypoints.get(_fp)
++            if prev is None:
++                pkg_entrypoints[_fp] = (_kind, _conf)
++            else:
++                _, ck, cc = _pick_preferred_entrypoint((True, prev[0], prev[1]), (True, _kind, _conf))
++                pkg_entrypoints[_fp] = (ck, cc)
+     for node in nodes:
+-        if node.get("id") in manifest_entrypoints:
+-            node["is_entrypoint"] = True
+-            node["entrypoint_kind"] = "android_manifest"
+-            node["entrypoint_confidence"] = 0.95
++        nid = node.get("id")
++        if not nid:
++            continue
++        cur_ep = (
++            bool(node.get("is_entrypoint")),
++            str(node.get("entrypoint_kind") or "none"),
++            float(node.get("entrypoint_confidence") or 0.0),
++        )
++        man_ep = (True, "android_manifest", 0.95) if nid in manifest_entrypoints else (False, "none", 0.0)
++        rust_ep = (
++            (True, rust_entrypoints[nid][0], rust_entrypoints[nid][1])
++            if nid in rust_entrypoints
++            else (False, "none", 0.0)
++        )
++        pkg_ep = (
++            (True, pkg_entrypoints[nid][0], pkg_entrypoints[nid][1])
++            if nid in pkg_entrypoints
++            else (False, "none", 0.0)
++        )
++        is_ep, kind, conf = _pick_preferred_entrypoint(cur_ep, man_ep, rust_ep, pkg_ep)
++        node["is_entrypoint"] = is_ep
++        node["entrypoint_kind"] = kind
++        node["entrypoint_confidence"] = conf
+ 
+     # Resolve semua edge setelah semua root selesai dipindai
+     for raw_edge in raw_edges:
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -89,6 +89,7 @@
+ def _build_undirected_cycle_basis(
+     vertices: List[str],
+     edges: List[Tuple[str, str]],
++    edge_natures: Optional[Dict[str, str]] = None,
+ ) -> List[Dict[str, Any]]:
+     """
+     Build deterministic fundamental-cycle witnesses for the undirected graph.
+@@ -99,6 +100,7 @@
+     if not vertices:
+         return []
+ 
++    natures = edge_natures or {}
+     union_find = _UnionFind(vertices)
+     tree: Dict[str, Set[str]] = {vertex: set() for vertex in vertices}
+     directed_edges = set(map(tuple, edges))
+@@ -129,10 +131,14 @@
+             observed_directions: List[List[str]] = []
+             if (left, right) in directed_edges:
+                 observed_directions.append([left, right])
++                if natures.get(f"{left} -> {right}", natures.get((left, right), "runtime")) == "same_package":
++                    forward_aligned = False
+             else:
+                 forward_aligned = False
+             if (right, left) in directed_edges:
+                 observed_directions.append([right, left])
++                if natures.get(f"{right} -> {left}", natures.get((right, left), "runtime")) == "same_package":
++                    reverse_aligned = False
+             else:
+                 reverse_aligned = False
+             witness_edges.append({
+@@ -250,6 +256,7 @@
+     boundaries = shared_graph.get("boundaries", {})
+     file_to_boundary = shared_graph.get("file_to_boundary", {})
+     resolved_imports = shared_graph.get("resolved_imports", {})
++    edge_natures = shared_graph.get("edge_natures", {})
+ 
+     # Build set of barrel files untuk quick lookup
+     barrel_files: Set[str] = set()
+@@ -267,6 +274,8 @@
+             continue
+ 
+         for tgt_file in targets:
++            if edge_natures.get(f"{src_file} -> {tgt_file}", "runtime") == "same_package":
++                continue
+             tgt_boundary = file_to_boundary.get(tgt_file)
+             if not tgt_boundary or tgt_boundary == src_boundary:
+                 continue
+@@ -323,6 +332,8 @@
+         if not src_boundary:
+             continue
+         for tgt_file in targets:
++            if edge_natures.get(f"{src_file} -> {tgt_file}", "runtime") == "same_package":
++                continue
+             tgt_boundary = file_to_boundary.get(tgt_file)
+             if tgt_boundary and tgt_boundary != src_boundary:
+                 if src_boundary not in boundary_graph:
+@@ -640,7 +651,8 @@
+ 
+     n_vertices = len(vertices)
+     n_edges = len(edges)
+-    cycle_basis = _build_undirected_cycle_basis(vertices, edges)
++    edge_natures = shared_graph.get("edge_natures", {})
++    cycle_basis = _build_undirected_cycle_basis(vertices, edges, edge_natures=edge_natures)
+ 
+     # --- β₀ via union-find ---
+     if n_vertices == 0:
+@@ -662,7 +674,6 @@
+         average_degree = (2.0 * n_edges / n_vertices) if n_vertices > 0 else 0.0
+ 
+     # --- Runtime vs Type-Level Betti Decomposition ---
+-    edge_natures = shared_graph.get("edge_natures", {})
+     runtime_edges = [
+         (u, v) for (u, v) in edges
+         if edge_natures.get(f"{u} -> {v}", edge_natures.get((u, v), "runtime")) == "runtime"
+--- a/codebase/topology_analyzers.py
++++ b/codebase/topology_analyzers.py
+@@ -53,9 +53,14 @@
+     vertices = shared_graph.get("vertices", [])
+     edges = shared_graph.get("edges", [])
+ 
+-    # Build adjacency
++    edge_natures = shared_graph.get("edge_natures", {})
++
++    # Build adjacency (same_package Kotlin edges stay reachable for orphan/impact
++    # analysis, never as compilation import cycles).
+     adj: Dict[str, List[str]] = {}
+     for src, tgt in edges:
++        if edge_natures.get(f"{src} -> {tgt}", "runtime") == "same_package":
++            continue
+         adj.setdefault(src, []).append(tgt)
+ 
+     # DFS-based cycle detection
+@@ -85,7 +90,6 @@
+ 
+     # Deduplicate cycles (normalize rotation)
+     seen: Set[str] = set()
+-    edge_natures = shared_graph.get("edge_natures", {})
+ 
+     for cycle in cycles:
+         core = cycle[:-1]
+@@ -617,6 +621,12 @@
+     if circular_refs:
+         from codebase.cycle_break import compute_cycle_break_advisory
+         circ_result = analyze_circular(shared_graph)
++        circ_nodes = {
++            node
++            for f in circ_result.get("findings", [])
++            for node in f.get("files", [])
++        }
++        circular_refs = [ref for ref in circular_refs if ref in circ_nodes]
+         relevant_cycles = [
+             f["cycle"] for f in circ_result.get("findings", [])
+             if any(target in node for node in f.get("cycle", []))
+@@ -659,12 +669,17 @@
+     Ekstrak outline ringkas dari satu file spesifik.
+     Migrated dari file_scanner.py get_file_outline().
+     """
++    import bisect
++
+     requested_target = _normalize_path(target_file)
+     file_map = shared_graph.get("file_map", {})
+-    target, candidates, resolution = _resolve_query_target(
+-        requested_target,
+-        set(file_map),
+-    )
++    if requested_target in file_map:
++        target, candidates, resolution = requested_target, [], "exact"
++    else:
++        target, candidates, resolution = _resolve_query_target(
++            requested_target,
++            set(file_map),
++        )
+ 
+     if target is None:
+         return _missing_query_target(
+@@ -674,6 +689,11 @@
+     content = file_map[target]
+     stripped = _strip_comments(content)
+     lines = content.splitlines()
++    stripped_lines = stripped.split("\n")
++    line_starts = [0]
++    for ln in stripped_lines[:-1]:
++        line_starts.append(line_starts[-1] + len(ln) + 1)
++    n_stripped_lines = len(stripped_lines)
+ 
+     # Extract imports
+     imports: List[str] = []
+@@ -704,8 +724,8 @@
+     for kind, pattern in decl_patterns:
+         for match in pattern.finditer(stripped):
+             name = match.group(1)
+-            line_no = stripped[:match.start()].count("\n") + 1
+-            match_line = stripped.split("\n")[line_no - 1].strip() if line_no <= len(stripped.split("\n")) else ""
++            line_no = bisect.bisect_right(line_starts, match.start())
++            match_line = stripped_lines[line_no - 1].strip() if line_no <= n_stripped_lines else ""
+             is_exported = match_line.startswith("export")
+ 
+             declarations.append({
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -30,21 +30,28 @@
+     android_manifest_entrypoints as _android_manifest_entrypoints,
+     candidate_targets as _candidate_targets,
+     classify_js_import_nature as classify_import_nature,
++    has_cli_shebang as _has_cli_shebang,
+     is_source_file as _is_source_file,
++    is_tool_config_file as _is_tool_config_file,
+     kotlin_is_generated_import as _kotlin_is_generated,
+     kotlin_is_internal_import as _kotlin_is_internal,
+     kotlin_module_candidates as _kotlin_module_candidates,
+     kotlin_package_of as _kotlin_package_of,
++    kotlin_same_package_declarations as _kotlin_same_package_declarations,
+     kotlin_source_root as _kotlin_source_root,
++    kotlin_strip_comments_and_strings as _kotlin_strip_comments_and_strings,
+     kotlin_top_level_names as _kotlin_top_level_names,
+     load_alias_rules as _load_alias_rules,
+     normalize_path as _normalize_path,
++    package_json_entrypoints as _package_json_entrypoints,
+     parse_kotlin_imports as _parse_kotlin_imports,
+     parse_python_imports,
+     parse_rust_imports as _parse_rust_imports,
++    pick_preferred_entrypoint as _pick_preferred_entrypoint,
+     python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
+     rust_cargo_package_name as _rust_cargo_package_name,
++    rust_manifest_entrypoints as _rust_manifest_entrypoints,
+     rust_module_path_of as _rust_module_path_of,
+     rust_top_level_names as _rust_top_level_names,
+     source_language,
+@@ -108,60 +115,107 @@
+                 
+     return symbols
+ 
+-def _find_semantic_usages(symbols: List[str], content: str) -> List[str]:
++_SEM_IDENT_REGEX = re.compile(r"^[A-Za-z0-9_]+$")
++_SEM_NEW_REGEX = re.compile(r"\bnew\s+([A-Za-z0-9_]+)\b")
++_SEM_CALL_REGEX = re.compile(r"\b([A-Za-z0-9_]+)\s*\(")
++_SEM_DEC_REGEX = re.compile(r"@([A-Za-z0-9_]+)\b")
++_SEM_COLON_TYPE_REGEX = re.compile(r":\s*([A-Za-z0-9_]+)\b")
++_SEM_ANGLE_TYPE_REGEX = re.compile(r"<([A-Za-z0-9_]+)>")
++_SEM_JSX_REGEX = re.compile(r"<([A-Za-z0-9_]+)\b")
++_SEM_INH_REGEX = re.compile(r"\b(?:extends|implements)\s+([A-Za-z0-9_]+)\b")
++_SEM_NS_REGEX = re.compile(r"\b([A-Za-z0-9_]+)\.")
++
++
++def _build_semantic_usage_index(
++    content: str,
++) -> Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], Set[str], Set[str]]:
++    return (
++        set(_SEM_NEW_REGEX.findall(content)),
++        set(_SEM_CALL_REGEX.findall(content)),
++        set(_SEM_DEC_REGEX.findall(content)),
++        set(_SEM_COLON_TYPE_REGEX.findall(content)) | set(_SEM_ANGLE_TYPE_REGEX.findall(content)),
++        set(_SEM_JSX_REGEX.findall(content)),
++        set(_SEM_INH_REGEX.findall(content)),
++        set(_SEM_NS_REGEX.findall(content)),
++    )
++
++
++def _find_semantic_usages(
++    symbols: List[str],
++    content: str,
++    _usage_index: Optional[
++        Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], Set[str], Set[str]]
++    ] = None,
++) -> List[str]:
++    if not symbols:
++        return []
++    s_new, s_call, s_dec, s_typ, s_jsx, s_inh, s_ns = (
++        _usage_index if _usage_index is not None else _build_semantic_usage_index(content)
++    )
+     usages = []
+     for sym in symbols:
+-        if not re.match(r'^[A-Za-z0-9_]+$', sym):
++        if not _SEM_IDENT_REGEX.match(sym):
+             continue
+-            
+-        if re.search(rf"\bnew\s+{sym}\b", content):
++
++        if sym in s_new:
+             usages.append(f"instantiated({sym})")
+-        elif re.search(rf"\b{sym}\s*\(", content):
+-            if re.search(rf"@{sym}\b", content):
++        elif sym in s_call:
++            if sym in s_dec:
+                 usages.append(f"decorator({sym})")
+             else:
+                 usages.append(f"called({sym})")
+-        elif re.search(rf":\s*{sym}\b", content) or re.search(rf":\s*Promise<{sym}>", content) or re.search(rf":\s*Observable<{sym}>", content) or re.search(rf"<{sym}>", content):
++        elif sym in s_typ:
+             usages.append(f"typed({sym})")
+-        elif re.search(rf"<{sym}\b", content):
++        elif sym in s_jsx:
+             usages.append(f"jsx_component({sym})")
+-        elif re.search(rf"\bextends\s+{sym}\b|\bimplements\s+{sym}\b", content):
++        elif sym in s_inh:
+             usages.append(f"inherited({sym})")
+-        elif re.search(rf"\b{sym}\.", content):
++        elif sym in s_ns:
+             usages.append(f"namespace_access({sym})")
+-            
++
+     return sorted(set(usages))
+ 
++
+ def parse_imports_with_nature(content: str, file_path: str = "") -> List[Dict[str, Any]]:
+-    if source_language(file_path) == "python":
++    lang = source_language(file_path)
++    if lang == "python":
+         return parse_python_imports(content)
+-    if source_language(file_path) == "kotlin":
++    if lang == "kotlin":
+         items = _parse_kotlin_imports(content)
+-        clean_content = _strip_comments(content)
+-        for item in items:
+-            item["semantic_usages"] = _find_semantic_usages(
+-                item.get("symbols", []), clean_content
+-            )
++        if items:
++            clean_content = _strip_comments(content)
++            usage_idx = _build_semantic_usage_index(clean_content)
++            for item in items:
++                item["semantic_usages"] = _find_semantic_usages(
++                    item.get("symbols", []), clean_content, usage_idx
++                )
+         return items
+-    if source_language(file_path) == "rust":
++    if lang == "rust":
+         items = _parse_rust_imports(content)
+-        clean_content = _strip_comments(content)
+-        for item in items:
+-            item["semantic_usages"] = _find_semantic_usages(
+-                item.get("symbols", []), clean_content
+-            )
++        if items:
++            clean_content = _strip_comments(content)
++            usage_idx = _build_semantic_usage_index(clean_content)
++            for item in items:
++                item["semantic_usages"] = _find_semantic_usages(
++                    item.get("symbols", []), clean_content, usage_idx
++                )
+         return items
+     clean_content = _strip_comments(content)
+     results: List[Dict[str, str]] = []
++    usage_idx: Optional[
++        Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], Set[str], Set[str]]
++    ] = None
+ 
+     for match in IMPORT_STATEMENT_REGEX.finditer(clean_content):
+         raw_path = match.group("path")
+         stmt = match.group("stmt") or ""
+         nature = classify_import_nature(stmt)
+-        
++
+         symbols = _extract_imported_symbols(stmt)
+-        usages = _find_semantic_usages(symbols, clean_content)
+-        
++        if symbols and usage_idx is None:
++            usage_idx = _build_semantic_usage_index(clean_content)
++        usages = _find_semantic_usages(symbols, clean_content, usage_idx) if symbols else []
++
+         results.append(
+             {
+                 "raw_import": raw_path,
+@@ -419,6 +473,8 @@
+     - Menangani utility types (Partial<T>, Readonly<T>, Pick<T, ...>, Omit<T, ...>)
+     - Menangani pewarisan interface (interface A extends B)
+     """
++    if "interface" not in content and "type" not in content:
++        return {}
+     clean = _strip_comments(content)
+     n = len(clean)
+     raw_shapes: Dict[str, Set[str]] = {}
+@@ -750,6 +806,9 @@
+     kotlin_packages: Set[str] = set()
+     kotlin_roots: List[str] = []
+     kotlin_symbol_index: Dict[Tuple[str, str], str] = {}
++    kotlin_file_packages: Dict[str, str] = {}
++    kotlin_same_pkg_raw: Dict[Tuple[str, str], Dict[str, str]] = {}
++    kotlin_stripped_map: Dict[str, str] = {}
+     for _fp in all_files:
+         if not _fp.endswith(".kt"):
+             continue
+@@ -757,11 +816,28 @@
+         _pkg = _kotlin_package_of(_content)
+         if _pkg:
+             kotlin_packages.add(_pkg)
++            kotlin_file_packages[_fp] = _pkg
+             _root = _kotlin_source_root(_fp, _pkg)
+             if _root and _root not in kotlin_roots:
+                 kotlin_roots.append(_root)
+             for _name in _kotlin_top_level_names(_content):
+                 kotlin_symbol_index.setdefault((_pkg, _name), _fp)
++            _stripped_kt = _kotlin_strip_comments_and_strings(_content)
++            kotlin_stripped_map[_fp] = _stripped_kt
++            for _sym, _skind in _kotlin_same_package_declarations(
++                _content, _stripped=_stripped_kt
++            ).items():
++                kotlin_same_pkg_raw.setdefault((_pkg, _sym), {})[_fp] = _skind
++
++    # Keep only unique (package, symbol) owners so duplicate-named top-level
++    # symbols across variant source roots (e.g. src/debug vs src/release) fail closed.
++    kotlin_same_pkg_index: Dict[str, List[Tuple[str, str, str]]] = {}
++    for (_pkg, _sym), _owners in kotlin_same_pkg_raw.items():
++        if len(_owners) == 1:
++            _owner_fp, _skind = next(iter(_owners.items()))
++            kotlin_same_pkg_index.setdefault(_pkg, []).append((_sym, _owner_fp, _skind))
++    for _pkg in kotlin_same_pkg_index:
++        kotlin_same_pkg_index[_pkg].sort()
+ 
+     # ============================================================
+     # PASS 1.5 (cont.): Rust module/symbol index (R1)
+@@ -800,14 +876,22 @@
+     # ============================================================
+     # PASS 2: Node metadata extraction
+     # ============================================================
+-    # G5a: AndroidManifest.xml entrypoints. The basename rules below
+-    # never match a Kotlin class name, so manifest-declared components
+-    # were reported orphan. Resolved name-only against the PASS 1.5
+-    # symbol index (unique match required); aliases never resolve.
++    all_files_set = set(all_files)
++    # G5a + Phase 3: AndroidManifest.xml, Cargo.toml, package.json, shebang, tool config entrypoints.
+     manifest_entrypoints = _android_manifest_entrypoints(
+         scan_root_norm,
+         [(fp, file_map[fp]) for fp in all_files if fp.endswith(".kt")],
+     )
++    rust_entrypoints = _rust_manifest_entrypoints(
++        scan_root_norm,
++        all_files_set,
++        ignore_dirs=ignore_dirs,
++    )
++    pkg_entrypoints = _package_json_entrypoints(
++        scan_root_norm,
++        all_files_set,
++        ignore_dirs=ignore_dirs,
++    )
+ 
+     node_metadata: Dict[str, Dict[str, Any]] = {}
+ 
+@@ -815,9 +899,35 @@
+         content = file_map[fp]
+         filename = os.path.basename(fp)
+ 
+-        is_entrypoint, ep_kind, ep_conf = _detect_entrypoint(filename)
+-        if fp in manifest_entrypoints:
+-            is_entrypoint, ep_kind, ep_conf = True, "android_manifest", 0.95
++        base_ep = _detect_entrypoint(filename)
++        manifest_ep = (
++            (True, "android_manifest", 0.95)
++            if fp in manifest_entrypoints
++            else (False, "none", 0.0)
++        )
++        rust_ep = (
++            (True, rust_entrypoints[fp][0], rust_entrypoints[fp][1])
++            if fp in rust_entrypoints
++            else (False, "none", 0.0)
++        )
++        pkg_ep = (
++            (True, pkg_entrypoints[fp][0], pkg_entrypoints[fp][1])
++            if fp in pkg_entrypoints
++            else (False, "none", 0.0)
++        )
++        shebang_ep = (
++            (True, "cli_shebang", 0.85)
++            if _has_cli_shebang(content)
++            else (False, "none", 0.0)
++        )
++        config_ep = (
++            (True, "tool_config_entry", 0.75)
++            if _is_tool_config_file(fp)
++            else (False, "none", 0.0)
++        )
++        is_entrypoint, ep_kind, ep_conf = _pick_preferred_entrypoint(
++            base_ep, manifest_ep, rust_ep, pkg_ep, shebang_ep, config_ep
++        )
+         is_test = _is_test_file(fp)
+         node_type = _classify_node(fp, content)
+ 
+@@ -832,7 +942,6 @@
+     # ============================================================
+     # PASS 3: Import resolution + graph construction
+     # ============================================================
+-    all_files_set = set(all_files)
+     edges: List[Tuple[str, str]] = []
+     resolved_imports: Dict[str, List[str]] = {}
+     unresolved_imports: List[Dict[str, Any]] = []
+@@ -1106,6 +1215,50 @@
+                         "attempted_candidates": attempted_candidates,
+                     })
+ 
++        # PASS 3b: Kotlin same-package symbol usage resolution.
++        # Files in the same Kotlin package can reference each other's
++        # non-private top-level declarations without an import statement.
++        # Marked import_nature="same_package" so topo.orphan / impact /
++        # test_reachability stay honest while topo.circular excludes them.
++        if fp.endswith(".kt"):
++            pkg = kotlin_file_packages.get(fp, "")
++            pkg_entries = kotlin_same_pkg_index.get(pkg)
++            if pkg and pkg_entries:
++                body_kt = kotlin_stripped_map.get(fp)
++                if body_kt is None:
++                    body_kt = _kotlin_strip_comments_and_strings(file_map.get(fp, ""))
++                body_kt = re.sub(
++                    r"^[ \t]*(?:package|import)\b[^\n]*",
++                    "",
++                    body_kt,
++                    flags=re.MULTILINE,
++                )
++                tokens = set(
++                    re.findall(r"(?<!::)(?<![.\w])[A-Za-z_][A-Za-z0-9_]*\b", body_kt)
++                )
++                explicit_set = set(resolved_targets)
++                same_pkg_targets: Set[str] = set()
++                for sym, target_fp, kind in pkg_entries:
++                    if target_fp == fp or target_fp in explicit_set:
++                        continue
++                    if sym not in tokens:
++                        continue
++                    if kind == "fun" and not re.search(
++                        rf"(?<!::)(?<![.\w]){re.escape(sym)}\s*\(",
++                        body_kt,
++                    ):
++                        continue
++                    same_pkg_targets.add(target_fp)
++                for target_fp in sorted(same_pkg_targets):
++                    edges.append((fp, target_fp))
++                    resolved_edge_natures.setdefault((fp, target_fp), []).append(
++                        "same_package"
++                    )
++                    resolved_edge_usages.setdefault((fp, target_fp), []).append(
++                        "same_package_ref"
++                    )
++                    resolved_targets.append(target_fp)
++
+         resolved_imports[fp] = resolved_targets
+ 
+     # Deduplicate edges
+@@ -1115,7 +1268,14 @@
+     for edge in edges:
+         u, v = edge
+         natures = resolved_edge_natures.get(edge, [])
+-        nature = "runtime" if "runtime" in natures else ("type_only" if natures else "runtime")
++        if "runtime" in natures:
++            nature = "runtime"
++        elif "type_only" in natures:
++            nature = "type_only"
++        elif "same_package" in natures:
++            nature = "same_package"
++        else:
++            nature = "runtime"
+         edge_natures[f"{u} -> {v}"] = nature
+ 
+     edge_details = [
+@@ -1152,18 +1312,20 @@
+     # ============================================================
+     type_shapes: Dict[str, Dict[str, List[str]]] = {}
+     known_global_shapes: Dict[str, Set[str]] = {}
++    shape_candidate_files: List[str] = []
+ 
+     for fp in all_files:
+         content = file_map[fp]
+         shapes = _extract_type_shapes(content)
+         if shapes:
++            shape_candidate_files.append(fp)
+             for sname, sprops in shapes.items():
+                 if sname not in known_global_shapes:
+                     known_global_shapes[sname] = set(sprops)
+                 else:
+                     known_global_shapes[sname].update(sprops)
+ 
+-    for fp in all_files:
++    for fp in shape_candidate_files:
+         content = file_map[fp]
+         shapes = _extract_type_shapes(content, known_shapes=known_global_shapes)
+         if shapes:
+@@ -1209,6 +1371,7 @@
+             "total_edges": len(edges),
+             "runtime_edge_count": sum(1 for (u, v) in edges if edge_natures.get(f"{u} -> {v}", "runtime") == "runtime"),
+             "type_only_edge_count": sum(1 for (u, v) in edges if edge_natures.get(f"{u} -> {v}", "runtime") == "type_only"),
++            "same_package_edge_count": sum(1 for (u, v) in edges if edge_natures.get(f"{u} -> {v}", "runtime") == "same_package"),
+             "total_boundaries": len(boundaries),
+             "total_type_shapes": sum(len(v) for v in type_shapes.values()),
+             "total_unresolved": len(unresolved_imports),
+--- a/core/target_topology.py
++++ b/core/target_topology.py
+@@ -255,7 +255,12 @@
+         for path, meta in node_metadata.items()
+         if int(meta.get("fan_in", 0) or 0) == 0 and int(meta.get("fan_out", 0) or 0) == 0
+     ]
+-    cyclic_sccs = _cyclic_sccs(vertices, edges)
++    edge_natures = shared_graph.get("edge_natures", {}) or {}
++    cycle_edges = [
++        edge for edge in edges
++        if edge_natures.get(f"{edge[0]} -> {edge[1]}", "runtime") != "same_package"
++    ]
++    cyclic_sccs = _cyclic_sccs(vertices, cycle_edges)
+ 
+     unresolved_sample = []
+     for item in unresolved[:top_n]:
+@@ -324,6 +329,7 @@
+             "internal_import_edges": int(summary.get("total_edges", len(edges)) or 0),
+             "runtime_edges": int(summary.get("runtime_edge_count", 0) or 0),
+             "type_only_edges": int(summary.get("type_only_edge_count", 0) or 0),
++            "same_package_edges": int(summary.get("same_package_edge_count", 0) or 0),
+             "entrypoints": int(summary.get("entrypoint_count", 0) or 0),
+             "tests": int(summary.get("test_file_count", 0) or 0),
+             "boundaries": int(summary.get("total_boundaries", len(boundaries)) or 0),

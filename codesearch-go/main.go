@@ -36,7 +36,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // buildCommit and buildDate are set at build time via -ldflags
@@ -54,7 +53,7 @@ func usage() string {
                   [--ext rs,py] [--exclude GLOBS] [--exclude-term T,..]
                   [--no-gitignore] [--once] [--json] [--plain]
                   [--per-file-cap N] [--all] [--defs-only] [--full]
-                  [--callers NAME] [--related NAME] [--version]
+                  [--callers NAME] [--related NAME] [--cached] [--version]
                   [--cache-dir DIR] [--index-status | --index-warm | --index-clean]
                   query [query ...]
 
@@ -101,11 +100,12 @@ callee's trailing name matches NAME's trailing name, as
 path:line: caller: line-text (caller is "-" at top level). Structural,
 not textual: it uses the tree-sitter AST, so pkg.Foo() matches a query
 for Foo and the enclosing function is reported. Languages: Go, Rust,
-Python, JavaScript (.js/.mjs/.cjs), TypeScript (.ts/.mts/.cts/.tsx),
+Python, JavaScript (.js/.mjs/.cjs/.jsx), TypeScript (.ts/.mts/.cts/.tsx),
 Kotlin (.kt).
 Name-based, not type-resolved. Takes no positional query; incompatible with --defs-only,
---all, --limit, --per-file-cap and --paths-only. The scan is always
-fresh (no BM25 index); --ext, --exclude and --no-gitignore apply, and
+--all, --limit, --per-file-cap and --paths-only. Scans fresh by default;
+pass --cached to answer from the synced gob index instead of re-parsing
+unchanged files. --ext, --exclude and --no-gitignore apply, and
 --json selects {"query":...,"total":N,"calls":[...]} output.
 Comma-separated names (--callers Foo,Bar) answer all of them in one
 scan; JSON then adds "batch":true and each call row still carries its
@@ -122,9 +122,9 @@ path:line: kind: detail with kind def, re-export, or ffi. The generated
 .d.ts is not parsed (often absent); the Rust source is the bridge's
 source of truth. Same mode rules as --callers: no positional query,
 incompatible with --defs-only, --all, --limit, --per-file-cap and
---paths-only, fresh scan, --json selects
-{"query":...,"total":N,"related":[...]} output. Comma-separated names
-(--related Foo,Bar) answer all of them in one scan; JSON then adds
+--paths-only, fresh scan by default or --cached to read the synced gob index,
+--json selects {"query":...,"total":N,"related":[...]} output. Comma-separated
+names (--related Foo,Bar) answer all of them in one scan; JSON then adds
 "batch":true and each row carries its "symbol", so the batch is the
 union of the individual runs.
 
@@ -290,6 +290,8 @@ func parseArgs(args []string) (options, error) {
 				return o, err
 			}
 			o.cacheDir = v
+		case "--cached":
+			o.cached = true
 		case "--index-status":
 			o.indexStatus = true
 		case "--index-warm":
@@ -372,19 +374,6 @@ func isEmptyQuery(q string) bool {
 	return false
 }
 
-// formatProof renders the shared proof-line accounting: content files
-// ("files", the searchable set), chunks, AST/fallback mix, skip buckets,
-// and manifest total. One definition across --once, rebuild, and cached
-// lines; content + skipped == manifest by construction (see
-// skipBreakdown). "Skipped" covers read-level skips only (oversize,
-// binary, overchars) — walk-level filtering (extensions, hidden dirs,
-// gitignore, excludes) is not counted here.
-func formatProof(ix *memIndex, content, oversize, binary, overchars, manifest int) string {
-	astF, fbF := ix.chunkingStats()
-	return fmt.Sprintf("%d files, %d chunks; chunking: AST %d files, fallback %d files; skipped %d (oversize %d, binary %d, overchars %d); manifest %d files",
-		content, ix.live, astF, fbF, oversize+binary+overchars, oversize, binary, overchars, manifest)
-}
-
 // versionLine is the single --version output line. Schema comes from the
 // schemaV constant (always true); commit/built come from ldflags and stay
 // "unknown" when the binary was built without them.
@@ -457,9 +446,9 @@ func run(args []string) int {
 		return 2
 	}
 
-	// --callers / --related are their own modes: a fresh AST scan, no
-	// BM25 index. Same rules for both; only the mode name in the
-	// error changes.
+	// --callers / --related are their own modes: fresh AST scan by
+	// default, or cached gob index lookup when --cached is set. Same
+	// rules for both; only the mode name in the error changes.
 	if o.callersSet && o.relatedSet {
 		fmt.Fprintln(os.Stderr, "codesearch: --related and --callers are mutually exclusive")
 		return 2
@@ -510,6 +499,9 @@ func checkQueryAndFlags(o options) error {
 	if o.all && (o.limitSet || o.perFileCapSet) {
 		return fmt.Errorf("--all is mutually exclusive with --limit and --per-file-cap")
 	}
+	if o.cached && o.once {
+		return fmt.Errorf("--cached and --once are mutually exclusive")
+	}
 	return nil
 }
 
@@ -547,76 +539,6 @@ func checkModeFlags(o options, mode string) error {
 		return fmt.Errorf("--%s is incompatible with --defs-only, --all, --limit, --per-file-cap and --paths-only", mode)
 	}
 	return nil
-}
-
-// loadIndex builds or syncs the BM25 index for root. --once builds in
-// memory only; otherwise the cached index is loaded, synced, and saved
-// back only when the sync changed something. Proof lines go to stderr,
-// exactly as before the split.
-func loadIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
-	if o.once {
-		return loadOnceIndex(root, cfg)
-	}
-	return loadCachedIndex(o, root, cfg)
-}
-
-func loadOnceIndex(root string, cfg *ScanConfig) (*memIndex, error) {
-	t0 := time.Now()
-	ix, st := buildFull(root, cfg)
-	fmt.Fprintf(os.Stderr, "(index built in memory: %s; in %s)\n",
-		formatProof(ix, st.content, st.oversize, st.binary, st.overchars, st.manifest), time.Since(t0).Round(time.Millisecond))
-	return ix, nil
-}
-
-func loadCachedIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
-	db := cachePath(root, cfg.key(), cacheBaseDir(o.cacheDir))
-	lock := db + ".lock"
-	var ix *memIndex
-	err := withLock(lock, func() error {
-		di, ok := loadDiskIndex(db)
-		if !ok {
-			t0 := time.Now()
-			var st buildStats
-			ix, st = buildFull(root, cfg)
-			if err := ix.save(db); err != nil {
-				return err
-			}
-			fmt.Fprintf(os.Stderr, "(index rebuilt: %s; in %s)\n",
-				formatProof(ix, st.content, st.oversize, st.binary, st.overchars, st.manifest), time.Since(t0).Round(time.Millisecond))
-			return nil
-		}
-		ix = memFromDisk(di)
-		t0 := time.Now()
-		a, m, d := ix.sync(root, cfg)
-		syncDur := time.Since(t0).Round(time.Millisecond)
-		if a+m+d > 0 {
-			if err := ix.save(db); err != nil {
-				return err
-			}
-		}
-		// Proof line, printed on EVERY cached run (not just on change):
-		// what index is in use, the freshness delta the sync just
-		// verified, and what the sync cost. This is what lets an agent
-		// trust the cache instead of paying a full --once rebuild.
-		// "Files" here means content files, the same definition as the
-		// --once and rebuild lines; skipped/manifest reconcile it.
-		content, ov, bi, oc, manifest := ix.skipBreakdown()
-		fmt.Fprintf(os.Stderr, "(index: %s; synced +%d ~%d -%d in %s)\n",
-			formatProof(ix, content, ov, bi, oc, manifest), a, m, d, syncDur)
-		return nil
-	})
-	// Found during the Tahap 3 split: the old inline code declared
-	// `ferr` but assigned withLock's result to `_`, so ferr was always
-	// nil and every cache error was silently ignored. The split keeps
-	// the observable behaviour for the case that matters — a save
-	// failure must not fail a search whose in-memory index is valid —
-	// but fixes the unsafe case: if the lock itself failed before any
-	// index was built, ix is nil and rendering it would panic, so
-	// that error is now returned (exit 1 in run) instead.
-	if err != nil && ix == nil {
-		return nil, err
-	}
-	return ix, nil
 }
 
 // renderResults renders search results for an already-loaded index.

@@ -1,0 +1,878 @@
+--- a/core/simplification_analyzer.py
++++ b/core/simplification_analyzer.py
+@@ -12,11 +12,14 @@
+ import os
+ import re
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Optional, Tuple
++from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
++
++from language_semantics import is_declaration_file, is_generated_or_vendored_asset
+ 
+ SIMPLIFICATION_SCHEMA_VERSION = "self-simplification-v14-js-structural-v2"
+ DEFAULT_IGNORES = {
+-    ".git", "__pycache__", "data", "node_modules", "dist", "coverage",
++    ".git", "__pycache__", "node_modules", "dist", "coverage",
++    "build", ".gradle", ".angular", "target",
+ }
+ 
+ 
+@@ -31,9 +34,15 @@
+ 
+ def _canonical_language_inventory(graph: Dict[str, Any]) -> Dict[str, Any]:
+     """Describe reference coverage separately from semantic-rule coverage."""
+-    suffix_counts = {".ts": 0, ".tsx": 0, ".js": 0, ".jsx": 0, ".py": 0, ".rs": 0, ".kt": 0}
++    suffix_counts = {
++        ".ts": 0, ".tsx": 0, ".js": 0, ".jsx": 0,
++        ".mjs": 0, ".cjs": 0, ".mts": 0, ".cts": 0,
++        ".py": 0, ".rs": 0, ".kt": 0,
++    }
+     for raw_path in graph.get("vertices", []) or []:
+         path = str(raw_path)
++        if is_declaration_file(path):
++            continue
+         for suffix in suffix_counts:
+             if path.endswith(suffix):
+                 suffix_counts[suffix] += 1
+@@ -45,6 +54,10 @@
+         ".tsx": "js_structural_v2",
+         ".js": "js_structural_v2",
+         ".jsx": "js_structural_v2",
++        ".mjs": "js_structural_v2",
++        ".cjs": "js_structural_v2",
++        ".mts": "js_structural_v2",
++        ".cts": "js_structural_v2",
+         ".rs": "rs_structural_v1",
+         ".kt": "kt_structural_v1",
+     }
+@@ -64,10 +77,15 @@
+     }
+ 
+ 
+-JS_SEMANTIC_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+-
+-
+-def _canonical_js_source_snapshot(graph: Dict[str, Any], root: Path) -> List[Tuple[str, str, str]]:
++JS_SEMANTIC_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
++
++
++def _canonical_js_source_snapshot(
++    graph: Dict[str, Any],
++    root: Path,
++    *,
++    excluded: Optional[Set[str]] = None,
++) -> List[Tuple[str, str, str]]:
+     """Return stable TS/JS source plus one shared length-preserving code mask."""
+     file_map = graph.get("file_map", {}) or {}
+     rows: List[Tuple[str, str, str]] = []
+@@ -75,7 +93,12 @@
+         path = str(raw_path)
+         source = file_map.get(raw_path)
+         if path.endswith(JS_SEMANTIC_EXTENSIONS) and isinstance(source, str):
+-            rows.append((_relative_graph_path(path, root), source, _mask_js_noncode(source)))
++            rel = _relative_graph_path(path, root)
++            if is_declaration_file(rel) or is_generated_or_vendored_asset(rel, source):
++                if excluded is not None:
++                    excluded.add(rel)
++                continue
++            rows.append((rel, source, _mask_js_noncode(source)))
+     rows.sort(key=lambda row: row[0])
+     return rows
+ 
+@@ -138,10 +161,242 @@
+     return "\n" not in value and "\r" not in value and (value[0] != "`" or "${" not in value)
+ 
+ 
++_CONTINUATION_OPERATORS = set("=,:?([{+-*/%&|!~^.<>")
++_CONTINUATION_KEYWORDS = {
++    "else", "return", "throw", "try", "do", "case", "yield", "await",
++}
++_CLAUSE_WITH_PAREN_KEYWORDS = {"if", "for", "while", "with", "catch", "switch", "when"}
++_TAIL_CONTINUATION_START_CHARS = set(".?:+-*/%&|^=<>)];}")
++_TAIL_CONTINUATION_KEYWORDS = ("as", "is", "in", "instanceof", "else")
++_INLINE_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
++
++
++def _extract_exact_forwarding_args(
++    source: str, masked: str, abs_start: int, abs_end: int,
++) -> Optional[List[str]]:
++    """Extract conservative plain-identifier forwarding argument tokens using masked + raw slices."""
++    args_src = source[abs_start:abs_end]
++    args_mask = masked[abs_start:abs_end]
++    if not args_src.strip() and not args_mask.strip():
++        return []
++    pieces: List[str] = []
++    last = 0
++    paren = bracket = brace = angle = 0
++    for idx, ch in enumerate(args_mask):
++        if ch == "(":
++            paren += 1
++        elif ch == ")":
++            if paren == 0:
++                return None
++            paren -= 1
++        elif ch == "[":
++            bracket += 1
++        elif ch == "]":
++            if bracket == 0:
++                return None
++            bracket -= 1
++        elif ch == "{":
++            brace += 1
++        elif ch == "}":
++            if brace == 0:
++                return None
++            brace -= 1
++        elif ch == "<":
++            angle += 1
++        elif ch == ">" and angle:
++            angle -= 1
++        elif ch == "," and paren == bracket == brace == angle == 0:
++            m_piece = args_mask[last:idx].strip()
++            s_piece = args_src[last:idx].strip()
++            if not m_piece or m_piece != s_piece:
++                return None
++            pieces.append(m_piece)
++            last = idx + 1
++    if paren or bracket or brace or angle:
++        return None
++    m_piece = args_mask[last:].strip()
++    s_piece = args_src[last:].strip()
++    if not m_piece or m_piece != s_piece:
++        return None
++    pieces.append(m_piece)
++    return pieces
++
++
++def _preceded_by_keyword(masked: str, pos: int, keyword: str) -> bool:
++    """Return True when *pos* is immediately preceded (modulo whitespace/masked comments) by *keyword*."""
++    idx = pos - 1
++    while idx >= 0 and masked[idx].isspace():
++        idx -= 1
++    start = idx - len(keyword) + 1
++    if start < 0 or masked[start:idx + 1] != keyword:
++        return False
++    if start > 0 and (masked[start - 1].isalnum() or masked[start - 1] in "_$"):
++        return False
++    return True
++
++
++def _leading_statement_boundary_ok(prefix_raw: str) -> bool:
++    """Reject brace-less clause headers (`if (...) return`) and expression continuations before a terminal."""
++    prefix = prefix_raw.rstrip()
++    if not prefix:
++        return True
++    last = prefix[-1]
++    if last in ";}":
++        return True
++    if last in _CONTINUATION_OPERATORS:
++        return False
++    had_newline = "\n" in prefix_raw[len(prefix):]
++    if last == ")":
++        if not had_newline:
++            return False
++        depth = 1
++        idx = len(prefix) - 2
++        while idx >= 0 and depth > 0:
++            if prefix[idx] == ")":
++                depth += 1
++            elif prefix[idx] == "(":
++                depth -= 1
++            idx -= 1
++        if depth != 0:
++            return False
++        while idx >= 0 and prefix[idx].isspace():
++            idx -= 1
++        if idx >= 0 and (prefix[idx].isalnum() or prefix[idx] in "_$"):
++            end_tok = idx + 1
++            while idx >= 0 and (prefix[idx].isalnum() or prefix[idx] in "_$"):
++                idx -= 1
++            word = prefix[idx + 1:end_tok]
++            if word in _CLAUSE_WITH_PAREN_KEYWORDS:
++                return False
++        return True
++    word_match = re.search(r"[A-Za-z_$][A-Za-z0-9_$]*$", prefix)
++    if word_match and word_match.group(0) in _CONTINUATION_KEYWORDS:
++        return False
++    return had_newline
++
++
++def _terminal_top_level_statement_kind(
++    masked_segment: str,
++    terminal_kinds: Tuple[str, ...],
++    *,
++    source_segment: str = "",
++) -> Optional[str]:
++    """Return the terminal keyword iff the final top-level statement in *masked_segment* is directly terminal."""
++    n = len(masked_segment)
++    brace = paren = bracket = 0
++    last_stmt: Optional[Tuple[str, int, int]] = None
++    i = 0
++    while i < n:
++        ch = masked_segment[i]
++        if ch == "{":
++            brace += 1
++        elif ch == "}":
++            brace -= 1
++        elif ch == "(":
++            paren += 1
++        elif ch == ")":
++            paren -= 1
++        elif ch == "[":
++            bracket += 1
++        elif ch == "]":
++            bracket -= 1
++        elif brace == paren == bracket == 0 and (ch.isalpha() or ch in "_$"):
++            j = i + 1
++            while j < n and (masked_segment[j].isalnum() or masked_segment[j] in "_$"):
++                j += 1
++            word = masked_segment[i:j]
++            if word in terminal_kinds:
++                last_stmt = (word, i, j)
++            i = j
++            continue
++        if brace < 0 or paren < 0 or bracket < 0:
++            return None
++        i += 1
++    if brace != 0 or paren != 0 or bracket != 0 or last_stmt is None:
++        return None
++    kind, stmt_start, stmt_kw_end = last_stmt
++    if not _leading_statement_boundary_ok(masked_segment[:stmt_start]):
++        return None
++    src = source_segment if len(source_segment) == n else masked_segment
++    brace = paren = bracket = 0
++    saw_expr_token = False
++    line_last_nonspace = ""
++    cur_line_start = stmt_kw_end
++    for k in range(stmt_kw_end, n):
++        ch = masked_segment[k]
++        if ch == ";":
++            if brace == paren == bracket == 0:
++                return kind if not masked_segment[k + 1:].strip() else None
++            saw_expr_token = True
++            line_last_nonspace = ch
++        elif ch == "\n":
++            if brace == paren == bracket == 0:
++                rest = masked_segment[k + 1:].lstrip()
++                if not rest:
++                    return kind
++                expr_so_far = saw_expr_token or bool(_INLINE_COMMENT_RE.sub("", src[stmt_kw_end:k]).strip())
++                if not expr_so_far:
++                    return None
++                if not line_last_nonspace or line_last_nonspace not in _CONTINUATION_OPERATORS:
++                    line_word = re.search(r"([A-Za-z_]+)\s*$", masked_segment[cur_line_start:k])
++                    if not (line_word and line_word.group(1) in _TAIL_CONTINUATION_KEYWORDS):
++                        if rest[0] not in _TAIL_CONTINUATION_START_CHARS:
++                            kw_cont = re.match(r"([A-Za-z_]+)\b", rest)
++                            if not kw_cont or kw_cont.group(1) not in _TAIL_CONTINUATION_KEYWORDS:
++                                return None
++            cur_line_start = k + 1
++            line_last_nonspace = ""
++        elif not ch.isspace():
++            saw_expr_token = True
++            line_last_nonspace = ch
++        if ch == "{":
++            brace += 1
++        elif ch == "}":
++            brace -= 1
++        elif ch == "(":
++            paren += 1
++        elif ch == ")":
++            paren -= 1
++        elif ch == "[":
++            bracket += 1
++        elif ch == "]":
++            bracket -= 1
++        if brace < 0 or paren < 0 or bracket < 0:
++            return None
++    if brace or paren or bracket:
++        return None
++    return kind
++
++
+ def _terminal_js_return(source: str, masked: str, body_start: int, body_end: int) -> Optional[Dict[str, Any]]:
+     segment = masked[body_start:body_end]
++    raw_segment = source[body_start:body_end]
++    if _terminal_top_level_statement_kind(segment, ("return",), source_segment=raw_segment) != "return":
++        return None
+     match = re.search(r"\breturn\b(?P<expr>[^;{}]*)\;\s*$", segment, flags=re.S)
+     if not match or re.search(r"\breturn\b", segment[:match.start()]):
++        return None
++    brace = paren = bracket = 0
++    for idx, ch in enumerate(segment):
++        if idx == match.start() and (brace or paren or bracket):
++            return None
++        if ch == "{":
++            brace += 1
++        elif ch == "}":
++            brace -= 1
++        elif ch == "(":
++            paren += 1
++        elif ch == ")":
++            paren -= 1
++        elif ch == "[":
++            bracket += 1
++        elif ch == "]":
++            bracket -= 1
++        if brace < 0 or paren < 0 or bracket < 0:
++            return None
++    if brace or paren or bracket:
++        return None
++    if not _leading_statement_boundary_ok(segment[:match.start()]):
+         return None
+     raw_expr = source[body_start + match.start("expr"):body_start + match.end("expr")].strip()
+     if not _js_nonthrowing_literal(raw_expr):
+@@ -246,7 +501,7 @@
+     """Find a terminal ``const x = <literal>; return x;`` using the shared mask."""
+     candidates: List[Dict[str, Any]] = []
+     pattern = re.compile(
+-        r"\bconst\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:\s*[^=;{}]+)?\s*=(?P<expr>[^;{}]+);"
++        r"\bconst\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:\s*[^\s=;{}][^=;{}]*)?\s*=(?P<expr>[^;{}]+);"
+         r"\s*return\s+(?P=name)\s*;"
+     )
+     for rel, source, masked in sources:
+@@ -551,16 +806,22 @@
+         params = fn.get("params")
+         if params is None or fn.get("async"):
+             continue
+-        body_mask = fn["masked"][fn["body_open"] + 1:fn["body_close"]].strip()
++        body_start = fn["body_open"] + 1
++        body_mask = fn["masked"][body_start:fn["body_close"]]
+         match = re.fullmatch(
+-            r"return\s+(?P<callee>[A-Za-z_$][A-Za-z0-9_$]*)\s*\((?P<args>[^;{}()]*)\)\s*;?",
++            r"\s*return\s+(?P<callee>[A-Za-z_$][A-Za-z0-9_$]*)\s*\((?P<args>[^;{}()]*)\)\s*;?\s*",
+             body_mask,
+             flags=re.S,
+         )
+         if not match or match.group("callee") == fn["name"]:
+             continue
+-        raw_args = [item.strip() for item in match.group("args").split(",") if item.strip()]
+-        if raw_args != list(params):
++        raw_args = _extract_exact_forwarding_args(
++            fn["source"],
++            fn["masked"],
++            body_start + match.start("args"),
++            body_start + match.end("args"),
++        )
++        if raw_args is None or raw_args != list(params):
+             continue
+         private = bool(fn["private"])
+         candidates.append(_candidate(
+@@ -633,6 +894,11 @@
+     candidates: List[Dict[str, Any]] = []
+     for rel, source, masked in sources:
+         for match in re.finditer(r"\bif\s*\(", masked):
++            if (
++                _preceded_by_keyword(masked, match.start(), "else")
++                or _preceded_by_keyword(masked, match.start(), "return")
++            ):
++                continue
+             cond_open = masked.find("(", match.start(), match.end())
+             cond_close = _matching_js_delimiter(masked, cond_open, "(", ")")
+             if cond_close < 0:
+@@ -643,12 +909,17 @@
+             then_close = _matching_js_brace(masked, then_open)
+             if then_close < 0:
+                 continue
+-            then_body = masked[then_open + 1:then_close].strip()
+-            terminal = re.search(r"(?:^|;)\s*(?P<kind>return|throw)\b[\s\S]*;?\s*$", then_body)
+-            if not terminal:
++            terminal_kind = _terminal_top_level_statement_kind(
++                masked[then_open + 1:then_close],
++                ("return", "throw"),
++                source_segment=source[then_open + 1:then_close],
++            )
++            if terminal_kind is None:
+                 continue
+             cursor = _skip_js_space(masked, then_close + 1)
+             if not masked.startswith("else", cursor):
++                continue
++            if cursor + 4 < len(masked) and (masked[cursor + 4].isalnum() or masked[cursor + 4] in "_$"):
+                 continue
+             else_open = _skip_js_space(masked, cursor + 4)
+             if else_open >= len(masked) or masked[else_open] != "{":
+@@ -661,11 +932,12 @@
+             candidates.append(_js_candidate_row(
+                 rel=rel, masked=masked, position=match.start(), line_start=line_start, line_end=line_end,
+                 kind="js_redundant_else_after_terminal",
+-                identity={"terminal": terminal.group("kind"), "else_line": source.count("\n", 0, cursor) + 1},
++                identity={"terminal": terminal_kind, "else_line": source.count("\n", 0, cursor) + 1},
+                 witness={
+                     "type": "js_redundant_else_after_terminal_v2", "same_owner_file": True,
+-                    "then_block_directly_terminal": True, "terminal_kind": terminal.group("kind"),
++                    "then_block_directly_terminal": True, "terminal_kind": terminal_kind,
+                     "else_is_braced": True, "else_if_excluded": True,
++                    "else_if_chain_inner_if_excluded": True,
+                     "condition_evaluation_preserved": True, "else_block_scope_must_be_preserved": True,
+                     "authority": "bounded_js_structural_control_flow_witness_only",
+                 },
+@@ -808,7 +1080,7 @@
+     """Broaden terminal-temporary detection beyond literals without inferred-name traps."""
+     candidates: List[Dict[str, Any]] = []
+     pattern = re.compile(
+-        r"\bconst\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?P<expr>[^;{}]+);"
++        r"\bconst\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?P<expr>[^\s;{}][^;{}]*);"
+         r"\s*return\s+(?P=name)\s*;"
+     )
+     for rel, source, masked in sources:
+@@ -1029,7 +1301,12 @@
+ 
+ 
+ def _canonical_brace_source_snapshot(
+-    graph: Dict[str, Any], root: Path, extensions: Tuple[str, ...], mask_fn,
++    graph: Dict[str, Any],
++    root: Path,
++    extensions: Tuple[str, ...],
++    mask_fn,
++    *,
++    excluded: Optional[Set[str]] = None,
+ ) -> List[Tuple[str, str, str]]:
+     """Return stable brace-language source plus one shared length-preserving code mask."""
+     file_map = graph.get("file_map", {}) or {}
+@@ -1038,17 +1315,36 @@
+         path = str(raw_path)
+         source = file_map.get(raw_path)
+         if path.endswith(extensions) and isinstance(source, str):
+-            rows.append((_relative_graph_path(path, root), source, mask_fn(source)))
++            rel = _relative_graph_path(path, root)
++            if is_declaration_file(rel) or is_generated_or_vendored_asset(rel, source):
++                if excluded is not None:
++                    excluded.add(rel)
++                continue
++            rows.append((rel, source, mask_fn(source)))
+     rows.sort(key=lambda row: row[0])
+     return rows
+ 
+ 
+-def _canonical_rs_source_snapshot(graph: Dict[str, Any], root: Path) -> List[Tuple[str, str, str]]:
+-    return _canonical_brace_source_snapshot(graph, root, RS_SEMANTIC_EXTENSIONS, _mask_rs_noncode)
+-
+-
+-def _canonical_kt_source_snapshot(graph: Dict[str, Any], root: Path) -> List[Tuple[str, str, str]]:
+-    return _canonical_brace_source_snapshot(graph, root, KT_SEMANTIC_EXTENSIONS, _mask_kt_noncode)
++def _canonical_rs_source_snapshot(
++    graph: Dict[str, Any],
++    root: Path,
++    *,
++    excluded: Optional[Set[str]] = None,
++) -> List[Tuple[str, str, str]]:
++    return _canonical_brace_source_snapshot(
++        graph, root, RS_SEMANTIC_EXTENSIONS, _mask_rs_noncode, excluded=excluded,
++    )
++
++
++def _canonical_kt_source_snapshot(
++    graph: Dict[str, Any],
++    root: Path,
++    *,
++    excluded: Optional[Set[str]] = None,
++) -> List[Tuple[str, str, str]]:
++    return _canonical_brace_source_snapshot(
++        graph, root, KT_SEMANTIC_EXTENSIONS, _mask_kt_noncode, excluded=excluded,
++    )
+ 
+ 
+ def _split_top_level_commas(code: str) -> List[str]:
+@@ -1260,6 +1556,68 @@
+     return records
+ 
+ 
++_KT_FUNCTION_MODIFIERS = {
++    "public", "private", "protected", "internal", "open", "override",
++    "suspend", "inline", "tailrec", "operator", "infix", "external",
++    "actual", "expect", "abstract",
++}
++
++
++def _preceding_kt_annotations(masked: str, pos: int) -> Tuple[List[str], Set[str]]:
++    """Collect adjacent preceding Kotlin @Annotations and modifier keywords."""
++    annotations: List[str] = []
++    extra_mods: Set[str] = set()
++    idx = pos - 1
++    while idx >= 0:
++        while idx >= 0 and masked[idx].isspace():
++            idx -= 1
++        if idx < 0:
++            break
++        if masked[idx] == ")":
++            depth = 1
++            idx -= 1
++            while idx >= 0 and depth > 0:
++                if masked[idx] == ")":
++                    depth += 1
++                elif masked[idx] == "(":
++                    depth -= 1
++                idx -= 1
++            if depth != 0:
++                break
++            while idx >= 0 and masked[idx].isspace():
++                idx -= 1
++            if idx < 0:
++                break
++            end_tok = idx + 1
++            while idx >= 0 and (masked[idx].isalnum() or masked[idx] in "_.:"):
++                idx -= 1
++            if idx >= 0 and masked[idx] == "@":
++                ann = masked[idx + 1:end_tok].split(":")[-1]
++                if ann:
++                    annotations.append(ann)
++                idx -= 1
++                continue
++            break
++        if masked[idx].isalnum() or masked[idx] in "_.":
++            end_tok = idx + 1
++            while idx >= 0 and (masked[idx].isalnum() or masked[idx] in "_.:"):
++                idx -= 1
++            token = masked[idx + 1:end_tok]
++            if idx >= 0 and masked[idx] == "@":
++                ann = token.split(":")[-1]
++                if ann:
++                    annotations.append(ann)
++                idx -= 1
++                continue
++            if token in _KT_FUNCTION_MODIFIERS:
++                extra_mods.add(token)
++                continue
++            break
++        break
++    annotations.reverse()
++    return annotations, extra_mods
++
++
+ def _kt_function_records(*, sources: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
+     """Discover Kotlin functions: block bodies and single-line ``=`` bodies."""
+     records: List[Dict[str, Any]] = []
+@@ -1316,7 +1674,16 @@
+             params = _kt_simple_parameter_names(source, masked, params_open, params_close)
+             name = match.group("name")
+             mods = match.group("mods") or ""
+-            private = "private" in mods.split()
++            annotations, extra_mods = _preceding_kt_annotations(masked, match.start())
++            mods_set = set(mods.split()) | extra_mods
++            private = "private" in mods_set
++            is_override = "override" in mods_set
++            is_test_fn = any(
++                ann == "Test"
++                or ann.endswith(".Test")
++                or ann in {"ParameterizedTest", "RepeatedTest", "TestFactory", "TestTemplate"}
++                for ann in annotations
++            )
+             records.append({
+                 "file": rel, "source": source, "masked": masked, "name": name,
+                 "start": match.start(), "params_open": params_open, "params_close": params_close,
+@@ -1327,6 +1694,9 @@
+                 "async": False, "form": "function" if form == "block" else "expression",
+                 "expr_start": expr_start, "expr_end": expr_end,
+                 "expr_continues": expr_continues if form == "expr" else False,
++                "annotations": annotations,
++                "is_override": is_override,
++                "is_test_fn": is_test_fn,
+             })
+     records.sort(key=lambda row: (row["file"], row["start"], row["name"]))
+     return records
+@@ -1438,6 +1808,16 @@
+         params = fn.get("params")
+         if params is None or fn.get("async"):
+             continue
++        if lang == "kt":
++            if fn.get("is_override") or fn.get("is_test_fn"):
++                continue
++            norm_file = f"/{str(fn['file']).replace(chr(92), '/').lower()}"
++            if (
++                "/src/test/" in norm_file
++                or "/src/androidtest/" in norm_file
++                or "/src/commontest/" in norm_file
++            ):
++                continue
+         forward_params = [p for p in params if p != "self"]
+         callee: Optional[str] = None
+         if fn["form"] == "expression":
+@@ -1446,42 +1826,58 @@
+             # forwarding call; _kt_function_records flags it.
+             if fn.get("expr_continues"):
+                 continue
+-            body_text = fn["source"][fn["expr_start"]:fn["expr_end"]].strip()
++            expr_start = fn["expr_start"]
++            expr_mask = fn["masked"][expr_start:fn["expr_end"]]
+             match = re.fullmatch(
+-                r"(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)",
+-                body_text, flags=re.S,
++                r"\s*(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)\s*",
++                expr_mask, flags=re.S,
+             )
+             if not match:
+                 continue
+             callee = match.group("callee")
+-            raw_args = [item.strip() for item in match.group("args").split(",") if item.strip()]
++            raw_args = _extract_exact_forwarding_args(
++                fn["source"],
++                fn["masked"],
++                expr_start + match.start("args"),
++                expr_start + match.end("args"),
++            )
+         else:
+-            body_mask = fn["masked"][fn["body_open"] + 1:fn["body_close"]].strip()
++            body_start = fn["body_open"] + 1
++            body_mask = fn["masked"][body_start:fn["body_close"]]
+             if lang == "rs":
+                 callee_pattern = (
+                     r"(?P<callee>[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?)"
+                 )
+                 match = re.fullmatch(
+-                    r"return\s+" + callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)\s*;?",
++                    r"\s*return\s+" + callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)\s*;?\s*",
+                     body_mask, flags=re.S,
+                 )
+                 if not match:
+                     match = re.fullmatch(
+-                        callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)",
++                        r"\s*" + callee_pattern + r"\s*\((?P<args>[^;{}()]*)\)\s*",
+                         body_mask, flags=re.S,
+                     )
+             else:
+                 match = re.fullmatch(
+-                    r"return\s+(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)\s*;?",
++                    r"\s*return\s+(?P<callee>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^;{}()]*)\)\s*;?\s*",
+                     body_mask, flags=re.S,
+                 )
+             if not match:
+                 continue
+             callee = re.sub(r"\s+", "", match.group("callee"))
+-            raw_args = [item.strip() for item in match.group("args").split(",") if item.strip()]
++            raw_args = _extract_exact_forwarding_args(
++                fn["source"],
++                fn["masked"],
++                body_start + match.start("args"),
++                body_start + match.end("args"),
++            )
+         if not callee or callee.split(".")[-1] == fn["name"]:
+             continue
+-        if raw_args != list(forward_params):
++        if lang == "kt":
++            leaf = callee.split(".")[-1]
++            if leaf and leaf[0].isupper():
++                continue
++        if raw_args is None or raw_args != list(forward_params):
+             continue
+         private = bool(fn["private"])
+         is_self_callee = "." in callee
+@@ -1562,10 +1958,10 @@
+ 
+     Two guards beyond the JS rule, because Rust/Kotlin ``if`` can be an
+     expression: (1) the ``if`` must be in statement position (the previous
+-    non-space character is not ``= ( [ ,`` and it is not preceded by
+-    ``return`` or by ``else`` for an ``else if`` chain); (2) the ``else``
+-    block must not end in a bare tail expression, which would be the value
+-    of an expression-position ``if``.
++    non-space character is not ``= ( [ , :`` or ``->`` and it is not
++    preceded by ``return`` or by ``else`` for an ``else if`` chain); (2) the
++    ``else`` block must not end in a bare tail expression, which would be the
++    value of an expression-position ``if``.
+     """
+     kind = f"{lang}_redundant_else_after_terminal"
+     candidates: List[Dict[str, Any]] = []
+@@ -1573,16 +1969,20 @@
+     for fn in records_fn(sources=sources):
+         records_by_file.setdefault(fn["file"], []).append(fn)
+     terminal_kinds = ("return", "throw") if lang == "kt" else ("return",)
+-    terminal_pattern = r"(?:^|;)\s*(?P<kind>" + "|".join(terminal_kinds) + r")\b[\s\S]*;?\s*$"
+     for rel, source, masked in sources:
+         for match in re.finditer(r"\bif\b", masked):
+             prev = match.start() - 1
+             while prev >= 0 and masked[prev].isspace():
+                 prev -= 1
+-            if prev >= 0 and masked[prev] in "=([,":
+-                continue
+-            before = masked[max(0, match.start() - 16):match.start()]
+-            if re.search(r"\breturn\s*$", before) or re.search(r"\belse\s*$", before):
++            if prev >= 0 and (
++                masked[prev] in "=([,:"
++                or masked[max(0, prev - 1):prev + 1] == "->"
++            ):
++                continue
++            if (
++                _preceded_by_keyword(masked, match.start(), "return")
++                or _preceded_by_keyword(masked, match.start(), "else")
++            ):
+                 continue
+             pos = match.end()
+             paren = bracket = angle = 0
+@@ -1609,13 +2009,18 @@
+             then_close = _matching_js_brace(masked, then_open)
+             if then_close < 0:
+                 continue
+-            then_body = masked[then_open + 1:then_close].strip()
+-            terminal = re.search(terminal_pattern, then_body)
+-            if not terminal:
++            terminal_kind = _terminal_top_level_statement_kind(
++                masked[then_open + 1:then_close],
++                terminal_kinds,
++                source_segment=source[then_open + 1:then_close],
++            )
++            if terminal_kind is None:
+                 continue
+             cursor = _skip_js_space(masked, then_close + 1)
+             if not masked.startswith("else", cursor):
+                 continue
++            if cursor + 4 < len(masked) and (masked[cursor + 4].isalnum() or masked[cursor + 4] in "_$"):
++                continue
+             else_open = _skip_js_space(masked, cursor + 4)
+             if else_open >= len(masked) or masked[else_open] != "{":
+                 continue
+@@ -1623,9 +2028,11 @@
+             if else_close < 0:
+                 continue
+             else_body = masked[else_open + 1:else_close].strip()
+-            if else_body and not else_body.endswith(";") and not re.search(
+-                r"\breturn\b[\s\S]*;?\s*$", else_body
+-            ):
++            if else_body and not else_body.endswith(";") and _terminal_top_level_statement_kind(
++                masked[else_open + 1:else_close],
++                terminal_kinds,
++                source_segment=source[else_open + 1:else_close],
++            ) is None:
+                 continue
+             line_start = source.count("\n", 0, match.start()) + 1
+             line_end = source.count("\n", 0, else_close) + 1
+@@ -1638,10 +2045,10 @@
+             candidates.append(_brace_candidate_row(
+                 rel=rel, name=enclosing, line_start=line_start, line_end=line_end,
+                 kind=kind,
+-                identity={"terminal": terminal.group("kind"), "else_line": source.count("\n", 0, cursor) + 1},
++                identity={"terminal": terminal_kind, "else_line": source.count("\n", 0, cursor) + 1},
+                 witness={
+                     "type": f"{lang}_redundant_else_after_terminal_v1", "same_owner_file": True,
+-                    "then_block_directly_terminal": True, "terminal_kind": terminal.group("kind"),
++                    "then_block_directly_terminal": True, "terminal_kind": terminal_kind,
+                     "else_is_braced": True, "else_if_excluded": True,
+                     "else_if_chain_inner_if_excluded": True,
+                     "statement_position_if_only": True, "else_block_value_free": True,
+@@ -1681,7 +2088,11 @@
+     return _brace_redundant_else_after_terminal_candidates(sources=sources, lang="kt", records_fn=_kt_function_records)
+ 
+ 
+-def _canonical_python_source_snapshot(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, str]]]:
++def _canonical_python_source_snapshot(
++    root: Path,
++    *,
++    excluded: Optional[Set[str]] = None,
++) -> Tuple[Dict[str, Any], List[Tuple[str, str]]]:
+     """Return Python sources from the canonical SharedGraph discovery snapshot.
+ 
+     Simplification owns semantic rules, not filesystem discovery.  The graph
+@@ -1708,7 +2119,12 @@
+         source = file_map.get(raw_path)
+         if not isinstance(source, str):
+             continue
+-        sources.append((_relative_graph_path(path, root), source))
++        rel = _relative_graph_path(path, root)
++        if is_generated_or_vendored_asset(rel, source):
++            if excluded is not None:
++                excluded.add(rel)
++            continue
++        sources.append((rel, source))
+     sources.sort(key=lambda row: row[0])
+     return graph, sources
+ 
+@@ -2604,10 +3020,11 @@
+         "classes": 0,
+     }
+ 
+-    graph, source_snapshot = _canonical_python_source_snapshot(root_path)
+-    js_source_snapshot = _canonical_js_source_snapshot(graph, root_path)
+-    rs_source_snapshot = _canonical_rs_source_snapshot(graph, root_path)
+-    kt_source_snapshot = _canonical_kt_source_snapshot(graph, root_path)
++    excluded_generated: Set[str] = set()
++    graph, source_snapshot = _canonical_python_source_snapshot(root_path, excluded=excluded_generated)
++    js_source_snapshot = _canonical_js_source_snapshot(graph, root_path, excluded=excluded_generated)
++    rs_source_snapshot = _canonical_rs_source_snapshot(graph, root_path, excluded=excluded_generated)
++    kt_source_snapshot = _canonical_kt_source_snapshot(graph, root_path, excluded=excluded_generated)
+     language_inventory = _canonical_language_inventory(graph)
+     for rel, source in source_snapshot:
+         try:
+@@ -2853,6 +3270,7 @@
+     detector_metrics["estimated_removable_kt_redundant_else_loc"] = sum(int(g.get("estimated_removable_loc", 0)) for g in kt_redundant_else_candidates)
+     detector_metrics["kt_semantic_files_scanned"] = len(kt_source_snapshot)
+     detector_metrics["kt_semantic_source_loc"] = sum(len(source.splitlines()) for _, source, _ in kt_source_snapshot)
++    detector_metrics["generated_files_excluded"] = len(excluded_generated)
+     return {
+         "schema_version": SIMPLIFICATION_SCHEMA_VERSION,
+         "root": ".",
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -126,8 +126,57 @@
+     return EXPERIMENTAL_SOURCE_EXTENSIONS if include_python else SOURCE_EXTENSIONS
+ 
+ 
++DECLARATION_FILE_EXTENSIONS = (".d.ts", ".d.mts", ".d.cts")
++_MINIFIED_ASSET_EXTENSIONS = (".min.js", ".min.mjs", ".min.cjs", ".min.css")
++_GENERATED_HEADER_MARKERS = (
++    "/* @ts-self-types=",
++    "@generated",
++    "Code generated",
++    "DO NOT EDIT",
++    "Generated by ",
++    "auto-generated",
++    "Auto-generated",
++    "this.__wbg_ptr",
++    "wasm.__wbg_",
++    "__wbindgen_",
++)
++
++
++def is_declaration_file(filename: str) -> bool:
++    return str(filename).lower().endswith(DECLARATION_FILE_EXTENSIONS)
++
++
++def is_generated_or_vendored_asset(rel_path: str, content: str = "") -> bool:
++    """Return True for declaration files, static public assets, minified bundles, and generated glue.
++
++    Deliberately excludes bare ``"wasm-bindgen"`` so hand-written adapter wrappers
++    that mention wasm-bindgen in JSDoc comments (for example ``node.mjs``) remain
++    in scope.
++    """
++    norm = normalize_path(str(rel_path)).lstrip("./")
++    lower = norm.lower()
++    if is_declaration_file(lower):
++        return True
++    if lower == "public/assets" or lower.startswith("public/assets/") or "/public/assets/" in lower:
++        return True
++    if lower.endswith(_MINIFIED_ASSET_EXTENSIONS):
++        return True
++    if content:
++        if lower.endswith(".py"):
++            py_markers = ("@generated", "Code generated", "DO NOT EDIT", "Generated by ", "auto-generated", "Auto-generated")
++            for line in content.splitlines()[:25]:
++                stripped = line.strip()
++                if stripped.startswith("#") and any(marker in stripped for marker in py_markers):
++                    return True
++        else:
++            head = content[:8192]
++            if any(marker in head for marker in _GENERATED_HEADER_MARKERS):
++                return True
++    return False
++
++
+ def is_source_file(filename: str, *, include_python: bool = False) -> bool:
+-    if filename.endswith(".d.ts"):
++    if is_declaration_file(filename):
+         return False
+     return filename.endswith(source_extensions(include_python=include_python))
+ 
+@@ -899,6 +948,7 @@
+ 
+ 
+ __all__ = [
++    "DECLARATION_FILE_EXTENSIONS",
+     "JS_RESOLUTION_EXTENSIONS",
+     "JS_SOURCE_EXTENSIONS",
+     "KOTLIN_RESOLUTION_EXTENSIONS",
+@@ -909,6 +959,8 @@
+     "RUST_STDLIB_CRATES",
+     "SOURCE_EXTENSIONS",
+     "EXPERIMENTAL_SOURCE_EXTENSIONS",
++    "is_declaration_file",
++    "is_generated_or_vendored_asset",
+     "is_tool_implementation_path",
+     "source_path_allowed",
+     "source_extensions",

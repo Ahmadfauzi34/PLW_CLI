@@ -85,6 +85,9 @@ var callLangs = []callLang{
 	{".tsx", grammars.TsxLanguage, `[
 		(call_expression function: (_) @callee) @call
 	]`},
+	{".jsx", grammars.TsxLanguage, `[
+		(call_expression function: (_) @callee) @call
+	]`},
 	{".kt", grammars.KotlinLanguage, ktCallQuery},
 }
 
@@ -172,6 +175,7 @@ var callerDefLangs = []callLang{
 	{".mts", grammars.TypescriptLanguage, tsDefQuery},
 	{".cts", grammars.TypescriptLanguage, tsDefQuery},
 	{".tsx", grammars.TsxLanguage, tsDefQuery},
+	{".jsx", grammars.TsxLanguage, tsDefQuery},
 }
 
 var callerDefSpecStore = newSpecStore[callSpec]()
@@ -236,6 +240,9 @@ func extractCalls(relPath, text string) ([]callSite, bool) {
 	// Normalize line endings exactly like chunkLines, so byte offsets
 	// from the parser and our line numbers agree.
 	norm := strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+	if isGeneratedOrMinified(relPath, norm, maxLineLenOf(norm)) {
+		return nil, false
+	}
 	src := []byte(norm)
 	lines := strings.Split(norm, "\n")
 	// Shared byte-offset -> line mapping (related.go).
@@ -392,59 +399,78 @@ func runCallers(o options, root string, cfg *ScanConfig) int {
 		fmt.Fprintln(os.Stderr, "codesearch: --callers requires a non-empty name")
 		return 2
 	}
-	files := iterFiles(root, cfg)
 	var sites []callSite
-	// Skip taxonomy, in the order the scan itself encounters them:
-	// readSource failure -> readSource skip -> unsupported language ->
-	// AST oversize -> parse failure or parse timeout. Buckets are
-	// disjoint; parsed + skipped == len(files). A file with an
-	// unsupported extension AND a readSource skip counts as source-skip
-	// (the haveText gate runs before extractCalls), never double-counted.
-	// The timeout bounds one file, not the run: a repo full of
-	// pathological files still sums (worst case N x 5s). Leaked timeout
-	// goroutines hold at most maxASTBytes (oversize is filtered first).
-	var parsed, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable int
-	t0 := time.Now()
-	for _, rel := range files {
-		fr := readSource(root, rel)
-		if !fr.statOK {
-			unreadable++
-			continue
+	if o.cached {
+		ix, err := loadCachedIndex(o, root, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "codesearch:", err)
+			return 1
 		}
-		if fr.skip != "" {
-			sourceSkip++
-			continue
-		}
-		if _, ok := getCallSpec(extOf(rel)); !ok {
-			unsupported++
-			continue
-		}
-		if len(fr.text) > maxASTBytes {
-			astOversize++
-			continue
-		}
-		var calls []callSite
-		var ok bool
-		if !runTimed(astTimeout, func() {
-			calls, ok = extractCalls(rel, fr.text)
-		}) {
-			timedOut++
-			continue
-		}
-		if !ok {
-			parseFail++
-			continue
-		}
-		parsed++
-		for _, c := range calls {
+		for _, c := range ix.callSites {
 			if wants[calleeBase(c.Callee)] {
 				sites = append(sites, c)
 			}
 		}
+		sort.SliceStable(sites, func(i, j int) bool {
+			if sites[i].Path != sites[j].Path {
+				return sites[i].Path < sites[j].Path
+			}
+			return sites[i].Line < sites[j].Line
+		})
+	} else {
+		files := iterFiles(root, cfg)
+		// Skip taxonomy, in the order the scan itself encounters them:
+		// readSource failure -> readSource skip -> unsupported language ->
+		// AST oversize -> generated/minified skip -> parse failure or
+		// parse timeout. Buckets are disjoint; parsed + skipped == len(files).
+		var parsed, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable int
+		t0 := time.Now()
+		for _, rel := range files {
+			fr := readSource(root, rel)
+			if !fr.statOK {
+				unreadable++
+				continue
+			}
+			if fr.skip != "" {
+				sourceSkip++
+				continue
+			}
+			if _, ok := getCallSpec(extOf(rel)); !ok {
+				unsupported++
+				continue
+			}
+			if len(fr.text) > maxASTBytes {
+				astOversize++
+				continue
+			}
+			norm := strings.ReplaceAll(strings.ReplaceAll(fr.text, "\r\n", "\n"), "\r", "\n")
+			if isGeneratedOrMinified(rel, norm, maxLineLenOf(norm)) {
+				sourceSkip++
+				continue
+			}
+			var calls []callSite
+			var ok bool
+			if !runTimed(astTimeout, func() {
+				calls, ok = extractCalls(rel, fr.text)
+			}) {
+				timedOut++
+				continue
+			}
+			if !ok {
+				parseFail++
+				continue
+			}
+			parsed++
+			for _, c := range calls {
+				if wants[calleeBase(c.Callee)] {
+					sites = append(sites, c)
+				}
+			}
+		}
+		skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
+		fmt.Fprintf(os.Stderr, "(callers: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
+			parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
 	}
-	skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
-	fmt.Fprintf(os.Stderr, "(callers: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
-		parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
 	if o.jsonOut {
 		env := callersEnvelope{Query: o.callers, Batch: len(names) > 1, Total: len(sites), Calls: []callSiteJSON{}}
 		for _, s := range sites {
