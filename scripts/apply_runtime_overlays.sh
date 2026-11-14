@@ -324,6 +324,18 @@ grep -Fq '_is_cli_or_tooling_context' codebase/performance_analyzers.py
 grep -Fq '_LISTENER_AUTO_CLEANUP_REGEX' codebase/performance_analyzers.py
 grep -Fq '_is_non_escaping_local_container' codebase/performance_analyzers.py
 grep -Fq '_has_cache_eviction_guard' codebase/performance_analyzers.py
+apply_reviewable_overlay "receipt_lease_hardening_v1"
+grep -Fq 'TASK_RECEIPT_ISSUER = "plw.workflow.task-receipt.v1"' core/accountability_provenance.py
+grep -Fq 'def provenance_key_status(' core/accountability_provenance.py
+grep -Fq '"accountability_provenance": _accountability_provenance_status()' core/portable_agent.py
+grep -Fq 'recovered_lease_expired' fullstack/validation_lease.py
+grep -Fq 'recovered_lease_expired' core/capability_action_lease.py
+grep -Fq 'def kernel_task_chain(' hott_kernel.py
+grep -Fq 'def cmd_chain(' plw_cli.py
+apply_reviewable_overlay "mermaid_graph_v1"
+grep -Fq '"mermaid": _contract(' core/semantic_affordance.py
+grep -Fq 'def kernel_mermaid(' hott_kernel.py
+grep -Fq 'def cmd_mermaid(' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
