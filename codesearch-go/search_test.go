@@ -334,6 +334,82 @@ func TestDefIdentifierPatterns(t *testing.T) {
 	}
 }
 
+// TestDefIdentifierPatternsDotTerminator (G1, 2026-11-14): a dot after
+// the queried name is a receiver/qualifier, not a definition terminator.
+// `fun AppGraph.folderNames()` defines folderNames, not AppGraph — the
+// old terminator [^a-z0-9_] let the dot through, so the extension
+// outranked `class AppGraph` in --defs-only. Generics, paths and the
+// opening brace must still terminate the name.
+func TestDefIdentifierPatternsDotTerminator(t *testing.T) {
+	res := defIdentifierPatterns(parseQuery("AppGraph"))
+	if len(res) != 1 {
+		t.Fatalf("AppGraph: got %d patterns, want 1", len(res))
+	}
+	for _, no := range []string{
+		"internal fun AppGraph.folderNames(): FolderNames = FolderNames(1)",
+		"fun AppGraph.folderNames() {",
+		"fun AppGraph.create(): AppGraph = AppGraph()",
+	} {
+		if res[0].MatchString(no) {
+			t.Errorf("pattern should NOT match receiver/qualifier %q", no)
+		}
+	}
+	for _, yes := range []string{
+		"internal class AppGraph(private val application: Application) {",
+		"class AppGraph<T> {",
+		"class AppGraph : Base() {",
+		"struct AppGraph {",
+		"impl AppGraph {",
+		"fun AppGraph() {",
+	} {
+		if !res[0].MatchString(yes) {
+			t.Errorf("pattern should match definition %q", yes)
+		}
+	}
+	// The x2.0 definition bonus (compileDefRes) shares the terminator
+	// and must reject the receiver form too, without losing the class.
+	matchAny := func(res []*regexp.Regexp, text string) bool {
+		for _, re := range res {
+			if re.MatchString(text) {
+				return true
+			}
+		}
+		return false
+	}
+	bonus := compileDefRes([]string{"app", "graph"}, "AppGraph")
+	if matchAny(bonus, "internal fun AppGraph.folderNames(): FolderNames = FolderNames(1)") {
+		t.Error("bonus regex should NOT match the receiver form")
+	}
+	if !matchAny(bonus, "internal class AppGraph(private val application: Application) {") {
+		t.Error("bonus regex should match the class definition")
+	}
+}
+
+func TestFilterDefChunksDotReceiver(t *testing.T) {
+	// G1 end to end: the extension chunk must leave --defs-only AppGraph
+	// (regex rejects the dot, Name folderNames != AppGraph), while
+	// --defs-only folderNames still finds it through the AST Name.
+	ix := newMemIndex("/r")
+	add := func(path, text, kind, name string, line int) {
+		d := ChunkDoc{Path: path, Line: line, Text: text, Kind: kind, Name: name}
+		ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
+	}
+	add("FolderNames.kt", "internal fun AppGraph.folderNames(): FolderNames = FolderNames(1)", "sig", "folderNames", 105)
+	add("AppGraph.kt", "internal class AppGraph(private val application: Application) {", "body", "AppGraph", 54)
+	_, scored := ix.searchBody(parseQuery("AppGraph"), nil, 50)
+	got := filterDefChunks(scored, ix, parseQuery("AppGraph"))
+	if len(got) != 1 {
+		t.Fatalf("query AppGraph: got %d chunks, want 1 (the class only)", len(got))
+	}
+	if p := ix.chunks[got[0].doc].Path; p != "AppGraph.kt" {
+		t.Errorf("query AppGraph: kept %q, want the class chunk", p)
+	}
+	_, scored = ix.searchBody(parseQuery("folderNames"), nil, 50)
+	if got := filterDefChunks(scored, ix, parseQuery("folderNames")); len(got) != 1 {
+		t.Errorf("query folderNames: got %d chunks, want 1 (the extension via Name)", len(got))
+	}
+}
+
 func TestFilterDefChunks(t *testing.T) {
 	ix := newMemIndex("/r")
 	add := func(path, text string, line int) {

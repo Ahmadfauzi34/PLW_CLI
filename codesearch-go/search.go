@@ -337,8 +337,11 @@ func compileDefRes(terms []string, core string) []*regexp.Regexp {
 	// "func" and the name: func (ix *memIndex) searchBody(...).
 	recv := `(?:\([^)]*\)\s+)?`
 	add := func(pat string) {
+		// G1 (2026-11-14): the terminator excludes "." — a dot after
+		// the name is a receiver/qualifier (fun AppGraph.folderNames),
+		// not a definition of the queried name.
 		re, err := regexp.Compile(`(?i)(?:^|[^a-z0-9_])(?:` + kw + `)\s+` +
-			recv + pat + `(?:[^a-z0-9_]|$)`)
+			recv + pat + `(?:[^a-z0-9_.]|$)`)
 		if err == nil {
 			out = append(out, re)
 		}
@@ -662,7 +665,9 @@ func defIdentifierPatterns(plan queryPlan) []*regexp.Regexp {
 			sb.WriteString(regexp.QuoteMeta(p))
 		}
 		re, err := regexp.Compile(`(?i)(?:^|[^a-z0-9_])(?:` + kw + `)\s+` +
-			recv + sb.String() + `(?:[^a-z0-9_]|$)`)
+			// G1 (2026-11-14): the terminator excludes "." — see
+			// compileDefRes: a dot after the name is a receiver.
+			recv + sb.String() + `(?:[^a-z0-9_.]|$)`)
 		if err == nil {
 			out = append(out, re)
 		}
