@@ -283,6 +283,11 @@ apply_reviewable_overlay "android_manifest_entrypoint_v1"
 grep -Fq 'def android_manifest_entrypoints' language_semantics.py
 grep -Fq 'android_manifest' core/shared_graph.py
 grep -Fq 'android_manifest' codebase/file_scanner.py
+apply_reviewable_overlay "check_fair_envelope_v1"
+grep -Fq 'Selection (G6):' hott_kernel.py
+grep -Fq 'by_analyzer' hott_kernel.py
+grep -Fq 'all_findings' plw_cli.py
+grep -Fq '[--limit N] [--all]' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

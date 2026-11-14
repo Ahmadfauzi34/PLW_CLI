@@ -1,0 +1,167 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2037,10 +2037,14 @@
+     }
+ 
+ 
++_CHECK_FINDINGS_LIMIT = 100
++
++
+ def kernel_analyze(
+     scan_root: str = ".",
+     analyzer_names: Optional[List[str]] = None,
+     output_mode: str = "full",
++    findings_limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
+ ) -> Dict[str, Any]:
+     """
+     Orkestrasi penuh: build SharedGraph + run analyzers + synthesize.
+@@ -2119,7 +2123,9 @@
+     # Step 4: Filter output berdasarkan mode
+     if output_mode == "summary":
+         base["unified_summary"] = unified_summary
+-        top_findings, findings_truncated = _top_check_findings(analyzer_output)
++        top_findings, findings_truncated = _top_check_findings(
++            analyzer_output, limit=findings_limit
++        )
+         base["findings"] = top_findings
+         base["findings_truncated"] = findings_truncated
+         return base
+@@ -2148,12 +2154,9 @@
+     return counts
+ 
+ 
+-_CHECK_FINDINGS_LIMIT = 100
+-
+-
+ def _top_check_findings(
+     analyzer_output: Dict[str, Any],
+-    limit: int = _CHECK_FINDINGS_LIMIT,
++    limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
+ ) -> tuple:
+     """Flatten actionable findings for the `plw check --json` envelope.
+ 
+@@ -2161,28 +2164,60 @@
+     open the analyzer cache file to read a single finding — and the
+     human-readable path could never list one either, because it reads
+     the same top-level `findings` key. This returns the actionable
+-    findings (critical/error/high/medium — anything at least as severe
+-    as high), each tagged with its analyzer, in a deterministic order
+-    (severity, analyzer, file/node, full JSON), bounded to `limit` with
+-    a truncation flag. Low/info findings stay in the analyzer cache.
++    findings (critical/error/high/medium), each tagged with its
++    analyzer, in a deterministic order (severity, analyzer, file/node,
++    full JSON), bounded to `limit` with a truncation flag
++    (`limit=None` means uncapped). Low/info findings stay in the
++    analyzer cache.
++
++    Selection (G6): one finding per analyzer per round, in sorted
++    analyzer order, each analyzer's findings severity-sorted
++    internally — so no single analyzer can fill the envelope alone
++    (the old global sort let `perf.async` take all 100 slots). The
++    selected set is re-sorted by the documented order before it is
++    returned, so the envelope stays sorted; only its membership is
++    fair across analyzers.
+     """
+     rank = {"critical": 0, "error": 0, "high": 1, "medium": 2}
+-    collected = []
++
++    def _order(f):
++        return (
++            rank.get(f.get("severity", "medium"), 2),
++            f.get("analyzer", ""),
++            f.get("file", "") or f.get("node", ""),
++            json.dumps(f, sort_keys=True, ensure_ascii=False),
++        )
++
++    by_analyzer = {}
+     for name, result in analyzer_output.get("results", {}).items():
++        items = []
+         for finding in result.get("findings", []):
+             sev = finding.get("severity", "info")
+             if sev not in rank:
+                 continue
+             item = dict(finding)
+             item.setdefault("analyzer", name)
+-            collected.append(item)
+-    collected.sort(key=lambda f: (
+-        rank.get(f.get("severity", "medium"), 2),
+-        f.get("analyzer", ""),
+-        f.get("file", "") or f.get("node", ""),
+-        json.dumps(f, sort_keys=True, ensure_ascii=False),
+-    ))
+-    return collected[:limit], len(collected) > limit
++            items.append(item)
++        if items:
++            items.sort(key=_order)
++            by_analyzer[name] = items
++
++    total = sum(len(v) for v in by_analyzer.values())
++    selected = []
++    names = sorted(by_analyzer)
++    round_idx = 0
++    while (limit is None or len(selected) < limit) and any(
++        round_idx < len(by_analyzer[n]) for n in names
++    ):
++        for name in names:
++            if limit is not None and len(selected) >= limit:
++                break
++            items = by_analyzer[name]
++            if round_idx < len(items):
++                selected.append(items[round_idx])
++        round_idx += 1
++    selected.sort(key=_order)
++    return selected, (limit is not None and total > limit)
+ 
+ 
+ def kernel_impact(
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -19,7 +19,7 @@
+   plw context <query> [root] [--target file] [--budget N] [--cache-mode MODE] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]
+   plw transitions <query> [root] [--target file] [--budget N] [--lineage sha256:id] [--json]
+   plw kan <target_file_or_query> [root] [--mode lan|ran|both] [--json]
+-  plw check [root] [--analyzers a,b] [--json]
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
+   plw steer [root] [--json]
+   plw brief <file> [root] [--json]
+   plw impact <file> [root] [--json]
+@@ -927,12 +927,21 @@
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--analyzers", default=None)
+     parser.add_argument("--cache-mode", default=None)
++    parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument("--all", action="store_true", dest="all_findings")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     root = opts.root_flag or opts.root or "."
+     analyzers = opts.analyzers.split(",") if opts.analyzers else None
+     cache_mode = opts.cache_mode
+     as_json = opts.as_json
++    # --all wins over --limit; neither means the default 100-slot envelope.
++    if opts.all_findings:
++        findings_limit = None
++    elif opts.limit is not None:
++        findings_limit = opts.limit
++    else:
++        findings_limit = hott_kernel._CHECK_FINDINGS_LIMIT
+ 
+     if cache_mode is not None:
+         cache_error = hott_kernel._set_graph_cache_mode(cache_mode)
+@@ -940,7 +949,7 @@
+             _format_check_output(cache_error, as_json=as_json)
+             return 2
+ 
+-    res = hott_kernel.kernel_analyze(root, analyzer_names=analyzers, output_mode="summary")
++    res = hott_kernel.kernel_analyze(root, analyzer_names=analyzers, output_mode="summary", findings_limit=findings_limit)
+     _format_check_output(res, as_json=as_json)
+     return 0 if "error" not in res else 1
+ 
+@@ -4890,7 +4899,7 @@
+       -> Imputes expected imports, callers, and conventions for new/isolated files
+ 
+ 2. Analysis, quality & context
+-  plw check [root] [--analyzers a,b] [--json]
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
+       -> Quick architectural and boundary violation check; --json includes high+medium findings (low/info stay in the analyzer cache)
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
