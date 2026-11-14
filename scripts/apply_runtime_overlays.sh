@@ -276,6 +276,9 @@ grep -Fq 'probe = _strip_strings(line).strip()' codebase/performance_analyzers.p
 apply_reviewable_overlay "ts_js_ext_map_v1"
 grep -Fq '_TS_COMPILED_TO_SOURCE_EXTENSIONS' language_semantics.py
 grep -Fq 'add(resolved_base[: -len(compiled)] + source)' language_semantics.py
+apply_reviewable_overlay "kotlin_label_v1"
+grep -Fq '".kt": "kotlin"' core/topology_engine.py
+grep -Fq 'G2 (2026-11-14)' core/topology_engine.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

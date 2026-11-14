@@ -1,0 +1,21 @@
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -64,6 +64,10 @@
+ ENGINE_FILE_EXTENSIONS = {".go": "go", ".rs": "rust", ".py": "python"}
+ 
+ # Extension -> engine language, for definition nodes in any language.
++# G2 (2026-11-14): ".kt" -> "kotlin" — without it every Kotlin symbol
++# node was labeled "unknown" (1,327 of 1,332 on oopbot-trial). The
++# engine already parses Kotlin (TREE_SITTER_LANGUAGES); only the
++# label was missing. ".kts" stays out on purpose (out of scope).
+ FILE_LANGUAGE_BY_EXTENSION = {
+     ".go": "go",
+     ".rs": "rust",
+@@ -72,6 +76,7 @@
+     ".jsx": "jsx",
+     ".ts": "typescript",
+     ".tsx": "tsx",
++    ".kt": "kotlin",
+ }
+ 
+ # Definition patterns are CANDIDATE generators only: a name found here is
