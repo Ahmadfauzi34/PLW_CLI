@@ -344,6 +344,11 @@ rm -rf skills/history
 test ! -e skills/history
 grep -Fq 'relevance -> execution lease -> execution attempt' plw_cli.py
 ! grep -Fq 'F141 postcondition' plw_cli.py
+apply_reviewable_overlay "agent_ux_hardening_v1"
+grep -Fq 'cache_mode=opts.cache_mode' plw_cli.py
+grep -Fq 'recommended_shortcut' plw_cli.py
+grep -Fq 'frame_only' hott_kernel.py
+grep -Fq 'fallback_hint' core/codesearch_engine.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
