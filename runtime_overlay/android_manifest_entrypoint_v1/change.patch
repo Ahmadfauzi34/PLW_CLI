@@ -1,0 +1,189 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -13,6 +13,7 @@
+ import json
+ import os
+ import re
++import xml.etree.ElementTree as ET
+ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+ 
+ JS_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+@@ -481,6 +482,94 @@
+     return ""
+ 
+ 
++# G5a: Android entrypoints from the manifest. The basename entrypoint
++# rules never match a Kotlin class name, so manifest-declared
++# Activities/Services/etc. were reported orphan.
++_ANDROID_MANIFEST_COMPONENT_TAGS = (
++    "application",
++    "activity",
++    "service",
++    "receiver",
++    "provider",
++)
++_ANDROID_NS = "http://schemas.android.com/apk/res/android"
++# Generated merged manifests live under build/ — never source truth.
++_ANDROID_MANIFEST_SKIP_DIRS = frozenset({
++    ".git", "node_modules", "build", "dist", ".gradle", "out",
++})
++
++
++def _android_manifest_names(content: str) -> List[str]:
++    """Component class names declared in one AndroidManifest.xml.
++
++    Only application/activity/service/receiver/provider count:
++    activity-alias names are manifest-only aliases, not classes, and
++    must never resolve to a file. Returns raw android:name values
++    (relative `.Foo`, qualified `pkg.Foo`, or bare `Foo`).
++    """
++    try:
++        root = ET.fromstring(content)
++    except ET.ParseError:
++        return []
++    names: List[str] = []
++    for element in root.iter():
++        tag = element.tag.rsplit("}", 1)[-1]
++        if tag not in _ANDROID_MANIFEST_COMPONENT_TAGS:
++            continue
++        name = element.get(f"{{{_ANDROID_NS}}}name") or element.get("name") or ""
++        if name:
++            names.append(name)
++    return names
++
++
++def android_manifest_entrypoints(
++    root: str, kt_files: Iterable[Tuple[str, str]]
++) -> Set[str]:
++    """Files declared as Android components in AndroidManifest.xml files.
++
++    Resolution is name-only against the Kotlin top-level index, unique
++    match required: a relative name (`.host.Foo`) resolves by simple
++    name; a fully-qualified name (`pkg.Foo`) additionally requires the
++    file's declared package to match. Ambiguous (same simple name in
++    two packages), missing, `$`-nested, or unparseable names resolve to
++    nothing — fail-closed, never a guessed entrypoint.
++    """
++    by_name: Dict[str, List[Tuple[str, str]]] = {}
++    for path, content in kt_files:
++        package = kotlin_package_of(content)
++        for name in kotlin_top_level_names(content):
++            by_name.setdefault(name, []).append((normalize_path(path), package))
++
++    entrypoints: Set[str] = set()
++    for dirpath, dirnames, filenames in os.walk(root):
++        dirnames[:] = sorted(d for d in dirnames if d not in _ANDROID_MANIFEST_SKIP_DIRS)
++        for filename in sorted(filenames):
++            if filename != "AndroidManifest.xml":
++                continue
++            try:
++                with open(
++                    os.path.join(dirpath, filename),
++                    encoding="utf-8",
++                    errors="ignore",
++                ) as fh:
++                    content = fh.read()
++            except OSError:
++                continue
++            for raw in _android_manifest_names(content):
++                if "$" in raw:
++                    continue
++                simple = raw.rsplit(".", 1)[-1]
++                candidates = by_name.get(simple, [])
++                if len(candidates) == 1:
++                    entrypoints.add(candidates[0][0])
++                elif len(candidates) > 1 and not raw.startswith(".") and "." in raw:
++                    package = raw.rsplit(".", 1)[0]
++                    matched = [p for p, pkg in candidates if pkg == package]
++                    if len(matched) == 1:
++                        entrypoints.add(matched[0])
++    return entrypoints
++
++
+ def parse_kotlin_imports(content: str) -> List[Dict[str, Any]]:
+     """Parse Kotlin imports. Kotlin has no `import type`: every import is
+     runtime (K6), so `import_nature` is always "runtime"."""
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -27,6 +27,7 @@
+     RUST_STDLIB_CRATES,
+     SOURCE_EXTENSIONS,
+     alias_candidates as _alias_candidates,
++    android_manifest_entrypoints as _android_manifest_entrypoints,
+     candidate_targets as _candidate_targets,
+     classify_js_import_nature as classify_import_nature,
+     is_source_file as _is_source_file,
+@@ -799,6 +800,15 @@
+     # ============================================================
+     # PASS 2: Node metadata extraction
+     # ============================================================
++    # G5a: AndroidManifest.xml entrypoints. The basename rules below
++    # never match a Kotlin class name, so manifest-declared components
++    # were reported orphan. Resolved name-only against the PASS 1.5
++    # symbol index (unique match required); aliases never resolve.
++    manifest_entrypoints = _android_manifest_entrypoints(
++        scan_root_norm,
++        [(fp, file_map[fp]) for fp in all_files if fp.endswith(".kt")],
++    )
++
+     node_metadata: Dict[str, Dict[str, Any]] = {}
+ 
+     for fp in all_files:
+@@ -806,6 +816,8 @@
+         filename = os.path.basename(fp)
+ 
+         is_entrypoint, ep_kind, ep_conf = _detect_entrypoint(filename)
++        if fp in manifest_entrypoints:
++            is_entrypoint, ep_kind, ep_conf = True, "android_manifest", 0.95
+         is_test = _is_test_file(fp)
+         node_type = _classify_node(fp, content)
+ 
+--- a/codebase/file_scanner.py
++++ b/codebase/file_scanner.py
+@@ -8,6 +8,7 @@
+     JS_RESOLUTION_EXTENSIONS as RESOLUTION_EXTENSIONS,
+     SOURCE_EXTENSIONS,
+     alias_candidates as _alias_candidates,
++    android_manifest_entrypoints as _android_manifest_entrypoints,
+     candidate_targets as _candidate_targets,
+     classify_js_import_nature as classify_import_nature,
+     is_source_file as _is_source_file,
+@@ -353,6 +354,9 @@
+     non_relative_imports: List[Dict[str, str]] = []
+     skipped_files: List[Dict[str, str]] = []
+     parse_warnings: List[Dict[str, str]] = []
++    # G5a: .kt sources stashed for the manifest-entrypoint pass below
++    # (the helper resolves component names against these contents).
++    kt_sources: List[Tuple[str, str]] = []
+ 
+     seen_external: Set[Tuple[str, str]] = set()
+     seen_non_relative: Set[Tuple[str, str]] = set()
+@@ -396,6 +400,9 @@
+                     )
+                     continue
+ 
++                if full_path.endswith(".kt"):
++                    kt_sources.append((full_path, content))
++
+                 node_type = _classify_node(full_path, content)
+                 main_name = _extract_main_name(full_path, content)
+ 
+@@ -444,6 +451,18 @@
+                                 }
+                             )
+ 
++    # G5a: AndroidManifest.xml entrypoints (same helper as shared_graph).
++    # Node flags are patched here, before fan_in/unreferenced are
++    # computed below, so both surfaces agree.
++    manifest_entrypoints: Set[str] = set()
++    for _root in roots:
++        manifest_entrypoints |= _android_manifest_entrypoints(_root, kt_sources)
++    for node in nodes:
++        if node.get("id") in manifest_entrypoints:
++            node["is_entrypoint"] = True
++            node["entrypoint_kind"] = "android_manifest"
++            node["entrypoint_confidence"] = 0.95
++
+     # Resolve semua edge setelah semua root selesai dipindai
+     for raw_edge in raw_edges:
+         source = raw_edge["source"]

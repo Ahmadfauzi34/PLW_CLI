@@ -279,6 +279,10 @@ grep -Fq 'add(resolved_base[: -len(compiled)] + source)' language_semantics.py
 apply_reviewable_overlay "kotlin_label_v1"
 grep -Fq '".kt": "kotlin"' core/topology_engine.py
 grep -Fq 'G2 (2026-11-14)' core/topology_engine.py
+apply_reviewable_overlay "android_manifest_entrypoint_v1"
+grep -Fq 'def android_manifest_entrypoints' language_semantics.py
+grep -Fq 'android_manifest' core/shared_graph.py
+grep -Fq 'android_manifest' codebase/file_scanner.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
