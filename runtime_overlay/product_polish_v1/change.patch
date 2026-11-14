@@ -1,0 +1,131 @@
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -64,7 +64,7 @@ Usage:
+   plw validation-plan <snapshot.json> [root] [--scenario-catalog catalog.json] [--max-scenarios N] [--focus UI_ID] [--constraints query.json] [--lease-id ID --store-dir DIR] [--json]
+   plw validation-evidence <plan.json> <evidence.json> [--store-dir DIR] [--json]
+   plw validation-coverage <plan.json> <evidence.json> <obligations.json> [--store-dir DIR] [--json]
+-  plw validation-coverage execution-backed <f139-binding.json> <obligations.json> [--json]
++  plw validation-coverage execution-backed <execution-binding.json> <obligations.json> [--json]
+   plw validation-request <plan.json> <evidence.json> <obligations.json> --validator-id ID --executor-id ID [--store-dir DIR] [--json]
+   plw validation-authorization <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID [--store-dir DIR] [--json]
+   plw validation-lease acquire <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID --idempotency-key KEY [--lease-ttl-seconds N] [--store-dir DIR] --allow-state-change [--json]
+@@ -78,11 +78,11 @@ Usage:
+   plw validation-runtime status <dispatch-intent-id> [--store-dir DIR] [--json]
+   plw validation-result accept <runtime-observation-id> <result.json> <request-set.json> --allow-state-change [--store-dir DIR] [--json]
+   plw validation-result status <runtime-observation-id> [--store-dir DIR] [--json]
+-      -> Accepts exact F137 validation.result content only; never executes runtime and never proves postconditions/truth
++      -> Accepts exact validation.result content only; never executes runtime and never proves postconditions/truth
+   plw validation-scenario-bind <acceptance-id> <plan.json> <result.json> [--store-dir DIR] [--json]
+-  plw postcondition-proof <f139-binding.json> <f140-coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
+-  plw fullstack-state <root> <f139-binding.json> <f141-proof.json> <fullstack-spec.json> --current-revision REV [--geometry-impact FILE] [--ui-reference FILE] [--json]
+-      -> Binds one F138-accepted result to exact F128 scenario identity; read-only and does not prove obligation coverage/postconditions/truth
++  plw postcondition-proof <execution-binding.json> <coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
++  plw fullstack-state <root> <execution-binding.json> <proof.json> <fullstack-spec.json> --current-revision REV [--geometry-impact FILE] [--ui-reference FILE] [--json]
++      -> Binds one accepted runtime result to exact scenario identity; read-only and does not prove obligation coverage/postconditions/truth
+   plw memory <subcommand> [args...]
+   plw fiber <subcommand> [args...]
+   plw <any hott_kernel mode> [args...]
+@@ -5209,35 +5209,35 @@ Usage:
+   plw ui capture-script [root] --revision REV
+   plw ui-reference <snapshot.json> [root] [--no-resources] [--json]
+   plw runtime-ui-reference <lease-id> <snapshot.json> [root] [--store-dir DIR] [--no-resources] [--json]
+-      -> Binds one F125 UI reference to verified F123 capture provenance without executing runtime
++      -> Binds one UI reference to verified capture provenance without executing runtime
+   plw geometric-impact <snapshot.json> [root] [--focus UI_ID] [--constraints query.json] [--proximity PX] [--lease-id ID --store-dir DIR] [--no-resources] [--json]
+       -> Evaluates explicit geometric constraints and projects selected UI owners to bounded topology impact; read-only
+ 
+ 4. Governance, lease & proof (advanced)
+   Stage order — each stage reads the previous stage's receipt; never skip a stage:
+-    F111 relevance -> F121 lease -> F122 attempt -> F123 dispatch -> F127 impact -> F128 evidence -> F129 coverage -> validation-request (F131) -> validation-authorization (F132) -> validation-lease (F133) -> F139 execution-backed -> F141 postcondition -> F142 fullstack
++    relevance -> execution lease -> execution attempt -> adapter dispatch -> geometric impact -> scenario evidence -> proof coverage -> validation-request -> validation-authorization -> validation-lease -> execution-backed coverage -> postcondition -> fullstack
+   plw validation-plan <snapshot.json> [root] [--scenario-catalog catalog.json] [--max-scenarios N] [--focus UI_ID] [--constraints query.json] [--lease-id ID --store-dir DIR] [--json]
+-      -> Plans a bounded recoverable validation scenario set from F127 impact; never executes renders/tests
++      -> Plans a bounded recoverable validation scenario set from geometric impact; never executes renders/tests
+   plw validation-evidence <plan.json> <evidence.json> [--store-dir DIR] [--json]
+-      -> Binds external evidence to exact F128 scenarios and separates verified receipts from exact content provenance
++      -> Binds external evidence to exact validation scenarios and separates verified receipts from exact content provenance
+   plw validation-coverage <plan.json> <evidence.json> <obligations.json> [--store-dir DIR] [--json]
+-      -> Checks F129 coverage: plan + evidence + obligations in, coverage verdict out; run after validation-evidence
+-  plw validation-coverage execution-backed <f139-binding.json> <obligations.json> [--json]
+-      -> Re-derives F129 or F139 proof obligations read-only; complete coverage is still not postcondition proof
+-  plw postcondition-proof <f139-binding.json> <f140-coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
+-      -> F141 scoped postcondition assembly; no source mutation attestation, stable promotion, or truth commit
+-  plw fullstack-state <root> <f139-binding.json> <f141-proof.json> <fullstack-spec.json> --current-revision REV [--geometry-impact FILE] [--ui-reference FILE] [--json]
+-      -> F142 composes separate topology/geometry/correspondence/behavior/postcondition authorities; no graph merge or truth commit
++      -> Checks proof coverage: plan + evidence + obligations in, coverage verdict out; run after validation-evidence
++  plw validation-coverage execution-backed <execution-binding.json> <obligations.json> [--json]
++      -> Re-derives proof obligations read-only from scenario or execution-backed evidence; complete coverage is still not postcondition proof
++  plw postcondition-proof <execution-binding.json> <coverage.json> <obligations.json> <postcondition-spec.json> --current-revision REV [--json]
++      -> Scoped postcondition assembly; no source mutation attestation, stable promotion, or truth commit
++  plw fullstack-state <root> <execution-binding.json> <proof.json> <fullstack-spec.json> --current-revision REV [--geometry-impact FILE] [--ui-reference FILE] [--json]
++      -> Composes separate topology/geometry/correspondence/behavior/postcondition authorities; no graph merge or truth commit
+   plw validation-request <plan.json> <evidence.json> <obligations.json> --validator-id ID --executor-id ID [--store-dir DIR] [--json]
+-      -> Re-derives F131 coverage and emits REQUESTED work without authorization or dispatch
++      -> Re-derives proof coverage and emits REQUESTED work without authorization or dispatch
+   plw validation-authorization <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID [--store-dir DIR] [--json]
+-      -> Verifies a host-issued principal grant and binds it to one exact F132 request; still no lease or dispatch
++      -> Verifies a host-issued principal grant and binds it to one exact validation request; still no lease or dispatch
+   plw validation-lease acquire <plan.json> <evidence.json> <obligations.json> <assertion.json> --request-id ID --validator-id ID --executor-id ID --idempotency-key KEY [--lease-ttl-seconds N] [--store-dir DIR] --allow-state-change [--json]
+-      -> Atomically consumes one exact F133 binding into one short-lived lease; no attempt or dispatch occurs
++      -> Atomically consumes one exact authorization binding into one short-lived validation lease; no attempt or dispatch occurs
+   plw validation-lease status <sha256:lease-id> [--request-id ID] [--executor-id ID] [--store-dir DIR] [--json]
+-      -> Reads one F133 lease state; inspection never regrants
++      -> Reads one validation lease state; inspection never regrants
+   plw validation-attempt register <lease-id> --attempt-key KEY --validator-id ID --executor-id ID --allow-state-change [--store-dir DIR] [--json]
+-      -> Registers one attempt under an F133 lease; no execution happens
++      -> Registers one attempt under a validation lease; no execution happens
+   plw validation-attempt status <lease-id> [--request-id ID] [--executor-id ID] [--store-dir DIR] [--json]
+       -> Reads one validation attempt state; an attempt without a terminal observation stays unresolved
+   plw validation-dispatch prepare <attempt-id> --dispatch-key KEY --validator-id ID --executor-id ID --allow-state-change [--store-dir DIR] [--json]
+@@ -5255,15 +5255,15 @@ Usage:
+   plw action-lease status <sha256:lease-id> [--json]
+       -> Verifies lease state read-only; inspection never regrants executor-start authority
+   plw action-outcome register [--store-dir DIR] --allow-state-change [--json]
+-      -> Claims one exact F121 lease handoff into a durable F122 attempt record; does not prove external execution started
++      -> Claims one exact execution lease handoff into a durable attempt record; does not prove external execution started
+   plw action-outcome record [--store-dir DIR] --allow-state-change [--json]
+       -> Records one terminal executor observation as SUCCEEDED, FAILED, or INDETERMINATE without settling postconditions
+   plw action-outcome status <sha256:lease-id> [--json]
+       -> Reads attempt/outcome state; a registered attempt without terminal receipt remains unresolved
+   plw action-adapter prepare [--store-dir DIR] --allow-state-change [--json]
+-      -> Persists one F123 dispatch intent for an exact unresolved F122 attempt; does not invoke a concrete adapter
++      -> Persists one dispatch intent for an exact unresolved attempt; does not invoke a concrete adapter
+   plw action-adapter observe [--store-dir DIR] --allow-state-change [--json]
+-      -> Records one adapter observation and forwards terminal observations into F122 without proving postconditions
++      -> Records one adapter observation and forwards terminal observations into the attempt ledger without proving postconditions
+   plw action-adapter status <sha256:lease-id> [--json]
+       -> Reads dispatch/observation bridge state; missing observation remains unresolved
+   plw reconcile-outcomes [--record] [--json]
+@@ -5272,7 +5272,7 @@ Usage:
+   plw accountability <sha256:decision-id> [--json]
+       -> Audits who filtered/compacted evidence, the resulting evidence debt, and recovery duty
+   plw accountability-chain <sha256:decision-id> [--limit N] [--json]
+-      -> Verifies and summarizes F111 relevance -> F112 delivery accountability without raw prompt/source
++      -> Verifies and summarizes relevance -> delivery accountability without raw prompt/source
+ 
+ 5. Other
+   plw memory <subcommand> [...]
+--- a/skills/capability-governance-workflow.md
++++ b/skills/capability-governance-workflow.md
+@@ -6,7 +6,7 @@
+ 
+ **Return to:** [SKILL.md routing map](../SKILL.md#9-skill-module-routing-map).
+ 
+-**Related modules — load only when needed:** [atomic execution lease workflow](atomic-execution-lease-workflow.md) after an F119 preflight is ready for the explicit F121 handoff; [context and proof workflow](context-and-proof-workflow.md) when a workflow claim requires current source/runtime evidence; [F86–F105 simplification decisions](history/f86-f105-simplification-decisions.md) only when replaying the historical reason for the current simplification state.
++**Related modules — load only when needed:** [atomic execution lease workflow](atomic-execution-lease-workflow.md) after an F119 preflight is ready for the explicit F121 handoff; [context and proof workflow](context-and-proof-workflow.md) when a workflow claim requires current source/runtime evidence.
+ 
+ > This module owns the no-effect parent chain through F119. Load the F121 lease module only for the explicit state-changing nonce-pair handoff.
+ > F120 remains an orthogonal external-corpus audit and is not an authority-chain step.
+--- a/skills/repository-structure-and-api-reference.md
++++ b/skills/repository-structure-and-api-reference.md
+@@ -28,9 +28,7 @@ tools/ai_studio_tool/
+ │   ├── tool-call-and-cli-workflow.md
+ │   ├── repository-structure-and-api-reference.md
+ │   ├── capability-governance-workflow.md
+-│   ├── atomic-execution-lease-workflow.md
+-│   └── history/
+-│       └── f86-f105-simplification-decisions.md
++│   └── atomic-execution-lease-workflow.md
+ │
+ ├── plw_cli.py                       # Zero-Bloat Native Command Layer (plw)
+ ├── agent_tool.py                     # JSON tool-call adapter; no shell execution

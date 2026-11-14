@@ -365,10 +365,19 @@ jobs:
           name: codesearch-go-linux-x86_64
           path: release
 
-      - name: Verify release checksum file
+      - name: Verify release checksum file and build dual-binary bundle
         if: steps.version.outputs.publish == 'true'
         working-directory: release
-        run: sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
+        run: |
+          sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
+          mkdir -p bundle_staging
+          cp plw-linux-x86_64 bundle_staging/plw
+          cp codesearch-go-linux-x86_64 bundle_staging/codesearch-go
+          chmod 0755 bundle_staging/plw bundle_staging/codesearch-go
+          tar --numeric-owner -czf plw-bundle-linux-x86_64.tar.gz -C bundle_staging plw codesearch-go
+          rm -rf bundle_staging
+          sha256sum plw-bundle-linux-x86_64.tar.gz | tee plw-bundle-linux-x86_64.tar.gz.sha256
+          sha256sum --check plw-bundle-linux-x86_64.tar.gz.sha256
 
       - name: Resolve engine version
         if: steps.version.outputs.publish == 'true'
@@ -402,9 +411,11 @@ jobs:
             release/plw-linux-x86_64.sha256 \
             release/codesearch-go-linux-x86_64 \
             release/codesearch-go-linux-x86_64.sha256 \
+            release/plw-bundle-linux-x86_64.tar.gz \
+            release/plw-bundle-linux-x86_64.tar.gz.sha256 \
             --target "$GITHUB_SHA" \
             --title "PLW $RELEASE_TAG" \
-            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification. Tree-sitter engine (codesearch-go): $ENGINE_VERSION (digest $ENGINE_DIGEST), paired with this binary and covered by the codesearch engine smoke test."
+            --notes "PLW $RELEASE_VERSION validated standalone binary release. Built from main after verified runtime extraction/overlay, binary-safety checks, topology/impact smoke, portable-agent doctor/orient/embedded-skill smoke, operation-plan argv round-trip and dirty revision byte-binding smoke, JS/TS/TSX/JSX simplification smoke, required Chromium/CDP proof, pinned Vite agent workflow, GLIBC 2.17/2.31 runtime execution of the digest-verified manylinux2014-built binary, target-cleanliness checks, and SHA-256 verification. Tree-sitter engine (codesearch-go): $ENGINE_VERSION (digest $ENGINE_DIGEST), paired with this binary and covered by the codesearch engine smoke test. Dual-binary archive: plw-bundle-linux-x86_64.tar.gz extracts plw + codesearch-go directly into PATH."
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -428,9 +439,18 @@ jobs:
           name: codesearch-go-linux-x86_64
           path: release
 
-      - name: Verify release checksum file
+      - name: Verify release checksum file and build dual-binary bundle
         working-directory: release
-        run: sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
+        run: |
+          sha256sum --check plw-linux-x86_64.sha256 codesearch-go-linux-x86_64.sha256
+          mkdir -p bundle_staging
+          cp plw-linux-x86_64 bundle_staging/plw
+          cp codesearch-go-linux-x86_64 bundle_staging/codesearch-go
+          chmod 0755 bundle_staging/plw bundle_staging/codesearch-go
+          tar --numeric-owner -czf plw-bundle-linux-x86_64.tar.gz -C bundle_staging plw codesearch-go
+          rm -rf bundle_staging
+          sha256sum plw-bundle-linux-x86_64.tar.gz | tee plw-bundle-linux-x86_64.tar.gz.sha256
+          sha256sum --check plw-bundle-linux-x86_64.tar.gz.sha256
 
       - name: Publish GitHub Release
         env:
@@ -442,6 +462,8 @@ jobs:
               release/plw-linux-x86_64.sha256 \
               release/codesearch-go-linux-x86_64 \
               release/codesearch-go-linux-x86_64.sha256 \
+              release/plw-bundle-linux-x86_64.tar.gz \
+              release/plw-bundle-linux-x86_64.tar.gz.sha256 \
               --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
@@ -449,6 +471,8 @@ jobs:
               release/plw-linux-x86_64.sha256 \
               release/codesearch-go-linux-x86_64 \
               release/codesearch-go-linux-x86_64.sha256 \
+              release/plw-bundle-linux-x86_64.tar.gz \
+              release/plw-bundle-linux-x86_64.tar.gz.sha256 \
               --title "PLW $GITHUB_REF_NAME" \
               --generate-notes
           fi

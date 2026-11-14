@@ -309,6 +309,9 @@ grep -Fq 'def _supports_cached_structural(' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v9"
 grep -Fq '696333c3492abdd6eda85d3b7a5e18b4147a8288c309ec9c8d6ac202c27d29e6' core/codesearch_engine.py
 grep -Fq '7900e083dc7c' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v10"
+grep -Fq '1a4c4548286b336ff76d3493130f69c5255e7754b90e17a997b931a6f6fcb87d' core/codesearch_engine.py
+grep -Fq -- '-s -w' core/codesearch_engine.py
 apply_reviewable_overlay "topology_resolution_v1"
 grep -Fq 'def kotlin_same_package_declarations(' language_semantics.py
 grep -Fq 'def rust_manifest_entrypoints(' language_semantics.py
@@ -336,6 +339,11 @@ apply_reviewable_overlay "mermaid_graph_v1"
 grep -Fq '"mermaid": _contract(' core/semantic_affordance.py
 grep -Fq 'def kernel_mermaid(' hott_kernel.py
 grep -Fq 'def cmd_mermaid(' plw_cli.py
+apply_reviewable_overlay "product_polish_v1"
+rm -rf skills/history
+test ! -e skills/history
+grep -Fq 'relevance -> execution lease -> execution attempt' plw_cli.py
+! grep -Fq 'F141 postcondition' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

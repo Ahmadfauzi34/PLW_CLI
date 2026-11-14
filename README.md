@@ -6,21 +6,30 @@ Current binary target: **Linux x86_64**.
 
 ## Install
 
-Download the latest release assets:
+Download either the combined dual-binary bundle or individual release assets:
 
+- `plw-bundle-linux-x86_64.tar.gz` (recommended: contains executable `plw` + `codesearch-go`)
+- `plw-bundle-linux-x86_64.tar.gz.sha256`
 - `plw-linux-x86_64`
 - `plw-linux-x86_64.sha256`
 - `codesearch-go-linux-x86_64` (paired tree-sitter engine binary)
 - `codesearch-go-linux-x86_64.sha256`
 
-Verify and install:
+Verify and install in one step using the bundle:
+
+```bash
+sha256sum --check plw-bundle-linux-x86_64.tar.gz.sha256
+sudo tar -xzf plw-bundle-linux-x86_64.tar.gz -C /usr/local/bin
+```
+
+Or install the individual binaries:
 
 ```bash
 sha256sum --check plw-linux-x86_64.sha256
 sha256sum --check codesearch-go-linux-x86_64.sha256
 chmod +x plw-linux-x86_64 codesearch-go-linux-x86_64
 sudo install plw-linux-x86_64 /usr/local/bin/plw
-sudo install codesearch-go-linux-x86_64 /usr/local/bin/codesearch
+sudo install codesearch-go-linux-x86_64 /usr/local/bin/codesearch-go
 ```
 
 Check the embedded version and the portable interface:
