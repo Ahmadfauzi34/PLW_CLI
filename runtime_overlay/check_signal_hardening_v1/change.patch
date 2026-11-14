@@ -1,0 +1,655 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -181,9 +181,19 @@
+     return filename.endswith(source_extensions(include_python=include_python))
+ 
+ 
++_JS_COMMENT_REGEX = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
++
++
++def _replace_js_comment(match: re.Match[str]) -> str:
++    text = match.group(0)
++    if text.startswith("/*"):
++        nl_count = text.count("\n")
++        return ("\n" * nl_count) if nl_count else " "
++    return ""
++
++
+ def strip_js_comments(content: str) -> str:
+-    content = re.sub(r"//.*$", "", content, flags=re.MULTILINE)
+-    return re.sub(r"/\*[\s\S]*?\*/", "", content)
++    return _JS_COMMENT_REGEX.sub(_replace_js_comment, content)
+ 
+ 
+ def classify_js_import_nature(stmt: str) -> str:
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -14,6 +14,8 @@
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
++from language_semantics import strip_js_comments as _strip_comments
++
+ 
+ # ============================================================
+ # Shared Helpers
+@@ -466,20 +468,42 @@
+         "index.ts", "index.js", "index.tsx", "index.jsx",
+         "index.mts", "index.cts",
+     }
+-    _MUTABLE_EXPORT_RE = re.compile(
+-        r"^\s*export\s+(?:let|var)\s+\w+"
+-        r"|^\s*export\s+const\s+\w+\s*=\s*new\s+\w+"
+-        r"|^\s*export\s+const\s+\w+\s*=\s*(?:\{|\[)",
++    _MUTABLE_REASSIGNABLE_EXPORT_RE = re.compile(
++        r"^\s*export\s+(?:declare\s+)?(?:let|var)\s+[A-Za-z_$][\w$]*",
++        re.MULTILINE,
++    )
++    _MUTABLE_INSTANCE_EXPORT_RE = re.compile(
++        r"^\s*export\s+(?:default\s+|const\s+[A-Za-z_$][\w$]*(?:\s*:[^=;\n]+)?\s*=\s*)new\s+([A-Za-z_$][\w$.]*)\s*\(",
+         re.MULTILINE,
+     )
++    _IMMUTABLE_EXPORT_CTOR_NAMES = frozenset({
++        "RegExp", "URL", "URLSearchParams", "Error", "TypeError", "RangeError",
++        "SyntaxError", "TextEncoder", "TextDecoder", "Date",
++    })
++    _IMMUTABLE_EXPORT_GUARD_RE = re.compile(
++        r"\bas\s+const\b|\bObject\.freeze\s*\(|:\s*(?:readonly\b|Readonly(?:Array)?\s*<)"
++    )
+ 
+     def _is_barrel_or_test(path: str) -> bool:
+         base = path.rsplit("/", 1)[-1]
+         return base in _BARREL_BASENAMES or ".spec." in base or ".test." in base
+ 
+     def _convergence_has_mutable_state(path: str) -> bool:
+-        content = file_map.get(path, "")
+-        return _MUTABLE_EXPORT_RE.search(content) is not None
++        content = _strip_comments(file_map.get(path, ""))
++        if not content:
++            return False
++        if _MUTABLE_REASSIGNABLE_EXPORT_RE.search(content):
++            return True
++        for match in _MUTABLE_INSTANCE_EXPORT_RE.finditer(content):
++            ctor_name = (match.group(1) or "").rsplit(".", 1)[-1]
++            if ctor_name in _IMMUTABLE_EXPORT_CTOR_NAMES:
++                continue
++            stmt_end = content.find(";", match.start())
++            stmt = content[match.start() : (stmt_end + 1 if stmt_end != -1 else match.start() + 512)]
++            if _IMMUTABLE_EXPORT_GUARD_RE.search(stmt):
++                continue
++            return True
++        return False
+ 
+     diamond_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+ 
+--- a/codebase/performance_analyzers.py
++++ b/codebase/performance_analyzers.py
+@@ -15,7 +15,12 @@
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+-from language_semantics import strip_js_comments as _strip_comments
++from language_semantics import (
++    has_cli_shebang as _has_cli_shebang,
++    is_tool_config_file as _is_tool_config_file,
++    normalize_path as _normalize_path,
++    strip_js_comments as _strip_comments,
++)
+ 
+ 
+ # ============================================================
+@@ -33,16 +38,33 @@
+     r"for\s+(?:const|let|var)\s+\w+\s+(?:of|in)|while\s*\()"
+ )
+ 
++_RETRY_COUNTER_NAME_REGEX = re.compile(
++    r"\b(?:attempt|attempts|retry|retries|tryCount|tries)\b",
++    re.IGNORECASE,
++)
++_FOR_CLAUSE_REGEX = re.compile(r"^\s*for\s*\(([^;]*);([^;]*);([^)]*)\)")
++_WHILE_CLAUSE_REGEX = re.compile(r"^\s*while\s*\(([^)]*)\)")
++_CLI_ENTRYPOINT_KINDS = frozenset({
++    "package_script",
++    "package_bin",
++    "cli_shebang",
++    "tool_config_entry",
++})
+ 
+-def _is_in_loop(lines: List[str], target_idx: int, target_column: Optional[int] = None) -> bool:
+-    """Return True only when the target is lexically enclosed by a loop body."""
++
++def _find_enclosing_loop(
++    lines: List[str],
++    target_idx: int,
++    target_column: Optional[int] = None,
++) -> Optional[Tuple[int, int]]:
++    """Return (header_idx, end_idx) for the innermost loop enclosing target_idx."""
+     previous_idx = target_idx - 1
+     while previous_idx >= 0 and not lines[previous_idx].strip():
+         previous_idx -= 1
+     if previous_idx >= 0:
+         previous = _strip_strings(lines[previous_idx])
+         if "{" not in previous and LOOP_HEADER_REGEX.match(previous):
+-            return True
++            return previous_idx, target_idx
+ 
+     unmatched_closing_braces = 0
+     for i in range(target_idx, -1, -1):
+@@ -58,10 +80,250 @@
+                 if unmatched_closing_braces:
+                     unmatched_closing_braces -= 1
+                 elif LOOP_HEADER_REGEX.match(line[:column]):
++                    depth = 0
++                    for j in range(i, len(lines)):
++                        scan = _strip_strings(lines[j])
++                        start_col = column if j == i else 0
++                        for ch in scan[start_col:]:
++                            if ch == "{":
++                                depth += 1
++                            elif ch == "}":
++                                depth -= 1
++                                if depth == 0:
++                                    return i, j
++                    return i, len(lines) - 1
++    return None
++
++
++def _is_in_loop(lines: List[str], target_idx: int, target_column: Optional[int] = None) -> bool:
++    """Return True only when the target is lexically enclosed by a loop body."""
++    return _find_enclosing_loop(lines, target_idx, target_column) is not None
++
++
++def _is_small_retry_bound(limit_token: str) -> bool:
++    if limit_token.isdigit():
++        return int(limit_token) <= 10
++    # Uppercase constant such as ATTEMPTS / MAX_RETRIES
++    return bool(re.match(r"^[A-Z][A-Z0-9_]+$", limit_token))
++
++
++def _is_bounded_retry_loop(lines: List[str], header_idx: int, end_idx: int) -> bool:
++    """Return True when the enclosing loop is a small bounded retry loop."""
++    header_clean = _strip_strings(lines[header_idx]).strip()
++    block_clean = _strip_strings("\n".join(lines[header_idx : end_idx + 1]))
++
++    for_match = _FOR_CLAUSE_REGEX.match(header_clean)
++    if for_match:
++        init_clause, cond_clause, update_clause = (
++            for_match.group(1),
++            for_match.group(2),
++            for_match.group(3),
++        )
++        counter_match = (
++            _RETRY_COUNTER_NAME_REGEX.search(init_clause)
++            or _RETRY_COUNTER_NAME_REGEX.search(cond_clause)
++            or _RETRY_COUNTER_NAME_REGEX.search(update_clause)
++        )
++        if counter_match:
++            counter_name = counter_match.group(0)
++            cond_clean = cond_clause.strip()
++            if cond_clean:
++                if ".length" in cond_clean:
++                    return False
++                bound_match = re.search(
++                    rf"\b{re.escape(counter_name)}\b\s*(<=?|>=?|!==?)\s*(\d+|[A-Z][A-Z0-9_]+)\b|"
++                    rf"\b(\d+|[A-Z][A-Z0-9_]+)\s*(<=?|>=?)\s*\b{re.escape(counter_name)}\b",
++                    cond_clean,
++                )
++                if bound_match:
++                    limit_tok = bound_match.group(2) or bound_match.group(3)
++                    if limit_tok and _is_small_retry_bound(limit_tok):
++                        return True
++            else:
++                # Pattern: `for (let attempt = 0; ; attempt++) { ... if (... || attempt === 2) throw ...; }`
++                body_bound = re.search(
++                    rf"\b{re.escape(counter_name)}\b\s*(===?|>=?|<=|<)\s*(\d+|[A-Z][A-Z0-9_]+)\b",
++                    block_clean,
++                )
++                has_exit = bool(re.search(r"\b(?:break|throw|return)\b", block_clean))
++                if body_bound and has_exit and _is_small_retry_bound(body_bound.group(2)):
+                     return True
++
++        # Generic small numeric try/catch retry loop (e.g. `for (let i = 0; i < 3; i++) { try { ... break; } catch {} }`)
++        small_loop = re.search(
++            r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([01])\s*;\s*"
++            r"\1\s*(<=?)\s*(\d+)\s*;",
++            header_clean,
++        )
++        if small_loop and re.search(r"\bcatch\b", block_clean) and re.search(
++            r"\b(?:break|throw|return)\b", block_clean
++        ):
++            start_val = int(small_loop.group(2))
++            op = small_loop.group(3)
++            limit_val = int(small_loop.group(4))
++            iterations = (limit_val - start_val) + (1 if op == "<=" else 0)
++            if 1 <= iterations <= 5:
++                return True
++        return False
++
++    while_match = _WHILE_CLAUSE_REGEX.match(header_clean)
++    if while_match:
++        cond_clean = while_match.group(1)
++        counter_match = _RETRY_COUNTER_NAME_REGEX.search(cond_clean)
++        if counter_match and ".length" not in cond_clean:
++            counter_name = counter_match.group(0)
++            bound_match = re.search(
++                rf"\b{re.escape(counter_name)}\b\s*(?:<=?|>=?)\s*(\d+|[A-Z][A-Z0-9_]+)\b",
++                cond_clean,
++            )
++            if bound_match and _is_small_retry_bound(bound_match.group(1)):
++                return True
++    return False
++
++
++def _is_cli_or_tooling_context(
++    file_path: str,
++    raw_content: str,
++    node_meta: Dict[str, Any],
++) -> bool:
++    """Return True when file executes in a CLI script or tooling/build context."""
++    ep_kind = str(node_meta.get("entrypoint_kind") or "")
++    if ep_kind in _CLI_ENTRYPOINT_KINDS:
++        return True
++    if _has_cli_shebang(raw_content):
++        return True
++    if _is_tool_config_file(file_path):
++        return True
++    norm = _normalize_path(file_path).lower()
++    wrapped = f"/{norm.lstrip('/')}"
++    if "/scripts/" in wrapped or "/bin/" in wrapped:
++        return True
+     return False
+ 
+ 
++def _extract_paren_call_and_args(
++    text: str,
++    open_paren_idx: int,
++    max_chars: int = 4096,
++) -> Tuple[str, List[str]]:
++    """Extract balanced `(...)` call substring and top-level comma arguments."""
++    if open_paren_idx < 0 or open_paren_idx >= len(text) or text[open_paren_idx] != "(":
++        return "", []
++    limit = min(len(text), open_paren_idx + max_chars)
++    paren_depth = 0
++    brace_depth = 0
++    bracket_depth = 0
++    quote: Optional[str] = None
++    escaped = False
++    args: List[str] = []
++    arg_start = open_paren_idx + 1
++
++    for idx in range(open_paren_idx, limit):
++        ch = text[idx]
++        if quote is not None:
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == quote:
++                quote = None
++            continue
++        if ch in ("'", '"', "`"):
++            quote = ch
++            continue
++        if ch == "(":
++            paren_depth += 1
++        elif ch == ")":
++            paren_depth -= 1
++            if paren_depth == 0:
++                last_arg = text[arg_start:idx].strip()
++                if last_arg or args:
++                    args.append(last_arg)
++                return text[open_paren_idx : idx + 1], args
++        elif paren_depth == 1:
++            if ch == "{":
++                brace_depth += 1
++            elif ch == "}":
++                brace_depth = max(0, brace_depth - 1)
++            elif ch == "[":
++                bracket_depth += 1
++            elif ch == "]":
++                bracket_depth = max(0, bracket_depth - 1)
++            elif ch == "," and brace_depth == 0 and bracket_depth == 0:
++                args.append(text[arg_start:idx].strip())
++                arg_start = idx + 1
++    return text[open_paren_idx:limit], args
++
++
++def _brace_depth_at(content: str, pos: int) -> int:
++    """Compute `{` minus `}` depth before character index *pos*, skipping strings."""
++    depth = 0
++    quote: Optional[str] = None
++    escaped = False
++    for ch in content[:pos]:
++        if quote is not None:
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == quote:
++                quote = None
++            continue
++        if ch in ("'", '"', "`"):
++            quote = ch
++        elif ch == "{":
++            depth += 1
++        elif ch == "}":
++            depth = max(0, depth - 1)
++    return depth
++
++
++def _is_non_escaping_local_container(
++    content: str,
++    var_name: str,
++    *,
++    is_member: bool = False,
++) -> bool:
++    """Return True when *var_name* is declared inside a function/method block and does not escape."""
++    if is_member or not var_name:
++        return False
++    decl_re = re.compile(
++        rf"(?:^|[;{{\n])\s*((?:const|let|var)\s+{re.escape(var_name)}\b"
++        rf"(?:\s*:[^=;\n]+)?\s*=\s*new\s+(?:Map|Set|WeakMap|WeakSet)\b)",
++        re.MULTILINE,
++    )
++    decls = list(decl_re.finditer(content))
++    if not decls:
++        return False
++    if any(_brace_depth_at(content, match.start(1)) == 0 for match in decls):
++        return False
++    if re.search(rf"\bexport\b[^\n;]*\b{re.escape(var_name)}\b", content):
++        return False
++    for ret_match in re.finditer(r"\breturn\b([^;\n]*)", content):
++        ret_expr = ret_match.group(1)
++        if re.search(
++            rf"\b{re.escape(var_name)}\b(?!\s*\.(?:has|get|set|delete|clear|size|keys|values|entries|forEach)\b)",
++            ret_expr,
++        ):
++            return False
++    if re.search(rf"[\w$.\]]+\s*=\s*{re.escape(var_name)}\s*(?:[;,\n]|$)", content):
++        return False
++    return True
++
++
++def _has_cache_eviction_guard(content: str, var_name: str, is_member: bool) -> bool:
++    """Return True when *content* bounds *var_name* by size and deletes/clears entries."""
++    target_pat = rf"(?:this\.)?{re.escape(var_name)}" if is_member else re.escape(var_name)
++    has_size_bound = bool(re.search(
++        rf"\b{target_pat}\s*\.\s*size\s*(?:>=|>|<=|<|===?|!==?)\s*[\w$.]+|"
++        rf"[\w$.]+\s*(?:<=|<|>=|>)\s*{target_pat}\s*\.\s*size\b",
++        content,
++    ))
++    if not has_size_bound:
++        return False
++    return bool(re.search(rf"\b{target_pat}\s*\.\s*(?:delete|clear)\s*\(", content))
++
++
+ # ============================================================
+ # perf.async — Async Waterfall Detector
+ # ============================================================
+@@ -91,10 +353,13 @@
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
+         content = _strip_comments(raw_content)
+         lines = content.split("\n")
++        node_meta = node_metadata.get(file_path) or {}
++        is_cli_context = _is_cli_or_tooling_context(file_path, raw_content, node_meta)
+ 
+         # --- sequential_await (with dependency check) ---
+         await_lines = []
+@@ -153,7 +418,26 @@
+         for i, line in enumerate(lines):
+             stripped = line.strip()
+             match = AWAIT_INSIDE_REGEX.search(line)
+-            if match and _is_in_loop(lines, i, match.start()):
++            if not match:
++                continue
++            loop_span = _find_enclosing_loop(lines, i, match.start())
++            if loop_span is None:
++                continue
++            header_idx, end_idx = loop_span
++            if _is_bounded_retry_loop(lines, header_idx, end_idx):
++                findings.append({
++                    "type": "await_in_loop",
++                    "severity": "info",
++                    "file": file_path,
++                    "line": i + 1,
++                    "content": stripped,
++                    "bounded_retry_guard": True,
++                    "observation": (
++                        f"await inside bounded retry loop at line {i + 1} "
++                        f"(sequential execution guarded by bounded retry)."
++                    ),
++                })
++            else:
+                 findings.append({
+                     "type": "await_in_loop",
+                     "severity": "high",
+@@ -170,21 +454,36 @@
+         for i, line in enumerate(lines):
+             match = SYNC_IO_REGEX.search(line)
+             if match:
+-                findings.append({
+-                    "type": "sync_io",
+-                    "severity": "high",
+-                    "file": file_path,
+-                    "line": i + 1,
+-                    "sync_method": match.group(1),
+-                    "content": line.strip(),
+-                    "observation": (
+-                        f"Synchronous I/O '{match.group(1)}' at line {i + 1} "
+-                        f"blocks the event loop."
+-                    ),
+-                })
++                if is_cli_context:
++                    findings.append({
++                        "type": "sync_io",
++                        "severity": "info",
++                        "execution_context": "cli_or_tooling_script",
++                        "file": file_path,
++                        "line": i + 1,
++                        "sync_method": match.group(1),
++                        "content": line.strip(),
++                        "observation": (
++                            f"Synchronous I/O '{match.group(1)}' at line {i + 1} "
++                            f"in CLI/tooling script context."
++                        ),
++                    })
++                else:
++                    findings.append({
++                        "type": "sync_io",
++                        "severity": "high",
++                        "file": file_path,
++                        "line": i + 1,
++                        "sync_method": match.group(1),
++                        "content": line.strip(),
++                        "observation": (
++                            f"Synchronous I/O '{match.group(1)}' at line {i + 1} "
++                            f"blocks the event loop."
++                        ),
++                    })
+ 
+-    severity_order = {"high": 0, "medium": 1, "low": 2}
+-    findings.sort(key=lambda f: (severity_order.get(f["severity"], 3), f["file"], f.get("line", 0)))
++    severity_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
++    findings.sort(key=lambda f: (severity_order.get(f["severity"], 4), f["file"], f.get("line", 0)))
+ 
+     return {
+         "analyzer": "perf.async",
+@@ -312,11 +611,14 @@
+ MAP_SET_REGEX = re.compile(
+     r"(?:const|let|var|private|public|protected|readonly)\s+"
+     r"(\w*(?:cache|Cache|pool|Pool|registry|Registry|store|Store)\w*)\s*"
+-    r"=\s*new\s+(Map|Set)\s*\("
++    r"(?::[^=;\n]+)?=\s*new\s+(Map|Set)\b"
+ )
+ OBJ_ALLOC_REGEX = re.compile(r"(?:const|let|var)\s+\w+\s*=\s*\{")
+ ADD_EVENT_LISTENER_REGEX = re.compile(r"\.addEventListener\s*\(")
+ REMOVE_EVENT_LISTENER_REGEX = re.compile(r"\.removeEventListener\s*\(")
++_LISTENER_AUTO_CLEANUP_REGEX = re.compile(
++    r"\bonce\s*:\s*true\b|\bsignal\b(?:\s*[:,}]|\s*$)"
++)
+ 
+ 
+ def analyze_gc_pressure(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+@@ -400,6 +702,8 @@
+             if match:
+                 var_name = match.group(1)
+                 coll_type = match.group(2)
++                if _is_non_escaping_local_container(content, var_name, is_member=False):
++                    continue
+                 has_cleanup = bool(re.search(
+                     rf"{re.escape(var_name)}\.(?:delete|clear)\s*\(|"
+                     rf"{re.escape(var_name)}\.size\s*[<>]",
+@@ -421,23 +725,29 @@
+ 
+         # --- unclosed_event_listener ---
+         if ADD_EVENT_LISTENER_REGEX.search(content) and not REMOVE_EVENT_LISTENER_REGEX.search(content):
+-            for i, line in enumerate(lines):
+-                if ".addEventListener" in line:
+-                    findings.append({
+-                        "type": "unclosed_event_listener",
+-                        "severity": "high",
+-                        "file": file_path,
+-                        "line": i + 1,
+-                        "content": line.strip(),
+-                        "observation": (
+-                            f"addEventListener at line {i + 1} without "
+-                            f"corresponding removeEventListener (memory leak)."
+-                        ),
+-                    })
+-                    break  # satu finding per file cukup
++            for match in ADD_EVENT_LISTENER_REGEX.finditer(content):
++                _, call_args = _extract_paren_call_and_args(content, match.end() - 1)
++                if len(call_args) >= 3:
++                    opts_arg = _strip_strings(call_args[2])
++                    if _LISTENER_AUTO_CLEANUP_REGEX.search(opts_arg):
++                        continue
++                line_num = content[: match.start()].count("\n") + 1
++                line_content = lines[line_num - 1].strip() if 0 <= line_num - 1 < len(lines) else ""
++                findings.append({
++                    "type": "unclosed_event_listener",
++                    "severity": "high",
++                    "file": file_path,
++                    "line": line_num,
++                    "content": line_content,
++                    "observation": (
++                        f"addEventListener at line {line_num} without "
++                        f"corresponding removeEventListener (memory leak)."
++                    ),
++                })
++                break  # satu finding per file cukup
+ 
+-    severity_order = {"high": 0, "medium": 1, "low": 2}
+-    findings.sort(key=lambda f: (severity_order.get(f["severity"], 3), f["file"], f.get("line", 0)))
++    severity_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
++    findings.sort(key=lambda f: (severity_order.get(f["severity"], 4), f["file"], f.get("line", 0)))
+ 
+     return {
+         "analyzer": "perf.gc",
+@@ -479,7 +789,7 @@
+ def analyze_cache(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+     """
+     Migrated dari cache_auditor.py.
+-    Deteksi: nondeterministic_cache_key, key_collision_risk, missing_ttl.
++    Deteksi: nondeterministic_cache_key, key_collision_risk, missing_ttl, unbounded_cache.
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
+@@ -493,6 +803,8 @@
+             continue
+ 
+         has_ttl = bool(TTL_MECHANISM_REGEX.search(content))
++        local_cache: Dict[Tuple[str, bool], bool] = {}
++        eviction_cache: Dict[Tuple[str, bool], bool] = {}
+ 
+         for i, line in enumerate(lines):
+             stripped = line.strip()
+@@ -532,32 +844,59 @@
+             # --- missing_ttl & unbounded_cache ---
+             cache_match = CACHE_SET_REGEX.search(stripped)
+             if cache_match and not has_ttl:
+-                findings.append({
+-                    "type": "missing_ttl",
+-                    "severity": "medium",
+-                    "file": file_path,
+-                    "line": i + 1,
+-                    "variable": cache_match.group(1),
+-                    "content": stripped,
+-                    "observation": (
+-                        f"cache.set() on '{cache_match.group(1)}' at line {i + 1} "
+-                        f"without TTL/expiration mechanism."
+-                    ),
+-                })
+-                findings.append({
+-                    "type": "unbounded_cache",
+-                    "severity": "medium",
+-                    "file": file_path,
+-                    "line": i + 1,
+-                    "variable": cache_match.group(1),
+-                    "content": stripped,
+-                    "observation": (
+-                        f"Unbounded cache collection '{cache_match.group(1)}' at line {i + 1}."
+-                    ),
+-                })
++                var_name = cache_match.group(1)
++                prefix = stripped[: cache_match.start()]
++                is_member = prefix.endswith(".")
++                key = (var_name, is_member)
++                if key not in local_cache:
++                    local_cache[key] = _is_non_escaping_local_container(
++                        content, var_name, is_member=is_member
++                    )
++                if local_cache[key]:
++                    continue
++                if key not in eviction_cache:
++                    eviction_cache[key] = _has_cache_eviction_guard(content, var_name, is_member)
++                if eviction_cache[key]:
++                    findings.append({
++                        "type": "missing_ttl",
++                        "severity": "low",
++                        "eviction_guard": True,
++                        "file": file_path,
++                        "line": i + 1,
++                        "variable": var_name,
++                        "content": stripped,
++                        "observation": (
++                            f"cache.set() on '{var_name}' at line {i + 1} "
++                            f"has capacity eviction guard without TTL/expiration mechanism."
++                        ),
++                    })
++                else:
++                    findings.append({
++                        "type": "missing_ttl",
++                        "severity": "medium",
++                        "file": file_path,
++                        "line": i + 1,
++                        "variable": var_name,
++                        "content": stripped,
++                        "observation": (
++                            f"cache.set() on '{var_name}' at line {i + 1} "
++                            f"without TTL/expiration mechanism."
++                        ),
++                    })
++                    findings.append({
++                        "type": "unbounded_cache",
++                        "severity": "medium",
++                        "file": file_path,
++                        "line": i + 1,
++                        "variable": var_name,
++                        "content": stripped,
++                        "observation": (
++                            f"Unbounded cache collection '{var_name}' at line {i + 1}."
++                        ),
++                    })
+ 
+-    severity_order = {"high": 0, "medium": 1, "low": 2}
+-    findings.sort(key=lambda f: (severity_order.get(f["severity"], 3), f["file"], f.get("line", 0)))
++    severity_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
++    findings.sort(key=lambda f: (severity_order.get(f["severity"], 4), f["file"], f.get("line", 0)))
+ 
+     return {
+         "analyzer": "perf.cache",

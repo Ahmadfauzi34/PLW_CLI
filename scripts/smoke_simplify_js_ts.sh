@@ -109,8 +109,110 @@ fn chain_if(x: i32) -> i32 {
 pub fn pub_wrap(x: i32) -> i32 { return inner(x); }
 EOF
 
+cat > "$TMP/project/g.mjs" <<'EOF'
+function targetMjs(x) { return x; }
+function runMjs(fn) { return Promise.resolve().then(fn); }
+
+function wrap_mjs(x) {
+  return targetMjs(x);
+}
+
+function trap_try_if(u) {
+  try {
+    if (!u) return null;
+  } catch {
+    return null;
+  }
+  return u;
+}
+
+function trap_lit_arg_fwd(x) {
+  return targetMjs("lit", x);
+}
+
+function trap_lit_zero(x) {
+  return targetMjs("lit");
+}
+
+function trap_else_if(a, b) {
+  if (a === 1) {
+    return 1;
+  } else if (b === 2) {
+    return 2;
+  } else {
+    return 3;
+  }
+}
+
+function trap_nested_arrow_else(a) {
+  if (a) {
+    runMjs().catch(() => {
+      return 1;
+    });
+  } else {
+    return 2;
+  }
+  return 0;
+}
+
+function trap_braceless_else(a, b) {
+  if (a) {
+    if (b) return 1;
+  } else {
+    return 2;
+  }
+  return 0;
+}
+EOF
+
+cat > "$TMP/project/h.mts" <<'EOF'
+export function calcMtsA(x: number): number {
+  const a = x + 10;
+  const b = a * 2;
+  return b - 3;
+}
+export function calcMtsB(x: number): number {
+  const a = x + 10;
+  const b = a * 2;
+  return b - 3;
+}
+export function trap_long_ws(x: number): number {
+  /* """                                                                                                                                                                                                                                                                  */
+  const longComment =
+    /*                                                                                                                                                                                                                                                                     */
+    x + 1;
+  return longComment + 2;
+}
+EOF
+
+cat > "$TMP/project/types.d.mts" <<'EOF'
+export declare function dts_trap(x: number): number;
+EOF
+
+cat > "$TMP/project/gen_glue.js" <<'EOF'
+/* @ts-self-types="./gen_glue.d.ts" */
+export function gen_trap(x) {
+  if (x) {
+    return true;
+  }
+  return false;
+}
+EOF
+
+mkdir -p "$TMP/project/public/assets" "$TMP/project/data" "$TMP/project/src/test/kotlin"
+cat > "$TMP/project/public/assets/vendor.js" <<'EOF'
+export function asset_trap(x) {
+  if (x) {
+    return true;
+  }
+  return false;
+}
+EOF
+
 cat > "$TMP/project/f.kt" <<'EOF'
 fun inner(x: Int): Int { return x + 1 }
+
+data class ChatKey(val value: String)
 
 private fun wrap_expr(x: Int): Int = inner(x)
 
@@ -167,6 +269,33 @@ fun destructure(pair: Pair<Int, Int>): Int {
     val (a, b) = pair
     return a + b
 }
+
+override fun trap_override(x: Int): Int = inner(x)
+
+@Test
+fun trap_test_fn(x: Int): Int = inner(x)
+
+fun trap_ctor(path: String): ChatKey = ChatKey(path)
+
+fun trap_lit_kt(x: Int): Int = inner("k", x)
+
+fun trap_elvis_else(x: Int?): Int {
+    if (x != null) {
+        val y = x ?: return 0
+    } else {
+        return 1
+    }
+    return 2
+}
+EOF
+
+cat > "$TMP/project/data/DataRepo.kt" <<'EOF'
+fun data_helper(x: Int): Int = x + 10
+private fun data_wrap(x: Int): Int = data_helper(x)
+EOF
+
+cat > "$TMP/project/src/test/kotlin/WrapTest.kt" <<'EOF'
+fun trap_test_dir(x: Int): Int = inner(x)
 EOF
 
 cd "$TMP/run"
@@ -176,7 +305,7 @@ export XDG_CACHE_HOME="$TMP/home/cache"
 
 ./plw simplify "$TMP/project" --json > "$TMP/simplify.json"
 
-python - "$TMP/simplify.json" "$TMP/project" <<'PY'
+python3 - "$TMP/simplify.json" "$TMP/project" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -188,31 +317,40 @@ bridge = payload.get("canonical_anatomy_bridge", {})
 scope = bridge.get("semantic_frontend_scope", {})
 inventory = bridge.get("language_inventory", {})
 counts = inventory.get("reference_source_counts", {})
+metrics = payload.get("metrics", {})
 
 if bridge.get("semantic_frontend") != "python_ast+js_structural_v2":
     raise SystemExit(f"unexpected frontend: {bridge.get('semantic_frontend')}")
 if scope.get("ts_js_rule_count") != 7:
     raise SystemExit(f"unexpected TS/JS rule count: {scope.get('ts_js_rule_count')}")
 
-for ext in (".ts", ".tsx", ".js", ".jsx"):
-    if counts.get(ext) != 1:
-        raise SystemExit(f"expected exactly one {ext} fixture, got {counts.get(ext)}")
-    if inventory.get("semantic_rule_frontends", {}).get(ext) != "js_structural_v2":
-        raise SystemExit(f"{ext} not bound to js_structural_v2")
+expected_counts = {
+    ".ts": 1, ".tsx": 1, ".js": 3, ".jsx": 1,
+    ".mjs": 1, ".mts": 1, ".rs": 1, ".kt": 3,
+}
+for ext, expected in expected_counts.items():
+    if counts.get(ext) != expected:
+        raise SystemExit(f"expected {expected} {ext} fixtures, got {counts.get(ext)}")
+    expected_frontend = (
+        "rs_structural_v1" if ext == ".rs"
+        else "kt_structural_v1" if ext == ".kt"
+        else "js_structural_v2"
+    )
+    if inventory.get("semantic_rule_frontends", {}).get(ext) != expected_frontend:
+        raise SystemExit(f"{ext} not bound to {expected_frontend}")
+
+if int(metrics.get("generated_files_excluded", 0)) != 2:
+    raise SystemExit(f"expected generated_files_excluded == 2, got {metrics.get('generated_files_excluded')}")
 
 if scope.get("rs_rule_count") != 3:
     raise SystemExit(f"unexpected Rust rule count: {scope.get('rs_rule_count')}")
 if scope.get("kt_rule_count") != 3:
     raise SystemExit(f"unexpected Kotlin rule count: {scope.get('kt_rule_count')}")
-for ext, frontend in ((".rs", "rs_structural_v1"), (".kt", "kt_structural_v1")):
-    if counts.get(ext) != 1:
-        raise SystemExit(f"expected exactly one {ext} fixture, got {counts.get(ext)}")
-    if inventory.get("semantic_rule_frontends", {}).get(ext) != frontend:
-        raise SystemExit(f"{ext} not bound to {frontend}")
 
 kinds = {row.get("kind") for row in payload.get("candidates", [])}
 required = {
     "js_direct_forwarding_wrapper",
+    "js_exact_function_body_duplication",
     "js_boolean_guard_return",
     "js_redundant_else_after_terminal",
     "js_terminal_expression_temporary",
@@ -227,22 +365,29 @@ missing = required - kinds
 if missing:
     raise SystemExit(f"missing expected JS/TS v2 candidate kinds: {sorted(missing)}")
 
-# Trap names must never appear as a candidate member: macro template text,
-# non-forwarding calls, expression-position ifs, tail-value else blocks,
-# else-if chain inner ifs, body-less declarations, and multi-line builder
-# chains truncated to a first-line call (``= JSONObject()`` + ``.put``).
-forbidden_names = {
-    "macro_generated", "not_forward", "expr_if", "tail_if", "chain_if",
-    "declared", "get_str", "raw_braces", "destructure", "trap_chain",
-}
+# Positive regression checks: .mjs and data/*.kt must be in scope.
 seen_names = {
     member.get("name")
     for row in payload.get("candidates", [])
     for member in row.get("members", [])
 }
+for expected_name in ("wrap_mjs", "calcMtsA", "data_wrap"):
+    if expected_name not in seen_names:
+        raise SystemExit(f"expected candidate missing from new scope: {expected_name}")
+
+# Trap names must never appear as a candidate member.
+forbidden_names = {
+    "macro_generated", "not_forward", "expr_if", "tail_if", "chain_if",
+    "declared", "get_str", "raw_braces", "destructure", "trap_chain",
+    "dts_trap", "gen_trap", "asset_trap",
+    "trap_try_if", "trap_lit_arg_fwd", "trap_lit_zero",
+    "trap_else_if", "trap_nested_arrow_else", "trap_braceless_else",
+    "trap_override", "trap_test_fn", "trap_ctor", "trap_lit_kt",
+    "trap_elvis_else", "trap_test_dir",
+}
 leaked = forbidden_names & seen_names
 if leaked:
-    raise SystemExit(f"structural v1 trap leaked into candidates: {sorted(leaked)}")
+    raise SystemExit(f"structural precision trap leaked into candidates: {sorted(leaked)}")
 
 if payload.get("invariants", {}).get("js_structural_frontend_v2_is_not_a_full_js_ts_parser") is not True:
     raise SystemExit("JS/TS v2 parser boundary invariant missing")

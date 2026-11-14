@@ -86,7 +86,7 @@ assert fresh["engine_result"]["stale"]["added"] == 2, fresh
 # Case 2: warm builds it; status afterwards is fresh.
 assert warm["ok"] is True, warm
 assert warm["engine_result"]["exists"] is True, warm
-assert warm["engine_result"]["schema"] == "go10", warm
+assert warm["engine_result"]["schema"] == "go11", warm
 assert warm["engine_result"]["files"] == 2, warm
 assert warm["engine_result"]["chunks"] > 0, warm
 assert warm["engine_result"]["stale"] == {"changed": 0, "added": 0, "removed": 0}, warm

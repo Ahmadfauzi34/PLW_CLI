@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestToCamelToSnake(t *testing.T) {
@@ -371,5 +375,100 @@ func TestRelatedForSelfFilter(t *testing.T) {
 	// Unknown name: no rows, never an error.
 	if rows := ix.relatedFor("nope", "a.mjs", 1); len(rows) != 0 {
 		t.Errorf("relatedFor unknown = %+v, want none", rows)
+	}
+}
+
+func TestExtractRelatedSkipsGeneratedAssets(t *testing.T) {
+	body := "export function foo() { return 1; }\n"
+	for _, tc := range []struct {
+		path string
+		text string
+	}{
+		{"src/types.d.ts", "export declare function foo(): number;\n"},
+		{"public/assets/app.mjs", body},
+		{"math compesor/burn_research.js", "/* @ts-self-types=\"./burn_research.d.ts\" */\n" + body},
+		{"math compesor/glue.mjs", "function m() { return __wbindgen_malloc(1); }\n" + body},
+	} {
+		if _, _, _, ok := extractRelated(tc.path, tc.text); ok {
+			t.Errorf("extractRelated(%q) = ok, want skipped", tc.path)
+		}
+	}
+	doc := "// Talks to wasm-bindgen bridge\n" + body
+	defs, _, _, ok := extractRelated("src/bridge.mjs", doc)
+	if !ok || len(defs) != 1 || defs[0].Name != "foo" {
+		t.Errorf("extractRelated normal JSDoc bridge.mjs = (%+v, %v), want [foo], true", defs, ok)
+	}
+}
+
+func TestRunRelatedCachedMatchesFresh(t *testing.T) {
+	root := t.TempDir()
+	cache := t.TempDir()
+	write := func(rel, body string, mtime time.Time) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(full, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t0 := time.Now().Add(-10 * time.Second).Truncate(time.Second)
+	write("src/impl.ts", "export function buildGraph() { return 1; }\n", t0)
+	write("src/index.ts", "export { buildGraph } from './impl';\n", t0)
+	write("src/lib.rs", "#[wasm_bindgen]\npub fn build_graph() {}\n", t0)
+	write("src/Host.kt", "package io.test\nclass HostRunner {\n  fun buildGraph() {}\n}\n", t0)
+	write("src/impl.d.ts", "export declare function buildGraph(): number;\n", t0)
+
+	cfg := defaultScanConfig()
+	queryCachedAndFresh := func(q string) (relatedEnvelope, relatedEnvelope) {
+		var envFresh, envCached relatedEnvelope
+		rc, out, err := captureStdoutRun(func() int {
+			return runRelated(options{related: q, relatedSet: true, jsonOut: true, cacheDir: cache}, root, cfg)
+		})
+		if err != nil || rc != 0 {
+			t.Fatalf("fresh runRelated(%q) rc=%d err=%v", q, rc, err)
+		}
+		if err := json.Unmarshal([]byte(out), &envFresh); err != nil {
+			t.Fatalf("unmarshal fresh: %v (%s)", err, out)
+		}
+		rc, out, err = captureStdoutRun(func() int {
+			return runRelated(options{related: q, relatedSet: true, cached: true, jsonOut: true, cacheDir: cache}, root, cfg)
+		})
+		if err != nil || rc != 0 {
+			t.Fatalf("cached runRelated(%q) rc=%d err=%v", q, rc, err)
+		}
+		if err := json.Unmarshal([]byte(out), &envCached); err != nil {
+			t.Fatalf("unmarshal cached: %v (%s)", err, out)
+		}
+		return envFresh, envCached
+	}
+
+	f1, c1 := queryCachedAndFresh("buildGraph")
+	if f1.Total != c1.Total || len(f1.Related) != len(c1.Related) || f1.Total != 4 {
+		t.Fatalf("related count mismatch: fresh=%+v cached=%+v", f1, c1)
+	}
+	for i := range f1.Related {
+		if f1.Related[i] != c1.Related[i] {
+			t.Errorf("row[%d] mismatch: fresh=%+v cached=%+v", i, f1.Related[i], c1.Related[i])
+		}
+	}
+
+	// Edit + delete sync: verify cached stays identical to fresh.
+	t1 := t0.Add(2 * time.Second)
+	write("src/impl.ts", "export function buildGraph2() { return 2; }\n", t1)
+	if err := os.Remove(filepath.Join(root, "src/Host.kt")); err != nil {
+		t.Fatal(err)
+	}
+	f2, c2 := queryCachedAndFresh("buildGraph,buildGraph2")
+	if f2.Total != c2.Total || !f2.Batch || !c2.Batch || len(f2.Related) != len(c2.Related) {
+		t.Fatalf("post-sync related mismatch: fresh=%+v cached=%+v", f2, c2)
+	}
+	for i := range f2.Related {
+		if f2.Related[i] != c2.Related[i] {
+			t.Errorf("post-sync row[%d] mismatch: fresh=%+v cached=%+v", i, f2.Related[i], c2.Related[i])
+		}
 	}
 }

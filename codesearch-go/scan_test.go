@@ -138,3 +138,12 @@ func loadGitignoreFromText(content string) []giPattern {
 	}
 	return pats
 }
+
+func TestDefaultScanConfigExtensions(t *testing.T) {
+	cfg := defaultScanConfig()
+	for _, ext := range []string{".rs", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".py", ".go", ".kt"} {
+		if !cfg.Exts[ext] {
+			t.Errorf("defaultScanConfig missing extension %q", ext)
+		}
+	}
+}

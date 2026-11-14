@@ -71,12 +71,13 @@ is null (except `search`, where the engine reports it).
 
 ## Schema contract
 
-The adapter accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` (`core/codesearch_engine.py`), currently `go10`.
+The adapter accepts the schemas listed in `SUPPORTED_SCHEMAS`
+(`core/codesearch_engine.py`), currently `{"go9", "go10", "go11"}`
+with `KNOWN_SCHEMA = "go11"`.
 The machine-checked contract lives in
 [codesearch-go/ENGINE_CONTRACT.md](../codesearch-go/ENGINE_CONTRACT.md)
 and is verified in CI by `scripts/check_engine_contract.sh`. A
-newer engine (`go10`) fails with a message saying the engine is
+newer engine (`go12`) fails with a message saying the engine is
 newer than the PLW build; an older engine fails saying it is stale.
 A schema bump means a new entry in the adapter **and** a new
 contract section, plus the black-box suite and the battery re-run —
@@ -112,10 +113,13 @@ The engine's search index lives under PLW's cache root
 `cache_dir`), overridable per call with `--cache-dir` or
 `CODESEARCH_CACHE_DIR`. `plw ast index status` reports whether an
 index exists for a root and whether it is stale (changed / added /
-removed files); `warm` builds it; `clean` deletes it. Engines that
-predate index management keep answering queries from their own
-default location; only the index commands refuse them, with a
-plain message.
+removed files); `warm` builds it; `clean` deletes it. On `go11+`
+engines with `--cache-dir`, the adapter also passes `--cached` for
+`--callers` and `--related` so structural lookups reuse and sync the
+persisted `.gob` call-site and relation index instead of re-parsing the
+whole tree. Engines that predate index management keep answering
+queries from their own default location; only the index commands
+refuse them, with a plain message.
 
 ## Troubleshooting
 
@@ -124,7 +128,7 @@ plain message.
 - `binary digest ... is not pinned` — rebuild with
   `codesearch-go/build.sh` and pin the digest (above), or set
   `CODESEARCH_ALLOW_UNPINNED=1` explicitly for a development run.
-- `index schema 'go11' is not the known-good 'go10'` — the engine is
+- `index schema 'go12' is not the known-good 'go11'` — the engine is
   newer than this PLW build; upgrade PLW or pin the matching engine.
 - `engine predates index management` — the engine binary is older
   than index support; rebuild it, or use queries without

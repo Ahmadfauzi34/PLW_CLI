@@ -51,6 +51,10 @@ STUB_SOURCE = textwrap.dedent(
         except (ValueError, IndexError):
             return ""
 
+    if env.get("STUB_ARGS_LOG"):
+        with open(env["STUB_ARGS_LOG"], "a", encoding="utf-8") as _logf:
+            _logf.write(json.dumps(args) + "\\n")
+
     # --version answers immediately (even for the sleep variant: the
     # version gate must stay fast while queries may hang).
     if has("--version"):
@@ -60,6 +64,10 @@ STUB_SOURCE = textwrap.dedent(
         commit = env.get("STUB_COMMIT", "abc123def456")
         print(f"codesearch schema={schema} commit={commit} built=unknown go=go1.27.3")
         sys.exit(int(env.get("STUB_VERSION_EXIT", "0")))
+
+    if env.get("STUB_REJECT_CACHED") == "1" and has("--cached"):
+        print("unknown flag: --cached", file=sys.stderr)
+        sys.exit(2)
 
     if env.get("STUB_SLEEP"):
         time.sleep(float(env["STUB_SLEEP"]))
@@ -271,13 +279,13 @@ class AdapterTestCase(unittest.TestCase):
         self.assertIn("digest", str(ctx.exception))
 
     def test_version_schema_checked_before_digest(self):
-        # go11 stub with an unpinned digest must fail with the schema
-        # message (G9 W5), not the pin message. (go11: one past the
-        # current KNOWN_SCHEMA go10, so it is newer by construction.)
-        stub = self.stub(env={"STUB_SCHEMA": "go11"})
+        # go12 stub with an unpinned digest must fail with the schema
+        # message (G9 W5), not the pin message. (go12: one past the
+        # current KNOWN_SCHEMA go11, so it is newer by construction.)
+        stub = self.stub(env={"STUB_SCHEMA": "go12"})
         with self.assertRaises(ce.EngineError) as ctx:
             ce.version_info(stub)
-        self.assertIn("go11", str(ctx.exception))
+        self.assertIn("go12", str(ctx.exception))
         self.assertIn("engine is newer", str(ctx.exception))
         self.assertNotIn("not pinned", str(ctx.exception))
 
@@ -604,11 +612,11 @@ class AdapterTestCase(unittest.TestCase):
         self.assertEqual(out["cache_dir"], str(ce.resolve_cache_dir()))
 
     def test_doctor_schema_mismatch_fields(self):
-        stub = self.stub(env={"STUB_SCHEMA": "go11"})
+        stub = self.stub(env={"STUB_SCHEMA": "go12"})
         out = ce.doctor_status(explicit=str(stub), root=self.fixture)
         self.assertFalse(out["available"])
-        self.assertEqual(out.get("engine_schema"), "go11")
-        self.assertEqual(out.get("known_schema"), "go10")
+        self.assertEqual(out.get("engine_schema"), "go12")
+        self.assertEqual(out.get("known_schema"), "go11")
 
     def test_doctor_envelope(self):
         stub = self.stub()
@@ -662,6 +670,53 @@ class AdapterTestCase(unittest.TestCase):
         self.assertEqual(err["error"], "boom")
         self.assertIsNone(err["engine"])
         self.assertIn("authority_note", err)
+
+    # -- T15: go11 --cached gating ----------------------------------------
+    def _logged_calls(self, log_path):
+        lines = [ln for ln in Path(log_path).read_text(encoding="utf-8").splitlines() if ln.strip()]
+        return [json.loads(ln) for ln in lines]
+
+    def test_cached_passed_for_go11_structural_queries_and_batches(self):
+        log_path = self.root / "args_go11.log"
+        stub = self.stub(env={
+            "STUB_SCHEMA": "go11",
+            "STUB_BATCH": "1",
+            "STUB_ARGS_LOG": str(log_path),
+        })
+        with self.pinned(stub):
+            self._run("callers", stub)
+            self._run("related", stub)
+            self._run("defs", stub)
+            self._run("search", stub)
+            ce.run_batch_query("callers", self.fixture, ["Run", "Greet"], stub, "explicit", 30)
+            ce.run_batch_query("related", self.fixture, ["Run", "Greet"], stub, "explicit", 30)
+        invocations = [a for a in self._logged_calls(log_path) if "--version" not in a]
+        callers_inv = [a for a in invocations if "--callers" in a]
+        related_inv = [a for a in invocations if "--related" in a]
+        other_inv = [a for a in invocations if "--callers" not in a and "--related" not in a]
+        self.assertEqual(len(callers_inv), 2)
+        self.assertEqual(len(related_inv), 2)
+        self.assertTrue(all("--cached" in a for a in callers_inv), callers_inv)
+        self.assertTrue(all("--cached" in a for a in related_inv), related_inv)
+        self.assertTrue(all("--cached" not in a for a in other_inv), other_inv)
+
+    def test_cached_omitted_for_go9_go10_and_no_cache_dir(self):
+        for label, extra_env in (
+            ("go9", {"STUB_SCHEMA": "go9", "STUB_REJECT_CACHED": "1", "STUB_BATCH": "1"}),
+            ("go10", {"STUB_SCHEMA": "go10", "STUB_REJECT_CACHED": "1", "STUB_BATCH": "1"}),
+            ("go11-nocache", {"STUB_SCHEMA": "go11", "STUB_NO_CACHE_DIR": "1", "STUB_REJECT_CACHED": "1", "STUB_BATCH": "1"}),
+        ):
+            with self.subTest(label=label):
+                log_path = self.root / f"args_{label}.log"
+                stub = self.stub(name=f"stub_{label}.py", env={**extra_env, "STUB_ARGS_LOG": str(log_path)})
+                with self.pinned(stub):
+                    out1 = self._run("callers", stub)
+                    out2 = self._run("related", stub)
+                    out3 = ce.run_batch_query("callers", self.fixture, ["Run", "Greet"], stub, "explicit", 30)
+                    out4 = ce.run_batch_query("related", self.fixture, ["Run", "Greet"], stub, "explicit", 30)
+                self.assertTrue(out1["ok"] and out2["ok"] and out3["ok"] and out4["ok"])
+                invocations = [a for a in self._logged_calls(log_path) if "--version" not in a]
+                self.assertTrue(all("--cached" not in a for a in invocations), invocations)
 
 
 if __name__ == "__main__":

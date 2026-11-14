@@ -362,6 +362,87 @@ func compileDefRes(terms []string, core string) []*regexp.Regexp {
 	return out
 }
 
+// matchesDefTermParts checks whether lowerText (lowercased chunk text)
+// contains a definition matching parts with the exact semantics of
+// `(?i)(?:^|[^a-z0-9_])(?:<defKeywords>)\s+(?:\([^)]*\)\s+)?p0[_-]?p1...[_-]?pn(?:[^a-z0-9_.]|$)`
+// without compiling or executing a regexp.
+func matchesDefTermParts(lowerText string, parts []string) bool {
+	if len(parts) == 0 || len(lowerText) == 0 {
+		return false
+	}
+	for _, kw := range defKeywords {
+		for i := 0; i+len(kw) < len(lowerText); {
+			idx := strings.Index(lowerText[i:], kw)
+			if idx < 0 {
+				break
+			}
+			pos := i + idx
+			i = pos + 1
+			if pos > 0 && isWordChar(lowerText[pos-1]) {
+				continue
+			}
+			j := pos + len(kw)
+			if j >= len(lowerText) || !isSpaceByte(lowerText[j]) {
+				continue
+			}
+			for j < len(lowerText) && isSpaceByte(lowerText[j]) {
+				j++
+			}
+			// Match either with or without an optional receiver "(...)\s+".
+			if matchPartsAt(lowerText, j, parts) {
+				return true
+			}
+			if j < len(lowerText) && lowerText[j] == '(' {
+				closeIdx := strings.IndexByte(lowerText[j+1:], ')')
+				if closeIdx >= 0 {
+					afterParen := j + 1 + closeIdx + 1
+					if afterParen < len(lowerText) && isSpaceByte(lowerText[afterParen]) {
+						for afterParen < len(lowerText) && isSpaceByte(lowerText[afterParen]) {
+							afterParen++
+						}
+						if matchPartsAt(lowerText, afterParen, parts) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func matchPartsAt(lowerText string, j int, parts []string) bool {
+	cur := j
+	for pi, part := range parts {
+		if pi > 0 && cur < len(lowerText) && (lowerText[cur] == '_' || lowerText[cur] == '-') {
+			cur++
+		}
+		if cur+len(part) > len(lowerText) || lowerText[cur:cur+len(part)] != part {
+			return false
+		}
+		cur += len(part)
+	}
+	if cur < len(lowerText) {
+		ch := lowerText[cur]
+		if isWordChar(ch) || ch == '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesAnyDefTerm(lowerText string, lowerTerms []string, coreParts []string) bool {
+	for _, lt := range lowerTerms {
+		if lt != "" && matchesDefTermParts(lowerText, []string{lt}) {
+			return true
+		}
+	}
+	if len(coreParts) > 1 && matchesDefTermParts(lowerText, coreParts) {
+		return true
+	}
+	return false
+}
+
 // excludedDocs returns the set of live docs containing all tokens of any
 // exclusion term list (AND within a list, OR across lists). Tokens use the
 // same tokenization as query terms (camelCase-aware) over the union of body
@@ -461,16 +542,12 @@ func (ix *memIndex) searchBody(p queryPlan, excl [][]string, limit int) (int, []
 	}
 
 	avgB, avgP := ix.avgBody(), ix.avgPath()
-	defRes := compileDefRes(allTerms, p.core)
 	coreLower := strings.ToLower(p.core)
-	// lowercased terms for the hasDefPattern gate; include the full core
-	// so camelCase/snake_case definitions match (the joined-identifier case)
-	lowerTerms := make([]string, 0, len(allTerms)+1)
+	coreParts := tokenize(splitCamel(p.core))
+	// lowercased terms for the definition matcher; include all query terms.
+	lowerTerms := make([]string, 0, len(allTerms))
 	for _, t := range allTerms {
 		lowerTerms = append(lowerTerms, strings.ToLower(t))
-	}
-	if coreLower != "" {
-		lowerTerms = append(lowerTerms, coreLower)
 	}
 
 	var scored []scoredChunk
@@ -520,15 +597,8 @@ func (ix *memIndex) searchBody(p queryPlan, excl [][]string, limit int) (int, []
 			score *= exactBonus
 		}
 		if defBoostOn {
-			// Fast gate: hand-rolled matcher quickly rejects non-definitions.
-			// Only run the expensive regex if the gate says "maybe".
-			if hasDefPattern(lowered, lowerTerms) {
-				for _, re := range defRes {
-					if re.MatchString(text) {
-						score *= defBonus
-						break
-					}
-				}
+			if matchesAnyDefTerm(lowered, lowerTerms, coreParts) {
+				score *= defBonus
 			}
 		}
 		scored = append(scored, scoredChunk{doc, score})
@@ -697,33 +767,75 @@ func defNameMatches(chunkName string, parts []string) bool {
 	return norm(chunkName) == joined
 }
 
+func isNonDefDocOrDeclPath(path string) bool {
+	lp := strings.ToLower(path)
+	switch extOf(lp) {
+	case ".md", ".txt", ".rst", ".adoc":
+		return true
+	}
+	for _, suf := range []string{".d.ts", ".d.mts", ".d.cts"} {
+		if strings.HasSuffix(lp, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripCommentLines(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "/*") ||
+			strings.HasPrefix(t, "*") || strings.HasPrefix(t, "*/") ||
+			strings.HasPrefix(t, "#") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
 // filterDefChunks keeps only chunks that define every identifier in the
 // query (see defIdentifierPatterns). A chunk passes an identifier when
 // the definition regex matches its text OR when the AST recorded that
 // identifier as the chunk's defined name (opsi 1, 2026-11-13: trust the
-// AST — a signature chunk carries its defined name). The Name check is
-// what makes the option sound: it ties the chunk to the identifier, so
-// "func foo(bar string)" cannot leak into a query for "bar", keeping the
-// AND semantics across identifiers; and it is what completes the option
-// for one-line and body-less members, which never get a separate
-// signature chunk (astchunk.go: sigEnd == endLine -> no sig chunk) but
-// whose def body chunk carries the same recorded name. Windows and
-// fallback chunks have Name == "" and are unaffected.
+// AST — a signature chunk carries its defined name).
+// In AST-chunked files (ix.files[path].AST), "window" chunks cover only
+// lines outside all AST definitions (imports, headers, comments) and are
+// excluded from definition hits, along with documentation, declaration
+// (.d.ts/.d.mts/.d.cts), and generated files. Fallback chunks run the
+// regex against non-comment lines only.
 func filterDefChunks(sc []scoredChunk, ix *memIndex, plan queryPlan) []scoredChunk {
-	res := defIdentifierPatterns(plan)
 	terms := defIdentifierTerms(plan)
-	if len(res) == 0 || len(terms) != len(res) {
+	if len(terms) == 0 {
 		return nil
 	}
 	var out []scoredChunk
 outer:
 	for _, s := range sc {
 		d := ix.chunks[s.doc]
-		for i, re := range res {
-			if re.MatchString(d.Text) {
+		if isNonDefDocOrDeclPath(d.Path) || ix.files[d.Path].Generated {
+			continue
+		}
+		if ix.files[d.Path].AST && d.Kind == string(kindWindow) {
+			continue
+		}
+		lowerMatchText := ""
+		haveLower := false
+		for i := range terms {
+			if defNameMatches(d.Name, terms[i]) {
 				continue
 			}
-			if defNameMatches(d.Name, terms[i]) {
+			if !haveLower {
+				matchText := d.Text
+				if !ix.files[d.Path].AST || d.Kind == "" || d.Kind == string(kindWindow) {
+					matchText = stripCommentLines(d.Text)
+				}
+				lowerMatchText = strings.ToLower(matchText)
+				haveLower = true
+			}
+			if matchesDefTermParts(lowerMatchText, terms[i]) {
 				continue
 			}
 			continue outer

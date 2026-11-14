@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestCalleeBase(t *testing.T) {
@@ -211,5 +217,128 @@ func TestSplitBatchNames(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+func TestExtractCallsJSX(t *testing.T) {
+	text := "export function Card(props) {\n\treturn renderItem(props.id);\n}\n"
+	sites, ok := extractCalls("src/Card.jsx", text)
+	if !ok {
+		t.Fatal("expected ok for valid JSX")
+	}
+	want := [][3]string{{"renderItem", "Card", "2"}}
+	if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
+func TestExtractCallsSkipsGeneratedAssets(t *testing.T) {
+	body := "export function wrap() { return helper(); }\n"
+	for _, tc := range []struct {
+		path string
+		text string
+	}{
+		{"src/types.d.ts", "export declare function wrap(): void;\n"},
+		{"public/assets/app.js", body},
+		{"math compesor/burn_research.js", "/* @ts-self-types=\"./burn_research.d.ts\" */\n" + body},
+		{"math compesor/node.mjs", "function f() { return this.__wbg_ptr + helper(); }\n"},
+	} {
+		if _, ok := extractCalls(tc.path, tc.text); ok {
+			t.Errorf("extractCalls(%q) = ok, want skipped", tc.path)
+		}
+	}
+	// Normal JS mentioning wasm-bindgen in a comment must still be extracted.
+	doc := "// Talks to wasm-bindgen export helper\nexport function wrap() { return helper(); }\n"
+	sites, ok := extractCalls("src/bridge.js", doc)
+	if !ok || len(sites) != 1 || sites[0].Callee != "helper" {
+		t.Errorf("extractCalls normal JSDoc bridge.js = (%+v, %v), want [helper], true", sites, ok)
+	}
+}
+
+func captureStdoutRun(fn func() int) (int, string, error) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		return 1, "", err
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	rc := fn()
+	_ = w.Close()
+	os.Stdout = old
+	out := <-done
+	_ = r.Close()
+	return rc, out, nil
+}
+
+func TestRunCallersCachedMatchesFresh(t *testing.T) {
+	root := t.TempDir()
+	cache := t.TempDir()
+	write := func(rel, body string, mtime time.Time) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(full, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t0 := time.Now().Add(-10 * time.Second).Truncate(time.Second)
+	write("src/a.ts", "export function run() { helper(); }\nexport function helper() {}\n", t0)
+	write("src/b.jsx", "export function View() { return helper() + other(); }\n", t0)
+	write("public/assets/gen.js", "function ignored() { helper(); other(); }\n", t0)
+	write("src/d.d.ts", "declare function helper(): void;\n", t0)
+
+	cfg := defaultScanConfig()
+	queryCachedAndFresh := func(q string) (callersEnvelope, callersEnvelope) {
+		var envFresh, envCached callersEnvelope
+		rc, out, err := captureStdoutRun(func() int {
+			return runCallers(options{callers: q, callersSet: true, jsonOut: true, cacheDir: cache}, root, cfg)
+		})
+		if err != nil || rc != 0 {
+			t.Fatalf("fresh runCallers(%q) rc=%d err=%v", q, rc, err)
+		}
+		if err := json.Unmarshal([]byte(out), &envFresh); err != nil {
+			t.Fatalf("unmarshal fresh: %v (%s)", err, out)
+		}
+		rc, out, err = captureStdoutRun(func() int {
+			return runCallers(options{callers: q, callersSet: true, cached: true, jsonOut: true, cacheDir: cache}, root, cfg)
+		})
+		if err != nil || rc != 0 {
+			t.Fatalf("cached runCallers(%q) rc=%d err=%v", q, rc, err)
+		}
+		if err := json.Unmarshal([]byte(out), &envCached); err != nil {
+			t.Fatalf("unmarshal cached: %v (%s)", err, out)
+		}
+		return envFresh, envCached
+	}
+
+	// Cold cached run builds gob index; second run hits warm cache.
+	f1, c1 := queryCachedAndFresh("helper,other")
+	if !reflect.DeepEqual(f1, c1) || f1.Total != 3 || !f1.Batch {
+		t.Errorf("batch mismatch: fresh=%+v cached=%+v", f1, c1)
+	}
+	f2, c2 := queryCachedAndFresh("helper")
+	if !reflect.DeepEqual(f2, c2) || f2.Total != 2 || f2.Batch {
+		t.Errorf("warm single mismatch: fresh=%+v cached=%+v", f2, c2)
+	}
+
+	// Edit a file and remove another: --cached syncs incrementally and matches fresh.
+	t1 := t0.Add(2 * time.Second)
+	write("src/a.ts", "export function run() { other(); }\nexport function helper() {}\n", t1)
+	if err := os.Remove(filepath.Join(root, "src/b.jsx")); err != nil {
+		t.Fatal(err)
+	}
+	f3, c3 := queryCachedAndFresh("helper,other")
+	if !reflect.DeepEqual(f3, c3) || f3.Total != 1 || f3.Calls[0].Callee != "other" {
+		t.Errorf("post-sync mismatch: fresh=%+v cached=%+v", f3, c3)
 	}
 }

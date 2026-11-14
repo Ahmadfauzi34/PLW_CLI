@@ -198,8 +198,8 @@ func checkIndexFlags(o options, mode string) error {
 	if o.callersSet || o.relatedSet {
 		return fmt.Errorf("--%s is incompatible with --callers and --related", mode)
 	}
-	if o.defsOnly || o.all || o.limitSet || o.perFileCapSet || o.pathsOnly || o.once || o.full {
-		return fmt.Errorf("--%s is incompatible with --defs-only, --all, --limit, --per-file-cap, --paths-only, --once and --full", mode)
+	if o.defsOnly || o.all || o.limitSet || o.perFileCapSet || o.pathsOnly || o.once || o.full || o.cached {
+		return fmt.Errorf("--%s is incompatible with --defs-only, --all, --limit, --per-file-cap, --paths-only, --once, --full and --cached", mode)
 	}
 	return nil
 }

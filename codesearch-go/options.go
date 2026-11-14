@@ -36,6 +36,7 @@ type options struct {
 	// their own commands: status (read-only probe), warm (build/save),
 	// clean (delete this root's index file).
 	cacheDir    string
+	cached      bool
 	indexStatus bool
 	indexWarm   bool
 	indexClean  bool

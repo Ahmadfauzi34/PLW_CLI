@@ -295,6 +295,9 @@ func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, boo
 		return nil, nil, nil, false
 	}
 	norm := strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+	if isGeneratedOrMinified(relPath, norm, maxLineLenOf(norm)) {
+		return nil, nil, nil, false
+	}
 	src := []byte(norm)
 	li := newLineIndex(src)
 	if relJSExts[ext] {
@@ -791,22 +794,79 @@ func resolveImport(fromFile, spec string, files map[string]bool) string {
 
 // --- resolution ---
 
+// relIndex pre-indexes definitions, re-export edges, FFI bridges, and live
+// nodes once so repeated relatedFor / batch --related queries run in O(1)
+// when no re-export edges or bridges match the queried symbol.
+type relIndex struct {
+	defs       []relDef
+	edges      []relEdge
+	bridges    []relBridge
+	files      map[string]bool
+	defByName  map[string][]relDef
+	defByFile  map[string][]relDef
+	starEdges  []relEdge
+	edgesByExp map[string][]relEdge
+	edgesBySrc map[string][]relEdge
+	liveBase   map[string]bool
+	byRustName map[string][]relBridge
+	byJSName   map[string][]relBridge
+}
+
+func newRelIndex(defs []relDef, edges []relEdge, bridges []relBridge, files map[string]bool) *relIndex {
+	ri := &relIndex{
+		defs:       defs,
+		edges:      edges,
+		bridges:    bridges,
+		files:      files,
+		defByName:  make(map[string][]relDef, len(defs)),
+		defByFile:  make(map[string][]relDef),
+		edgesByExp: make(map[string][]relEdge),
+		edgesBySrc: make(map[string][]relEdge),
+		liveBase:   make(map[string]bool, len(defs)),
+		byRustName: make(map[string][]relBridge, len(bridges)),
+		byJSName:   make(map[string][]relBridge, len(bridges)),
+	}
+	for _, d := range defs {
+		ri.defByName[d.Name] = append(ri.defByName[d.Name], d)
+		ri.defByFile[d.Path] = append(ri.defByFile[d.Path], d)
+		ri.liveBase[d.Path+"\x00"+d.Name] = true
+	}
+	for _, e := range edges {
+		ri.edgesBySrc[e.From] = append(ri.edgesBySrc[e.From], e)
+		if e.Star {
+			ri.starEdges = append(ri.starEdges, e)
+		} else {
+			for expName := range e.Names {
+				ri.edgesByExp[expName] = append(ri.edgesByExp[expName], e)
+			}
+		}
+	}
+	for _, b := range bridges {
+		ri.byRustName[b.RustName] = append(ri.byRustName[b.RustName], b)
+		if b.JSName != "" {
+			ri.byJSName[b.JSName] = append(ri.byJSName[b.JSName], b)
+		}
+	}
+	return ri
+}
+
+func (ri *relIndex) findDef(file, name string) (relDef, bool) {
+	for _, d := range ri.defByFile[file] {
+		if d.Name == name {
+			return d, true
+		}
+	}
+	return relDef{}, false
+}
+
 // resolveRelated computes every row for query: local defs, the full
 // re-export chain (cycle-safe), and the wasm_bindgen bridge if any.
 func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relBridge, files map[string]bool) []relEntry {
+	return newRelIndex(defs, edges, bridges, files).resolve(query)
+}
+
+func (ri *relIndex) resolve(query string) []relEntry {
 	want := calleeBase(query)
-	defByFile := map[string][]relDef{}
-	for _, d := range defs {
-		defByFile[d.Path] = append(defByFile[d.Path], d)
-	}
-	findDef := func(file, name string) (relDef, bool) {
-		for _, d := range defByFile[file] {
-			if d.Name == name {
-				return d, true
-			}
-		}
-		return relDef{}, false
-	}
 	var entries []relEntry
 	seen := map[string]bool{}
 	add := func(e relEntry) {
@@ -817,11 +877,10 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 			entries = append(entries, e)
 		}
 	}
-	for _, d := range defs {
-		if d.Name == want {
-			add(relEntry{Path: d.Path, Line: d.Line, Kind: "def",
-				Detail: fmt.Sprintf("%s defined here", d.Name)})
-		}
+	wantDefs := ri.defByName[want]
+	for _, d := range wantDefs {
+		add(relEntry{Path: d.Path, Line: d.Line, Kind: "def",
+			Detail: fmt.Sprintf("%s defined here", d.Name)})
 	}
 	// F2 phase 1/2: re-export rows are collected, not emitted, until
 	// liveness is known. A row is signal only when its chain ends at
@@ -832,141 +891,137 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 	// traceRow.node is the "file\x00name" the row points at ("" when
 	// the target is unknown); succ maps a node to the nodes its
 	// re-export edges point at, for the liveness fixpoint below.
-	type traceRow struct {
-		entry relEntry
-		node  string
-	}
-	var trace []traceRow
-	succ := map[string][]string{}
-	nkey := func(file, name string) string { return file + "\x00" + name }
-	// traceSeen is separate from `seen`: a trace row is deduped at
-	// collection time, but must NOT count as already-emitted — phase 2
-	// emits through `add`, which skips keys in `seen`. Sharing the map
-	// would silently drop every trace row at emission.
-	traceSeen := map[string]bool{}
-	traceAdd := func(e relEntry, node string) {
-		e.Symbol = want
-		k := fmt.Sprintf("%s:%d:%s:%s", e.Path, e.Line, e.Kind, e.Detail)
-		if !traceSeen[k] {
-			traceSeen[k] = true
-			trace = append(trace, traceRow{e, node})
+	if len(ri.starEdges) > 0 || len(ri.edgesByExp[want]) > 0 {
+		type traceRow struct {
+			entry relEntry
+			node  string
 		}
-	}
-	// Re-export walk: queue of (file, exportedName) to explain.
-	type task struct {
-		file, name string
-	}
-	visited := map[string]bool{}
-	queue := []task{}
-	// processEdge explains one edge that exports exportedName: it
-	// records the row and, when the target does not define the name
-	// itself, queues the target for further chain following.
-	processEdge := func(e relEdge, exportedName string) {
-		local := exportedName
-		if !e.Star {
-			ln, ok := e.Names[exportedName]
-			if !ok {
+		var trace []traceRow
+		succ := map[string][]string{}
+		nkey := func(file, name string) string { return file + "\x00" + name }
+		// traceSeen is separate from `seen`: a trace row is deduped at
+		// collection time, but must NOT count as already-emitted — phase 2
+		// emits through `add`, which skips keys in `seen`. Sharing the map
+		// would silently drop every trace row at emission.
+		traceSeen := map[string]bool{}
+		traceAdd := func(e relEntry, node string) {
+			e.Symbol = want
+			k := fmt.Sprintf("%s:%d:%s:%s", e.Path, e.Line, e.Kind, e.Detail)
+			if !traceSeen[k] {
+				traceSeen[k] = true
+				trace = append(trace, traceRow{e, node})
+			}
+		}
+		// Re-export walk: queue of (file, exportedName) to explain.
+		type task struct {
+			file, name string
+		}
+		visited := map[string]bool{}
+		queue := []task{}
+		// processEdge explains one edge that exports exportedName: it
+		// records the row and, when the target does not define the name
+		// itself, queues the target for further chain following.
+		processEdge := func(e relEdge, exportedName string) {
+			local := exportedName
+			if !e.Star {
+				ln, ok := e.Names[exportedName]
+				if !ok {
+					return
+				}
+				local = ln
+			}
+			target := e.From
+			if e.Target != "" {
+				target = resolveImport(e.From, e.Target, ri.files)
+			}
+			if target == "" {
+				traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+					Detail: fmt.Sprintf("re-exports %s from %q (target not in index)", exportedName, e.Target)}, "")
 				return
 			}
-			local = ln
-		}
-		target := e.From
-		if e.Target != "" {
-			target = resolveImport(e.From, e.Target, files)
-		}
-		if target == "" {
-			traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-				Detail: fmt.Sprintf("re-exports %s from %q (target not in index)", exportedName, e.Target)}, "")
-			return
-		}
-		node := nkey(target, local)
-		succ[nkey(e.From, exportedName)] = append(succ[nkey(e.From, exportedName)], node)
-		if d, ok := findDef(target, local); ok {
-			traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-				Detail: fmt.Sprintf("re-exports %s from %s (defined %s:%d)", exportedName, target, target, d.Line)}, node)
-			return
-		}
-		traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
-			Detail: fmt.Sprintf("re-exports %s via %s (definition not found there)", exportedName, target)}, node)
-		if !visited[node] {
-			visited[node] = true
-			queue = append(queue, task{target, local})
-		}
-	}
-	// Seed: every edge that exports `want` (as its exported name).
-	for _, e := range edges {
-		if e.Star {
-			processEdge(e, want)
-		} else if _, ok := e.Names[want]; ok {
-			processEdge(e, want)
-		}
-	}
-	// Continue chains: an intermediate file that re-exports the name
-	// onward gets its own row, then we follow it.
-	for len(queue) > 0 {
-		t := queue[0]
-		queue = queue[1:]
-		for _, e := range edges {
-			if e.From != t.file {
-				continue
+			node := nkey(target, local)
+			succ[nkey(e.From, exportedName)] = append(succ[nkey(e.From, exportedName)], node)
+			if d, ok := ri.findDef(target, local); ok {
+				traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+					Detail: fmt.Sprintf("re-exports %s from %s (defined %s:%d)", exportedName, target, target, d.Line)}, node)
+				return
 			}
+			traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+				Detail: fmt.Sprintf("re-exports %s via %s (definition not found there)", exportedName, target)}, node)
+			if !visited[node] {
+				visited[node] = true
+				queue = append(queue, task{target, local})
+			}
+		}
+		// Seed: every edge that exports `want` (as its exported name).
+		for _, e := range ri.edges {
 			if e.Star {
-				processEdge(e, t.name)
-			} else if _, ok := e.Names[t.name]; ok {
-				processEdge(e, t.name)
+				processEdge(e, want)
+			} else if _, ok := e.Names[want]; ok {
+				processEdge(e, want)
 			}
 		}
-	}
-	// F2 phase 2: emit only the trace rows on live chains. A node
-	// (file, name) is live when the file defines the name as it
-	// arrives there — the local name, which may differ from the
-	// queried name through an alias (`export {orig as alias}`) — or
-	// re-exports it onward to a live node; the fixpoint converges
-	// even with re-export cycles (each pass only adds nodes).
-	live := map[string]bool{}
-	for _, d := range defs {
-		live[nkey(d.Path, d.Name)] = true
-	}
-	for changed := true; changed; {
-		changed = false
-		for src, dsts := range succ {
-			if live[src] {
-				continue
-			}
-			for _, dst := range dsts {
-				if live[dst] {
-					live[src] = true
-					changed = true
-					break
+		// Continue chains: an intermediate file that re-exports the name
+		// onward gets its own row, then we follow it.
+		for len(queue) > 0 {
+			t := queue[0]
+			queue = queue[1:]
+			for _, e := range ri.edgesBySrc[t.file] {
+				if e.Star {
+					processEdge(e, t.name)
+				} else if _, ok := e.Names[t.name]; ok {
+					processEdge(e, t.name)
 				}
 			}
 		}
-	}
-	// When no chain reaches a definition of `want` and there is no
-	// def row either, the trace is the only information ("looked
-	// here, here, not found"), so it is kept whole instead of
-	// emitting an empty answer.
-	anyLive, hasDef := false, false
-	for _, t := range trace {
-		if t.node != "" && live[t.node] {
-			anyLive = true
-			break
-		}
-	}
-	for _, d := range defs {
-		if d.Name == want {
-			hasDef = true
-			break
-		}
-	}
-	if !anyLive && !hasDef {
-		for _, t := range trace {
-			add(t.entry)
-		}
-	} else {
-		for _, t := range trace {
-			if t.node != "" && live[t.node] {
-				add(t.entry)
+		// F2 phase 2: emit only the trace rows on live chains. A node
+		// (file, name) is live when the file defines the name as it
+		// arrives there — the local name, which may differ from the
+		// queried name through an alias (`export {orig as alias}`) — or
+		// re-exports it onward to a live node; the fixpoint converges
+		// even with re-export cycles (each pass only adds nodes).
+		if len(trace) > 0 {
+			live := map[string]bool{}
+			isLive := func(node string) bool {
+				return ri.liveBase[node] || live[node]
+			}
+			for changed := true; changed; {
+				changed = false
+				for src, dsts := range succ {
+					if isLive(src) {
+						continue
+					}
+					for _, dst := range dsts {
+						if isLive(dst) {
+							live[src] = true
+							changed = true
+							break
+						}
+					}
+				}
+			}
+			// When no chain reaches a definition of `want` and there is no
+			// def row either, the trace is the only information ("looked
+			// here, here, not found"), so it is kept whole instead of
+			// emitting an empty answer.
+			anyLive := false
+			for _, t := range trace {
+				if t.node != "" && isLive(t.node) {
+					anyLive = true
+					break
+				}
+			}
+			hasDef := len(wantDefs) > 0
+			if !anyLive && !hasDef {
+				for _, t := range trace {
+					add(t.entry)
+				}
+			} else {
+				for _, t := range trace {
+					if t.node != "" && isLive(t.node) {
+						add(t.entry)
+					}
+				}
 			}
 		}
 	}
@@ -975,28 +1030,30 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 	// found from either side: by Rust name (default conversion or the
 	// query's snake form) or by its JS name (covers js_name overrides,
 	// whose JS name does not round-trip to the Rust name).
-	rustName := toSnake(query)
-	for _, b := range bridges {
-		if b.RustName != rustName && b.JSName != query && b.JSName != toCamel(query) {
-			continue
-		}
-		jsDef := ""
-		for _, d := range defs {
-			if d.Name == b.JSName {
-				jsDef = fmt.Sprintf("%s:%d", d.Path, d.Line)
-				break
+	if len(ri.bridges) > 0 {
+		rustName := toSnake(query)
+		camelName := toCamel(query)
+		if len(ri.byRustName[rustName]) > 0 || len(ri.byJSName[query]) > 0 || len(ri.byJSName[camelName]) > 0 {
+			for _, b := range ri.bridges {
+				if b.RustName != rustName && b.JSName != query && b.JSName != camelName {
+					continue
+				}
+				jsDef := ""
+				if jsDefs := ri.defByName[b.JSName]; len(jsDefs) > 0 {
+					jsDef = fmt.Sprintf("%s:%d", jsDefs[0].Path, jsDefs[0].Line)
+				}
+				detail := fmt.Sprintf("rust %s -> js %s", b.RustName, b.JSName)
+				if b.Class != "" {
+					detail = fmt.Sprintf("rust %s::%s -> js %s.%s", b.Class, b.RustName, b.Class, b.JSName)
+				}
+				if jsDef != "" {
+					detail += fmt.Sprintf(" (js def in repo: %s)", jsDef)
+				} else {
+					detail += " (js def not in repo: generated binding)"
+				}
+				add(relEntry{Path: b.RustPath, Line: b.RustLine, Kind: "ffi", Detail: detail})
 			}
 		}
-		detail := fmt.Sprintf("rust %s -> js %s", b.RustName, b.JSName)
-		if b.Class != "" {
-			detail = fmt.Sprintf("rust %s::%s -> js %s.%s", b.Class, b.RustName, b.Class, b.JSName)
-		}
-		if jsDef != "" {
-			detail += fmt.Sprintf(" (js def in repo: %s)", jsDef)
-		} else {
-			detail += " (js def not in repo: generated binding)"
-		}
-		add(relEntry{Path: b.RustPath, Line: b.RustLine, Kind: "ffi", Detail: detail})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].Path != entries[j].Path {
@@ -1005,79 +1062,101 @@ func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relB
 		if entries[i].Line != entries[j].Line {
 			return entries[i].Line < entries[j].Line
 		}
-		return entries[i].Kind < entries[j].Kind
+		if entries[i].Kind != entries[j].Kind {
+			return entries[i].Kind < entries[j].Kind
+		}
+		return entries[i].Detail < entries[j].Detail
 	})
 	return entries
 }
 
-// runRelated scans root fresh and prints every row for the queried
-// symbol: local defs, re-export chains, and the wasm_bindgen bridge.
-// Returns a process exit code.
+// runRelated scans root (fresh by default, or cached index with --cached)
+// and prints every row for the queried symbol: local defs, re-export
+// chains, and the wasm_bindgen bridge. Returns a process exit code.
 func runRelated(o options, root string, cfg *ScanConfig) int {
 	names := splitBatchNames(o.related)
 	if len(names) == 0 {
 		fmt.Fprintln(os.Stderr, "codesearch: --related requires a non-empty name")
 		return 2
 	}
-	files := iterFiles(root, cfg)
-	fileSet := map[string]bool{}
-	for _, rel := range files {
-		fileSet[rel] = true
-	}
+	var fileSet map[string]bool
 	var defs []relDef
 	var edges []relEdge
 	var bridges []relBridge
-	// Skip taxonomy, mirroring extractRelated's own order: readSource
-	// failure -> readSource skip -> AST oversize -> unsupported language
-	// -> parse/spec failure or parse timeout. Buckets are disjoint;
-	// parsed + skipped == len(files). Spec-build failures inside
-	// extractRelatedJS/Rust land in parse-fail. The timeout bounds one
-	// file, not the run (see the callers note on leaked goroutines).
-	var parsed, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable int
-	t0 := time.Now()
-	for _, rel := range files {
-		fr := readSource(root, rel)
-		if !fr.statOK {
-			unreadable++
-			continue
+	if o.cached {
+		ix, err := loadCachedIndex(o, root, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "codesearch:", err)
+			return 1
 		}
-		if fr.skip != "" {
-			sourceSkip++
-			continue
+		fileSet = make(map[string]bool, len(ix.files))
+		for rel := range ix.files {
+			fileSet[rel] = true
 		}
-		if len(fr.text) > maxASTBytes {
-			astOversize++
-			continue
+		defs = ix.relDefs
+		edges = ix.relEdges
+		bridges = ix.relBridges
+	} else {
+		files := iterFiles(root, cfg)
+		fileSet = map[string]bool{}
+		for _, rel := range files {
+			fileSet[rel] = true
 		}
-		if ext := extOf(rel); !relJSExts[ext] && ext != ".rs" && ext != ".kt" {
-			unsupported++
-			continue
+		// Skip taxonomy, mirroring extractRelated's own order: readSource
+		// failure -> readSource skip -> AST oversize -> unsupported language
+		// -> generated/minified skip -> parse/spec failure or parse timeout.
+		var parsed, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable int
+		t0 := time.Now()
+		for _, rel := range files {
+			fr := readSource(root, rel)
+			if !fr.statOK {
+				unreadable++
+				continue
+			}
+			if fr.skip != "" {
+				sourceSkip++
+				continue
+			}
+			if len(fr.text) > maxASTBytes {
+				astOversize++
+				continue
+			}
+			if ext := extOf(rel); !relJSExts[ext] && ext != ".rs" && ext != ".kt" {
+				unsupported++
+				continue
+			}
+			norm := strings.ReplaceAll(strings.ReplaceAll(fr.text, "\r\n", "\n"), "\r", "\n")
+			if isGeneratedOrMinified(rel, norm, maxLineLenOf(norm)) {
+				sourceSkip++
+				continue
+			}
+			var d []relDef
+			var e []relEdge
+			var b []relBridge
+			var ok bool
+			if !runTimed(astTimeout, func() {
+				d, e, b, ok = extractRelated(rel, fr.text)
+			}) {
+				timedOut++
+				continue
+			}
+			if !ok {
+				parseFail++
+				continue
+			}
+			parsed++
+			defs = append(defs, d...)
+			edges = append(edges, e...)
+			bridges = append(bridges, b...)
 		}
-		var d []relDef
-		var e []relEdge
-		var b []relBridge
-		var ok bool
-		if !runTimed(astTimeout, func() {
-			d, e, b, ok = extractRelated(rel, fr.text)
-		}) {
-			timedOut++
-			continue
-		}
-		if !ok {
-			parseFail++
-			continue
-		}
-		parsed++
-		defs = append(defs, d...)
-		edges = append(edges, e...)
-		bridges = append(bridges, b...)
+		skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
+		fmt.Fprintf(os.Stderr, "(related: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
+			parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
 	}
-	skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
-	fmt.Fprintf(os.Stderr, "(related: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
-		parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
+	ri := newRelIndex(defs, edges, bridges, fileSet)
 	entries := []relEntry{}
 	for _, name := range names {
-		entries = append(entries, resolveRelated(name, defs, edges, bridges, fileSet)...)
+		entries = append(entries, ri.resolve(name)...)
 	}
 	if o.jsonOut {
 		env := relatedEnvelope{Query: o.related, Batch: len(names) > 1, Total: len(entries), Related: []relEntryJSON{}}

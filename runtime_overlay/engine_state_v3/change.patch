@@ -1,0 +1,143 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -20,9 +20,9 @@
+   codesearch writes its proof lines and summaries to stderr, so
+   stdout stays machine-readable.
+ * Fail-closed.  A missing binary, an unparsable version, a schema
+-  other than the known-good ``go9``, a timeout, a non-zero exit, or
+-  an unparsable JSON response all raise ``EngineError``.  No partial
+-  result is ever presented as success.
++  not listed in ``SUPPORTED_SCHEMAS`` (known-good ``go11``), a timeout,
++  a non-zero exit, or an unparsable JSON response all raise
++  ``EngineError``.  No partial result is ever presented as success.
+ * Discovery.  Explicit path, then the ``CODESEARCH_BIN``
+   environment variable, then ``PATH`` — where the engine is looked
+   up under each of ``PATH_CANDIDATES`` in order (``codesearch``,
+@@ -49,7 +49,7 @@
+   just its self-reported ``--version`` line: ``version_info``
+   rejects any binary whose digest is not in
+   ``PINNED_ENGINE_DIGESTS`` (rejection order: parse → schema →
+-  digest, so a go10 engine still fails with the schema message).
++  digest, so an unsupported newer engine still fails with the schema message).
+   The pin covers the reproducible ``build.sh`` output (same source
+   + toolchain = byte-identical, ``built=unknown``) and the v0.2.5
+   release asset.  An unpinned binary can only run with the
+@@ -84,13 +84,17 @@
+ 
+ CODESEARCH_ENGINE_VERSION = "codesearch-engine-v1"
+ SCHEMA_VERSION = "plw-codesearch-engine-v1"
+-KNOWN_SCHEMA = "go10"
++KNOWN_SCHEMA = "go11"
+ # G13: the adapter accepts exactly these schemas. The value names the
+ # contract each schema implements (see ENGINE_CONTRACT.md); a schema
+ # bump means a new entry here AND a new contract section, plus the
+ # black-box suite and the G9/G13 battery re-run — never a bare
+ # constant change.
+-SUPPORTED_SCHEMAS = {"go9": "plw-codesearch-engine-v1", "go10": "plw-codesearch-engine-v1"}
++SUPPORTED_SCHEMAS = {
++    "go9": "plw-codesearch-engine-v1",
++    "go10": "plw-codesearch-engine-v1",
++    "go11": "plw-codesearch-engine-v1",
++}
+ # G2: digest pin. Keys are SHA256 hex digests of engine binaries PLW
+ # trusts, values name what each digest is. A binary whose digest is
+ # not listed here is refused by version_info unless the explicit
+@@ -156,6 +160,22 @@
+ _SCHEMA_NUM_RE = re.compile(r"^go(\d+)$")
+ 
+ 
++def _schema_number(schema: Any) -> Optional[int]:
++    """Extract numeric schema generation from labels like ``go11``."""
++    match = _SCHEMA_NUM_RE.match(str(schema or ""))
++    return int(match.group(1)) if match else None
++
++
++def _supports_cached_structural(engine: Dict[str, Any]) -> bool:
++    """Whether ``engine`` accepts ``--cached`` on structural queries (go11+)."""
++    schema_num = _schema_number(engine.get("schema"))
++    return (
++        bool(engine.get("cache_dir_supported"))
++        and schema_num is not None
++        and schema_num >= 11
++    )
++
++
+ class EngineError(Exception):
+     """Fail-closed engine failure: nothing usable was produced."""
+ 
+@@ -248,11 +268,11 @@
+     """Run `codesearch --version` and parse it. Fail-closed on anything odd.
+ 
+     Rejection order (G2/G13): unparsable output → schema mismatch →
+-    digest not pinned. The schema check comes first so a go10 engine
+-    still fails with the schema message (G9 W5), and the digest check
+-    is what closes G2: a binary that merely *claims* go9 — a stub
+-    printing a pinned commit included — is refused unless its bytes
+-    match a pinned digest or the explicit opt-out is set.
++    digest not pinned. The schema check comes first so an unsupported
++    schema still fails with the schema message (G9 W5), and the digest
++    check is what closes G2: a binary that merely *claims* a supported
++    schema — a stub printing a pinned commit included — is refused unless
++    its bytes match a pinned digest or the explicit opt-out is set.
+     """
+     try:
+         proc = subprocess.run(
+@@ -283,10 +303,10 @@
+         # is behind; an older engine means the binary is stale. An
+         # unnumbered label falls back to the generic message.
+         direction = ""
+-        got = _SCHEMA_NUM_RE.match(str(info["schema"]))
+-        known = _SCHEMA_NUM_RE.match(KNOWN_SCHEMA)
+-        if got and known:
+-            if int(got.group(1)) > int(known.group(1)):
++        got = _schema_number(info["schema"])
++        known = _schema_number(KNOWN_SCHEMA)
++        if got is not None and known is not None:
++            if got > known:
+                 direction = (
+                     f" (engine is newer than this PLW build: {info['schema']!r} > "
+                     f"{KNOWN_SCHEMA!r}; upgrade PLW or pin the engine)"
+@@ -669,8 +689,12 @@
+         argv = ["--defs-only", query]
+     elif mode == "callers":
+         argv = ["--callers", query]
++        if _supports_cached_structural(engine):
++            argv.append("--cached")
+     elif mode == "related":
+         argv = ["--related", query]
++        if _supports_cached_structural(engine):
++            argv.append("--cached")
+     elif mode == "search":
+         argv = [query]
+         if limit is not None:
+@@ -764,7 +788,8 @@
+ 
+     ``defs`` uses the engine's positional-query batch (one index build,
+     envelope ``{"queries": [{query, total, hits}]}``).  ``callers`` and
+-    ``related`` use the comma-joined flag value: one fresh AST scan,
++    ``related`` use the comma-joined flag value: one AST scan (reusing
++    the synced gob cache via ``--cached`` when engine schema >= go11),
+     one flat envelope carrying a ``"batch": true`` marker, each row
+     carrying its symbol (``callee`` for calls, ``symbol`` for related).
+ 
+@@ -803,6 +828,7 @@
+     if not names:
+         raise EngineError("run_batch_query requires at least one query")
+     engine = engine_status(binary, discovered_via, cache_dir)
++    use_cached = _supports_cached_structural(engine)
+     batch_mode = "batch"
+     grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in names}
+     result: Dict[str, Any] = {}
+@@ -813,8 +839,12 @@
+             argv = ["--defs-only", *chunk]
+         elif mode == "callers":
+             argv = ["--callers", ",".join(chunk)]
++            if use_cached:
++                argv.append("--cached")
+         else:
+             argv = ["--related", ",".join(chunk)]
++            if use_cached:
++                argv.append("--cached")
+         chunk_result = _run_codesearch(
+             binary, root, argv, timeout_s,
+             Path(str(engine["cache_dir"])), bool(engine["cache_dir_supported"]),

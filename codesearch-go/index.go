@@ -8,20 +8,24 @@ import (
 	"crypto/sha1"
 	"encoding/gob"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
-const schemaV = "go10" // go10: TS interface members (method_signature) are definitions (chunking, callers, related); was go9
+const schemaV = "go11" // go11: CallSites + FileMeta.Generated persisted for --cached --callers/--related, AST window/doc/generated filtering in --defs-only; was go10
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {
-	Mtime int64
-	Size  int64
-	AST   bool // true if the file was chunked via AST definitions (not fallback)
+	Mtime     int64
+	Size      int64
+	AST       bool // true if the file was chunked via AST definitions (not fallback)
+	Generated bool // true if generated/minified/declaration asset skipped for AST/calls/defs
 	// Skip explains a manifest-only file: "", "oversize", "binary",
 	// "overchars". Content files have Skip == "".
 	Skip string
@@ -44,12 +48,12 @@ type diskIndex struct {
 	Chunks  []ChunkDoc
 	Files   map[string]FileMeta
 	Newest  int64
-	// Related symbol maps (K15): the --related inputs, persisted so a
-	// cached index can attach related rows to search hits without
-	// re-parsing. relDef/relEdge/relBridge live in related.go.
+	// Related symbol maps (K15) + CallSites (go11): persisted so cached
+	// --related and --callers queries skip full AST re-scans.
 	RelDefs    []relDef
 	RelEdges   []relEdge
 	RelBridges []relBridge
+	CallSites  []callSite
 }
 
 type posting struct {
@@ -70,10 +74,12 @@ type memIndex struct {
 	sumBody int64
 	sumPath int64
 	live    int
-	// Related symbol maps, kept in step with chunks by buildFull/sync.
+	// Related symbol maps + call sites, kept in step with chunks by buildFull/sync.
 	relDefs    []relDef
 	relEdges   []relEdge
 	relBridges []relBridge
+	callSites  []callSite
+	relIdx     *relIndex
 }
 
 func newMemIndex(root string) *memIndex {
@@ -231,6 +237,7 @@ func (ix *memIndex) save(path string) error {
 		RelDefs:    ix.relDefs,
 		RelEdges:   ix.relEdges,
 		RelBridges: ix.relBridges,
+		CallSites:  ix.callSites,
 	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -271,6 +278,7 @@ func memFromDisk(di *diskIndex) *memIndex {
 	ix.relDefs = di.RelDefs
 	ix.relEdges = di.RelEdges
 	ix.relBridges = di.RelBridges
+	ix.callSites = di.CallSites
 	for _, d := range di.Chunks {
 		ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
 	}
@@ -279,6 +287,7 @@ func memFromDisk(di *diskIndex) *memIndex {
 
 // removeRel drops one file's related rows (defs, edges, bridges).
 func (ix *memIndex) removeRel(path string) {
+	ix.relIdx = nil
 	{
 		var out []relDef
 		for _, d := range ix.relDefs {
@@ -308,15 +317,29 @@ func (ix *memIndex) removeRel(path string) {
 	}
 }
 
+// removeCalls drops one file's cached call sites.
+func (ix *memIndex) removeCalls(path string) {
+	var out []callSite
+	for _, c := range ix.callSites {
+		if c.Path != path {
+			out = append(out, c)
+		}
+	}
+	ix.callSites = out
+}
+
 // relatedFor resolves the related rows for one def chunk's name,
 // excluding the chunk's own definition row (the hit IS the def; the
 // interesting rows are its re-exporters and its FFI bridge).
 func (ix *memIndex) relatedFor(name, selfPath string, selfLine int) []relEntry {
-	files := map[string]bool{}
-	for rel := range ix.files {
-		files[rel] = true
+	if ix.relIdx == nil {
+		files := make(map[string]bool, len(ix.files))
+		for rel := range ix.files {
+			files[rel] = true
+		}
+		ix.relIdx = newRelIndex(ix.relDefs, ix.relEdges, ix.relBridges, files)
 	}
-	rows := resolveRelated(name, ix.relDefs, ix.relEdges, ix.relBridges, files)
+	rows := ix.relIdx.resolve(name)
 	var out []relEntry
 	for _, r := range rows {
 		if r.Kind == "def" && r.Path == selfPath && r.Line == selfLine {
@@ -388,21 +411,27 @@ type fileOutcome struct {
 	fr         fileRead
 	docs       []ChunkDoc
 	astOK      bool
+	generated  bool
 	relDefs    []relDef
 	relEdges   []relEdge
 	relBridges []relBridge
 	relOK      bool
+	callSites  []callSite
+	callOK     bool
 }
 
 // processFile reads one file and derives its index inputs: chunk docs
-// (+AST flag) and related maps. Pure — it touches no index state — so
-// buildFull can run it in goroutines and sync can call it inline.
+// (+AST/generated flags), related maps, and call sites. Pure — it touches
+// no index state — so buildFull can run it in goroutines and sync can call it inline.
 func processFile(root, rel string) fileOutcome {
 	fr := readSource(root, rel)
 	out := fileOutcome{fr: fr}
 	if !fr.haveText {
 		return out
 	}
+	norm := strings.ReplaceAll(strings.ReplaceAll(fr.text, "\r\n", "\n"), "\r", "\n")
+	gen := isGeneratedOrMinified(rel, norm, maxLineLenOf(norm))
+	out.generated = gen
 	chunks, astOK := chunkFile(rel, fr.text)
 	out.astOK = astOK
 	for _, c := range chunks {
@@ -414,10 +443,21 @@ func processFile(root, rel string) fileOutcome {
 			Name: c.name,
 		})
 	}
-	// Second parse for the related maps (defs, re-export edges,
-	// bridges). Cost is paid once per build; the gob persists the
-	// maps, so cached runs skip it.
-	out.relDefs, out.relEdges, out.relBridges, out.relOK = extractRelated(rel, fr.text)
+	// Derive related maps and call sites during build/sync so --cached
+	// queries avoid re-parsing unchanged files on every run.
+	if !gen && len(fr.text) <= maxASTBytes {
+		ext := extOf(rel)
+		if relJSExts[ext] || ext == ".rs" || ext == ".kt" {
+			_ = runTimed(astTimeout, func() {
+				out.relDefs, out.relEdges, out.relBridges, out.relOK = extractRelated(rel, fr.text)
+			})
+		}
+		if _, ok := getCallSpec(ext); ok {
+			_ = runTimed(astTimeout, func() {
+				out.callSites, out.callOK = extractCalls(rel, fr.text)
+			})
+		}
+	}
 	return out
 }
 
@@ -451,6 +491,7 @@ func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 			ix.relDefs = append(ix.relDefs, r.relDefs...)
 			ix.relEdges = append(ix.relEdges, r.relEdges...)
 			ix.relBridges = append(ix.relBridges, r.relBridges...)
+			ix.callSites = append(ix.callSites, r.callSites...)
 			st.content++
 		} else {
 			switch r.fr.skip {
@@ -462,7 +503,13 @@ func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 				st.overchars++
 			}
 		}
-		ix.files[rel] = FileMeta{Mtime: r.fr.mtimeNanos, Size: r.fr.size, AST: r.astOK, Skip: r.fr.skip}
+		ix.files[rel] = FileMeta{
+			Mtime:     r.fr.mtimeNanos,
+			Size:      r.fr.size,
+			AST:       r.astOK,
+			Generated: r.generated,
+			Skip:      r.fr.skip,
+		}
 		if r.fr.mtimeNanos > ix.newest {
 			ix.newest = r.fr.mtimeNanos
 		}
@@ -526,6 +573,7 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 		}
 		ix.removePath(rel)
 		ix.removeRel(rel)
+		ix.removeCalls(rel)
 		if fr.haveText {
 			for _, d := range out.docs {
 				ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
@@ -535,13 +583,22 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 				ix.relEdges = append(ix.relEdges, out.relEdges...)
 				ix.relBridges = append(ix.relBridges, out.relBridges...)
 			}
+			if out.callOK {
+				ix.callSites = append(ix.callSites, out.callSites...)
+			}
 			if old[rel] {
 				modified++
 			} else {
 				added++
 			}
 		}
-		ix.files[rel] = FileMeta{Mtime: fr.mtimeNanos, Size: fr.size, AST: out.astOK, Skip: fr.skip}
+		ix.files[rel] = FileMeta{
+			Mtime:     fr.mtimeNanos,
+			Size:      fr.size,
+			AST:       out.astOK,
+			Generated: out.generated,
+			Skip:      fr.skip,
+		}
 		if fr.mtimeNanos > ix.newest {
 			ix.newest = fr.mtimeNanos
 		}
@@ -550,9 +607,78 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 		if !seen[rel] {
 			ix.removePath(rel)
 			ix.removeRel(rel)
+			ix.removeCalls(rel)
 			delete(ix.files, rel)
 			deleted++
 		}
 	}
 	return added, modified, deleted
+}
+
+// formatProof renders the shared proof-line accounting: content files
+// ("files", the searchable set), chunks, AST/fallback mix, skip buckets,
+// and manifest total. One definition across --once, rebuild, and cached
+// lines; content + skipped == manifest by construction (see
+// skipBreakdown). "Skipped" covers read-level skips only (oversize,
+// binary, overchars) — walk-level filtering (extensions, hidden dirs,
+// gitignore, excludes) is not counted here.
+func formatProof(ix *memIndex, content, oversize, binary, overchars, manifest int) string {
+	astF, fbF := ix.chunkingStats()
+	return fmt.Sprintf("%d files, %d chunks; chunking: AST %d files, fallback %d files; skipped %d (oversize %d, binary %d, overchars %d); manifest %d files",
+		content, ix.live, astF, fbF, oversize+binary+overchars, oversize, binary, overchars, manifest)
+}
+
+// loadIndex builds or syncs the gob index for root. --once builds in
+// memory only; otherwise the cached index is loaded, synced, and saved
+// back only when the sync changed something. Proof lines go to stderr.
+func loadIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
+	if o.once {
+		return loadOnceIndex(root, cfg)
+	}
+	return loadCachedIndex(o, root, cfg)
+}
+
+func loadOnceIndex(root string, cfg *ScanConfig) (*memIndex, error) {
+	t0 := time.Now()
+	ix, st := buildFull(root, cfg)
+	fmt.Fprintf(os.Stderr, "(index built in memory: %s; in %s)\n",
+		formatProof(ix, st.content, st.oversize, st.binary, st.overchars, st.manifest), time.Since(t0).Round(time.Millisecond))
+	return ix, nil
+}
+
+func loadCachedIndex(o options, root string, cfg *ScanConfig) (*memIndex, error) {
+	db := cachePath(root, cfg.key(), cacheBaseDir(o.cacheDir))
+	lock := db + ".lock"
+	var ix *memIndex
+	err := withLock(lock, func() error {
+		di, ok := loadDiskIndex(db)
+		if !ok {
+			t0 := time.Now()
+			var st buildStats
+			ix, st = buildFull(root, cfg)
+			if err := ix.save(db); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "(index rebuilt: %s; in %s)\n",
+				formatProof(ix, st.content, st.oversize, st.binary, st.overchars, st.manifest), time.Since(t0).Round(time.Millisecond))
+			return nil
+		}
+		ix = memFromDisk(di)
+		t0 := time.Now()
+		a, m, d := ix.sync(root, cfg)
+		syncDur := time.Since(t0).Round(time.Millisecond)
+		if a+m+d > 0 {
+			if err := ix.save(db); err != nil {
+				return err
+			}
+		}
+		content, ov, bi, oc, manifest := ix.skipBreakdown()
+		fmt.Fprintf(os.Stderr, "(index: %s; synced +%d ~%d -%d in %s)\n",
+			formatProof(ix, content, ov, bi, oc, manifest), a, m, d, syncDur)
+		return nil
+	})
+	if err != nil && ix == nil {
+		return nil, err
+	}
+	return ix, nil
 }
