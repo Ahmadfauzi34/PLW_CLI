@@ -76,6 +76,6 @@ COMMIT="$( (find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' |
 # proxy — vendor/ is committed, so a build without network works
 # and a vendor/modules.txt mismatch fails loudly instead of
 # silently falling back to a download.
-"$GO" build -mod=vendor -trimpath -buildvcs=false -ldflags "-X main.buildCommit=$COMMIT" -o codesearch-go .
+"$GO" build -mod=vendor -trimpath -buildvcs=false -ldflags "-s -w -X main.buildCommit=$COMMIT" -o codesearch-go .
 echo "built ./codesearch-go"
 ./codesearch-go --version

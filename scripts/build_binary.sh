@@ -20,7 +20,10 @@ rm -f plw.spec
 
 ARGS=(--noconfirm --clean --onefile --name plw --paths "$ROOT")
 if [[ -d skills ]]; then
-  ARGS+=(--add-data "skills:skills")
+  rm -rf build/skills
+  mkdir -p build/skills
+  cp -a skills/*.md build/skills/
+  ARGS+=(--add-data "build/skills:skills")
 fi
 if [[ -f VERSION ]]; then
   ARGS+=(--add-data "VERSION:.")
