@@ -332,6 +332,10 @@ grep -Fq 'recovered_lease_expired' fullstack/validation_lease.py
 grep -Fq 'recovered_lease_expired' core/capability_action_lease.py
 grep -Fq 'def kernel_task_chain(' hott_kernel.py
 grep -Fq 'def cmd_chain(' plw_cli.py
+apply_reviewable_overlay "mermaid_graph_v1"
+grep -Fq '"mermaid": _contract(' core/semantic_affordance.py
+grep -Fq 'def kernel_mermaid(' hott_kernel.py
+grep -Fq 'def cmd_mermaid(' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

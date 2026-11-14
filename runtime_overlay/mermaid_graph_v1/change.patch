@@ -1,0 +1,1324 @@
+diff --git a/core/semantic_affordance.py b/core/semantic_affordance.py
+index 3fa0629..5c7b0b6 100644
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -57,6 +57,18 @@ COMMAND_CONTRACTS: Dict[str, Dict[str, Any]] = {
+         ["runtime behavior", "semantic ownership", "correctness", "postcondition", "truth"],
+         "skills/target-codebase-topology-workflow.md",
+     ),
++    "mermaid": _contract(
++        "Multi-Depth Mermaid Architecture & Dependency Graph",
++        ["architecture visualization", "hierarchical dependency graph", "path-trie module clustering", "multi-resolution zoom", "progressive structural disclosure"],
++        ["Mermaid flowchart generator", "hierarchical architecture diagram", "C4-style zoomable codebase map"],
++        ["runtime call trace", "rendered UI layout", "execution authority", "source mutation"],
++        "Repository topology or a specific module/file is being explored, and the human or coding agent needs a compact, multi-depth visual and structural dependency diagram.",
++        "Depth-controlled Mermaid flowchart (L1 subsystem overview, L2 domain module flow, L3 entrypoint/hub/cycle file graph, L4 file micro-neighborhood with symbol outline and blast radius) plus progressive next-zoom CLI hints.",
++        ["Mermaid flowchart source", "compacted subsystem/module clusters", "typed dependency edges", "hub/entrypoint/cycle badges", "next-zoom drill-down commands"],
++        ["MERMAID_GRAPH_READY", "FOCUS_NOT_FOUND", "EMPTY_OR_UNRESOLVED_REPOSITORY"],
++        ["runtime behavior", "semantic ownership", "correctness", "postcondition", "truth"],
++        "skills/target-codebase-topology-workflow.md",
++    ),
+     "resolve-target": _contract(
+         "Target Resolution and Structural Relevance",
+         ["entity resolution", "information retrieval", "dependency graph neighborhood", "reverse dependency reachability", "test/entrypoint reachability"],
+@@ -903,6 +915,7 @@ ALIAS_TO_CANONICAL = {
+     "context-accountability": "accountability",
+     "decision-lineage": "lineage",
+     "delayed-cost": "reconcile-outcomes",
++    "diagram": "mermaid",
+     "evidence-need": "evidence-needs",
+     "execution": "action-lease",
+     "execution-backed-evidence": "validation-scenario-bind",
+@@ -912,6 +925,7 @@ ALIAS_TO_CANONICAL = {
+     "full-stack-state": "fullstack-state",
+     "geometry-reference": "ui-reference",
+     "import-graph": "topology",
++    "mermaid-graph": "mermaid",
+     "model": "transition-model",
+     "obligations": "validation-coverage",
+     "observe-output": "compact-output",
+diff --git a/hott_kernel.py b/hott_kernel.py
+index d92d8c6..1c496a2 100644
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2009,6 +2009,1159 @@ def kernel_topology(
+     }
+ 
+ 
++_MERMAID_DIRECTIONS = ("LR", "TD", "TB", "RL", "BT")
++_MERMAID_DEPTH_NAMES = {
++    1: "subsystem_overview",
++    2: "module_dependency_flow",
++    3: "file_architecture_graph",
++    4: "file_micro_neighborhood",
++}
++
++
++def _mermaid_escape(text: Any) -> str:
++    """Sanitize a string for safe inclusion inside a Mermaid ["..."] node/edge label."""
++    s = str(text or "")
++    s = s.replace("\\", "/")
++    s = s.replace('"', "'").replace("`", "'")
++    s = s.replace("<", "‹").replace(">", "›")
++    s = s.replace("{", "(").replace("}", ")")
++    return s
++
++
++def _mermaid_build_path_trie(rel_paths: List[str]) -> Dict[str, Any]:
++    """Build directory children and direct-file counts for path-trie compaction."""
++    from collections import defaultdict
++    dir_children: Dict[str, set] = defaultdict(set)
++    dir_direct_files: Dict[str, int] = defaultdict(int)
++    dir_total_files: Dict[str, int] = defaultdict(int)
++
++    for rel in rel_paths:
++        parts = [p for p in rel.split("/") if p]
++        if not parts:
++            continue
++        dir_total_files[""] += 1
++        if len(parts) == 1:
++            dir_direct_files[""] += 1
++            continue
++        dirs = parts[:-1]
++        cur = ""
++        for seg in dirs:
++            nxt = f"{cur}/{seg}" if cur else seg
++            dir_children[cur].add(nxt)
++            dir_total_files[nxt] += 1
++            cur = nxt
++        dir_direct_files[cur] += 1
++
++    return {
++        "dir_children": dir_children,
++        "dir_direct_files": dir_direct_files,
++        "dir_total_files": dir_total_files,
++    }
++
++
++def _mermaid_is_passthrough_dir(cur: str, trie: Dict[str, Any]) -> bool:
++    """Return True when `cur` has a single child directory that holds nearly all files."""
++    children = trie["dir_children"].get(cur, ())
++    if len(children) != 1:
++        return False
++    direct = trie["dir_direct_files"].get(cur, 0)
++    total = trie["dir_total_files"].get(cur, 0)
++    return direct == 0 or (direct <= 1 and total > 4)
++
++
++def _mermaid_compact_group(
++    rel_path: str,
++    trie: Dict[str, Any],
++    *,
++    target_splits: int = 1,
++) -> str:
++    """Derive a compacted directory group key by collapsing single-child pass-through dirs."""
++    parts = [p for p in rel_path.split("/") if p]
++    if len(parts) <= 1:
++        return "(root)"
++    dirs = parts[:-1]
++    dir_children = trie["dir_children"]
++    dir_direct_files = trie["dir_direct_files"]
++
++    # Refine depth=1 for nested sub-roots like android/host/src/pi-extensions
++    if target_splits == 1:
++        if "pi-extensions" in dirs:
++            pi_idx = dirs.index("pi-extensions")
++            return "/".join(dirs[: pi_idx + 1])
++        if len(dirs) >= 2 and dirs[0] == "android":
++            if dirs[1] == "host" and len(dirs) >= 3 and dirs[2] == "src":
++                return "android/host/src"
++            return f"android/{dirs[1]}"
++
++    splits_seen = 0
++    cur = ""
++    chosen = dirs[0]
++    for idx, seg in enumerate(dirs):
++        nxt = f"{cur}/{seg}" if cur else seg
++        parent_branches = (
++            len(dir_children.get(cur, ())) > 1
++            or (dir_direct_files.get(cur, 0) > 0 and not _mermaid_is_passthrough_dir(cur, trie))
++        )
++        is_boundary_seg = seg in ("pi-extensions", "packages", "apps", "crates", "plugins", "services")
++        if (idx == 0 and not _mermaid_is_passthrough_dir("", trie)) or parent_branches or is_boundary_seg:
++            splits_seen += 1
++        chosen = nxt
++        cur = nxt
++        if splits_seen >= target_splits:
++            collapsed_steps = 0
++            while _mermaid_is_passthrough_dir(cur, trie):
++                only_child = next(iter(dir_children[cur]))
++                cur = only_child
++                chosen = cur
++                collapsed_steps += 1
++            # If we collapsed a deep package chain (e.g. src/main/kotlin/io/jeph/pipkin)
++            # during module-level grouping (target_splits >= 2), step one level into
++            # the domain package under that namespace root if available.
++            if target_splits >= 2 and collapsed_steps >= 2:
++                rem_idx = len([p for p in cur.split("/") if p])
++                if rem_idx < len(dirs):
++                    chosen = f"{cur}/{dirs[rem_idx]}"
++                    cur = chosen
++            break
++
++    return chosen
++
++
++def _mermaid_short_module_label(group_key: str) -> str:
++    """Shorten long pass-through prefixes (e.g. src/main/kotlin/io/jeph/pipkin/...) for display."""
++    markers = ("/kotlin/io/jeph/", "/java/io/jeph/", "/src/main/kotlin/", "/src/main/java/")
++    for m in markers:
++        if m in group_key:
++            tail = group_key.split(m, 1)[1]
++            prefix = group_key.split("/src/", 1)[0]
++            if "/src/" in group_key:
++                after_src = group_key.split("/src/", 1)[1]
++                flavor = after_src.split("/", 1)[0]
++                if flavor and flavor != "main":
++                    prefix = f"{prefix}({flavor})" if prefix else flavor
++            return f"{prefix}: {tail}" if prefix else tail
++    return group_key
++
++
++def kernel_mermaid(
++    scan_root: str = ".",
++    *,
++    depth: int = 1,
++    focus: Optional[str] = None,
++    direction: str = "LR",
++    max_nodes: int = 24,
++    include_tests: bool = False,
++) -> Dict[str, Any]:
++    """Generate a multi-depth Mermaid architecture & dependency diagram from SharedGraph."""
++    if not SHARED_GRAPH_AVAILABLE or not TARGET_TOPOLOGY_AVAILABLE:
++        return {"error": "mermaid topology generator is unavailable", "available": False}
++    root_error = _validate_scan_root(scan_root)
++    if root_error:
++        return root_error
++    if isinstance(depth, bool) or not isinstance(depth, int) or depth not in (1, 2, 3, 4):
++        return _kernel_error(
++            "invalid_mermaid_depth",
++            "Mermaid depth must be an integer between 1 and 4.",
++            depth=depth,
++            supported_depths=[1, 2, 3, 4],
++        )
++    norm_dir = str(direction or "LR").strip().upper()
++    if norm_dir not in _MERMAID_DIRECTIONS:
++        return _kernel_error(
++            "invalid_mermaid_direction",
++            f"Mermaid direction must be one of {', '.join(_MERMAID_DIRECTIONS)}.",
++            direction=direction,
++            supported_directions=list(_MERMAID_DIRECTIONS),
++        )
++    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or not 4 <= max_nodes <= 120:
++        return _kernel_error(
++            "invalid_mermaid_max_nodes",
++            "Mermaid max_nodes must be an integer between 4 and 120.",
++            max_nodes=max_nodes,
++            minimum=4,
++            maximum=120,
++        )
++
++    from collections import Counter, defaultdict
++
++    root_abs = os.path.abspath(scan_root)
++    graph = _build_kernel_graph(scan_root)
++    graph_sig = (graph.get("cache", {}) or {}).get("graph_content_signature")
++    if not graph_sig and callable(globals().get("graph_content_signature")):
++        try:
++            graph_sig = graph_content_signature(graph)
++        except Exception:
++            graph_sig = None
++
++    orientation = build_target_topology_orientation(
++        graph, top_n=min(50, max(12, max_nodes)), include_edges=True
++    )
++    inv = (orientation.get("inventory") or {})
++    vertices: List[str] = list(graph.get("vertices") or [])
++    raw_edges = list(graph.get("edges") or [])
++    edge_natures: Dict[str, str] = dict(graph.get("edge_natures") or {})
++    node_meta: Dict[str, Dict[str, Any]] = dict(graph.get("node_metadata") or {})
++
++    def _rel(p: str) -> str:
++        try:
++            return os.path.relpath(p, root_abs).replace("\\", "/")
++        except Exception:
++            return str(p).replace("\\", "/")
++
++    active_abs = [
++        v for v in vertices
++        if include_tests or not (node_meta.get(v) or {}).get("is_test", False)
++    ]
++    active_set = set(active_abs)
++    rel_by_abs = {v: _rel(v) for v in active_abs}
++    abs_by_rel = {rel_by_abs[v]: v for v in active_abs}
++
++    if not active_abs:
++        empty_mmd = f"flowchart {norm_dir}\n    EMPTY[\"No supported source files found in {_mermaid_escape(scan_root)}\"]"
++        return {
++            "schema_version": "1.0.0-mermaid-graph",
++            "mode": "mermaid",
++            "decision": "EMPTY_OR_UNRESOLVED_REPOSITORY",
++            "scan_root": scan_root,
++            "graph_signature": graph_sig,
++            "depth": depth,
++            "depth_name": _MERMAID_DEPTH_NAMES[depth],
++            "direction": norm_dir,
++            "focus": focus,
++            "include_tests": bool(include_tests),
++            "summary": {
++                "total_repo_files": len(vertices),
++                "active_files": 0,
++                "rendered_nodes": 0,
++                "rendered_edges": 0,
++            },
++            "mermaid_source": empty_mmd,
++            "nodes": [],
++            "edges": [],
++            "next_zoom_hints": [],
++            "authority": {
++                "read_only": True,
++                "selects_PLW_capability": False,
++                "mutate_source": False,
++                "execute_runtime": False,
++                "commit_truth": False,
++            },
++        }
++
++    trie = _mermaid_build_path_trie(list(rel_by_abs.values()))
++    sccs = list(orientation.get("strongly_connected_components") or [])
++    cyclic_files: set = set()
++    for scc in sccs:
++        for member in (scc.get("members") or []):
++            cyclic_files.add(str(member).replace("\\", "/"))
++
++    focus_norm = str(focus or "").strip().replace("\\", "/").strip("/")
++    root_arg = scan_root if scan_root != "." else "."
++
++    # =========================================================================
++    # DEPTH 1: SUBSYSTEM OVERVIEW
++    # =========================================================================
++    if depth == 1:
++        sub_by_rel = {
++            rel: _mermaid_compact_group(rel, trie, target_splits=1)
++            for rel in rel_by_abs.values()
++        }
++        # If total subsystems is 1 and there are multiple files, split one level deeper
++        if len(set(sub_by_rel.values())) == 1 and len(rel_by_abs) > 1:
++            sub_by_rel = {
++                rel: _mermaid_compact_group(rel, trie, target_splits=2)
++                for rel in rel_by_abs.values()
++            }
++
++        sub_files: Dict[str, List[str]] = defaultdict(list)
++        sub_langs: Dict[str, Counter] = defaultdict(Counter)
++        sub_entrypoints: Counter = Counter()
++        sub_cycles: Counter = Counter()
++        for v_abs, rel in rel_by_abs.items():
++            grp = sub_by_rel[rel]
++            sub_files[grp].append(rel)
++            meta = node_meta.get(v_abs) or {}
++            ext = os.path.splitext(rel)[1].lstrip(".") or str(meta.get("language") or "src")
++            sub_langs[grp][ext] += 1
++            if meta.get("is_entrypoint"):
++                sub_entrypoints[grp] += 1
++        for scc in sccs:
++            members = [str(m).replace("\\", "/") for m in (scc.get("members") or [])]
++            touched = {sub_by_rel[m] for m in members if m in sub_by_rel}
++            for grp in touched:
++                sub_cycles[grp] += 1
++
++        internal_edges: Counter = Counter()
++        cross_edges: Dict[tuple, Counter] = defaultdict(Counter)
++        for u_abs, v_abs in raw_edges:
++            if u_abs not in active_set or v_abs not in active_set:
++                continue
++            u_rel, v_rel = rel_by_abs[u_abs], rel_by_abs[v_abs]
++            gu, gv = sub_by_rel[u_rel], sub_by_rel[v_rel]
++            nat = edge_natures.get(f"{u_abs} -> {v_abs}", "runtime")
++            if gu == gv:
++                internal_edges[gu] += 1
++            else:
++                cross_edges[(gu, gv)][nat] += 1
++
++        all_subsystems = sorted(
++            sub_files.keys(),
++            key=lambda g: (-len(sub_files[g]), -internal_edges[g], g),
++        )
++        if focus_norm:
++            matched_subs = {
++                g for g in all_subsystems
++                if focus_norm.lower() in g.lower()
++                or any(focus_norm.lower() in f.lower() for f in sub_files[g])
++            }
++            if not matched_subs:
++                return {
++                    "schema_version": "1.0.0-mermaid-graph",
++                    "mode": "mermaid",
++                    "decision": "FOCUS_NOT_FOUND",
++                    "scan_root": scan_root,
++                    "graph_signature": graph_sig,
++                    "depth": depth,
++                    "depth_name": _MERMAID_DEPTH_NAMES[depth],
++                    "direction": norm_dir,
++                    "focus": focus,
++                    "available_subsystems": all_subsystems[:20],
++                    "mermaid_source": "",
++                    "nodes": [],
++                    "edges": [],
++                    "next_zoom_hints": [
++                        {
++                            "description": f"Explore subsystem {g} at depth 2",
++                            "command": f"plw mermaid {root_arg} --depth 2 --focus {g}",
++                        }
++                        for g in all_subsystems[:5]
++                    ],
++                    "authority": {
++                        "read_only": True,
++                        "selects_PLW_capability": False,
++                        "mutate_source": False,
++                        "execute_runtime": False,
++                        "commit_truth": False,
++                    },
++                }
++            neighbor_subs = set(matched_subs)
++            for (gu, gv), cnts in cross_edges.items():
++                if sum(cnts.values()) > 0 and (gu in matched_subs or gv in matched_subs):
++                    neighbor_subs.add(gu)
++                    neighbor_subs.add(gv)
++            selected_subs = [g for g in all_subsystems if g in neighbor_subs][:max_nodes]
++        else:
++            selected_subs = all_subsystems[:max_nodes]
++
++        selected_set = set(selected_subs)
++        lines = [
++            f"flowchart {norm_dir}",
++            "    classDef subsystem fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;",
++            "    classDef cyclic fill:#3b1d2e,stroke:#f43f5e,stroke-width:2px,color:#ffe4e6;",
++        ]
++        node_ids: Dict[str, str] = {}
++        nodes_out: List[Dict[str, Any]] = []
++        for idx, grp in enumerate(selected_subs):
++            nid = f"S{idx}"
++            node_ids[grp] = nid
++            f_cnt = len(sub_files[grp])
++            lang_str = ", ".join(f"{k}:{v}" for k, v in sub_langs[grp].most_common(3))
++            ep_cnt = sub_entrypoints[grp]
++            int_cnt = internal_edges[grp]
++            cyc_cnt = sub_cycles[grp]
++            cyc_tag = f" | cycles: {cyc_cnt}" if cyc_cnt else ""
++            label = (
++                f"{_mermaid_escape(grp)}\\n"
++                f"{f_cnt} files ({_mermaid_escape(lang_str)})\\n"
++                f"entrypoints: {ep_cnt} | internal edges: {int_cnt}{cyc_tag}"
++            )
++            cls = "cyclic" if cyc_cnt > 0 else "subsystem"
++            lines.append(f'    {nid}["{label}"]:::{cls}')
++            nodes_out.append({
++                "id": nid,
++                "subsystem": grp,
++                "files": f_cnt,
++                "languages": dict(sub_langs[grp]),
++                "entrypoints": ep_cnt,
++                "internal_edges": int_cnt,
++                "cyclic_sccs": cyc_cnt,
++            })
++
++        edges_out: List[Dict[str, Any]] = []
++        for (gu, gv), cnts in sorted(
++            cross_edges.items(),
++            key=lambda kv: (-sum(kv[1].values()), kv[0][0], kv[0][1]),
++        ):
++            if gu not in selected_set or gv not in selected_set:
++                continue
++            tot = sum(cnts.values())
++            rt = cnts.get("runtime", 0)
++            sp = cnts.get("same_package", 0)
++            to = cnts.get("type_only", 0)
++            parts = []
++            if rt:
++                parts.append(f"rt:{rt}")
++            if sp:
++                parts.append(f"pkg:{sp}")
++            if to:
++                parts.append(f"type:{to}")
++            edge_lbl = f"{tot} edges ({', '.join(parts)})"
++            lines.append(f'    {node_ids[gu]} -->|"{edge_lbl}"| {node_ids[gv]}')
++            edges_out.append({
++                "from": gu,
++                "to": gv,
++                "total": tot,
++                "natures": dict(cnts),
++            })
++
++        zoom_hints = [
++            {
++                "target": grp,
++                "target_kind": "subsystem",
++                "reason": f"{len(sub_files[grp])} files, {internal_edges[grp]} internal edges, {sub_entrypoints[grp]} entrypoints",
++                "command": f"plw mermaid {root_arg} --depth 2 --focus {grp}",
++            }
++            for grp in selected_subs[:6]
++        ]
++        zoom_hints.append({
++            "target": selected_subs[0] if selected_subs else ".",
++            "target_kind": "file_architecture",
++            "reason": "Inspect top entrypoints, hubs, and cyclic files across the repository",
++            "command": f"plw mermaid {root_arg} --depth 3",
++        })
++
++        return {
++            "schema_version": "1.0.0-mermaid-graph",
++            "mode": "mermaid",
++            "decision": "MERMAID_GRAPH_READY",
++            "scan_root": scan_root,
++            "graph_signature": graph_sig,
++            "depth": depth,
++            "depth_name": _MERMAID_DEPTH_NAMES[depth],
++            "direction": norm_dir,
++            "focus": focus,
++            "include_tests": bool(include_tests),
++            "summary": {
++                "total_repo_files": inv.get("files", len(vertices)),
++                "active_files": len(active_abs),
++                "total_subsystems": len(all_subsystems),
++                "rendered_nodes": len(nodes_out),
++                "rendered_edges": len(edges_out),
++                "internal_import_edges": inv.get("internal_import_edges", len(raw_edges)),
++                "entrypoints": inv.get("entrypoints", 0),
++                "cyclic_sccs": inv.get("cyclic_sccs", len(sccs)),
++            },
++            "mermaid_source": "\n".join(lines),
++            "nodes": nodes_out,
++            "edges": edges_out,
++            "next_zoom_hints": zoom_hints,
++            "authority": {
++                "read_only": True,
++                "selects_PLW_capability": False,
++                "mutate_source": False,
++                "execute_runtime": False,
++                "commit_truth": False,
++            },
++        }
++
++    # =========================================================================
++    # DEPTH 2: MODULE / DOMAIN PACKAGE FLOW
++    # =========================================================================
++    if depth == 2:
++        sub_by_rel = {
++            rel: _mermaid_compact_group(rel, trie, target_splits=1)
++            for rel in rel_by_abs.values()
++        }
++        mod_by_rel = {
++            rel: _mermaid_compact_group(rel, trie, target_splits=2)
++            for rel in rel_by_abs.values()
++        }
++        if len(set(mod_by_rel.values())) <= len(set(sub_by_rel.values())):
++            mod_by_rel = {
++                rel: _mermaid_compact_group(rel, trie, target_splits=3)
++                for rel in rel_by_abs.values()
++            }
++
++        mod_files: Dict[str, List[str]] = defaultdict(list)
++        mod_parent_sub: Dict[str, str] = {}
++        for v_abs, rel in rel_by_abs.items():
++            m = mod_by_rel[rel]
++            mod_files[m].append(rel)
++            mod_parent_sub[m] = sub_by_rel[rel]
++
++        mod_internal: Counter = Counter()
++        mod_cross: Dict[tuple, Counter] = defaultdict(Counter)
++        mod_traffic: Counter = Counter()
++        for u_abs, v_abs in raw_edges:
++            if u_abs not in active_set or v_abs not in active_set:
++                continue
++            u_rel, v_rel = rel_by_abs[u_abs], rel_by_abs[v_abs]
++            mu, mv = mod_by_rel[u_rel], mod_by_rel[v_rel]
++            nat = edge_natures.get(f"{u_abs} -> {v_abs}", "runtime")
++            if mu == mv:
++                mod_internal[mu] += 1
++            else:
++                mod_cross[(mu, mv)][nat] += 1
++                mod_traffic[mu] += 1
++                mod_traffic[mv] += 1
++
++        all_modules = sorted(
++            mod_files.keys(),
++            key=lambda m: (-(mod_traffic[m] + mod_internal[m] * 2 + len(mod_files[m])), m),
++        )
++        if focus_norm:
++            matched_mods = {
++                m for m in all_modules
++                if focus_norm.lower() in m.lower()
++                or focus_norm.lower() in mod_parent_sub.get(m, "").lower()
++                or any(focus_norm.lower() in f.lower() for f in mod_files[m])
++            }
++            if not matched_mods:
++                return {
++                    "schema_version": "1.0.0-mermaid-graph",
++                    "mode": "mermaid",
++                    "decision": "FOCUS_NOT_FOUND",
++                    "scan_root": scan_root,
++                    "graph_signature": graph_sig,
++                    "depth": depth,
++                    "depth_name": _MERMAID_DEPTH_NAMES[depth],
++                    "direction": norm_dir,
++                    "focus": focus,
++                    "available_modules": all_modules[:25],
++                    "mermaid_source": "",
++                    "nodes": [],
++                    "edges": [],
++                    "next_zoom_hints": [
++                        {
++                            "description": f"Zoom into module {m}",
++                            "command": f"plw mermaid {root_arg} --depth 2 --focus {m}",
++                        }
++                        for m in all_modules[:5]
++                    ],
++                    "authority": {
++                        "read_only": True,
++                        "selects_PLW_capability": False,
++                        "mutate_source": False,
++                        "execute_runtime": False,
++                        "commit_truth": False,
++                    },
++                }
++            # Include direct cross-module neighbors of matched modules
++            expanded_mods = set(matched_mods)
++            for (mu, mv), cnts in sorted(
++                mod_cross.items(), key=lambda kv: -sum(kv[1].values())
++            ):
++                if len(expanded_mods) >= max_nodes:
++                    break
++                if mu in matched_mods or mv in matched_mods:
++                    expanded_mods.add(mu)
++                    expanded_mods.add(mv)
++            selected_mods = [
++                m for m in all_modules if m in matched_mods
++            ][:max_nodes]
++            for m in all_modules:
++                if len(selected_mods) >= max_nodes:
++                    break
++                if m in expanded_mods and m not in selected_mods:
++                    selected_mods.append(m)
++        else:
++            selected_mods = all_modules[:max_nodes]
++
++        selected_set = set(selected_mods)
++        by_sub: Dict[str, List[str]] = defaultdict(list)
++        for m in selected_mods:
++            by_sub[mod_parent_sub.get(m, "(root)")].append(m)
++
++        lines = [
++            f"flowchart {norm_dir}",
++            "    classDef mod fill:#0f172a,stroke:#38bdf8,stroke-width:1.5px,color:#f1f5f9;",
++            "    classDef hubmod fill:#1e1b4b,stroke:#818cf8,stroke-width:2px,color:#e0e7ff;",
++        ]
++        node_ids: Dict[str, str] = {}
++        nodes_out: List[Dict[str, Any]] = []
++        idx = 0
++        top_hub_files_for_hints: List[tuple] = []
++
++        for sub_name, mods in sorted(by_sub.items(), key=lambda kv: (-len(kv[1]), kv[0])):
++            sg_id = f"SG_{abs(hash(sub_name)) % 100000}"
++            lines.append(f'    subgraph {sg_id} ["{_mermaid_escape(sub_name)}"]')
++            for m in sorted(mods):
++                nid = f"M{idx}"
++                idx += 1
++                node_ids[m] = nid
++                files_in_m = mod_files[m]
++                scored_files = []
++                for f_rel in files_in_m:
++                    v_abs = abs_by_rel.get(f_rel, "")
++                    meta = node_meta.get(v_abs) or {}
++                    fi = int(meta.get("fan_in", 0))
++                    fo = int(meta.get("fan_out", 0))
++                    ep = bool(meta.get("is_entrypoint", False))
++                    scored_files.append((fi + fo + (10 if ep else 0), fi, fo, ep, f_rel))
++                scored_files.sort(reverse=True)
++                if scored_files:
++                    top_hub_files_for_hints.append(scored_files[0])
++                top_names = [
++                    f"{os.path.basename(t[4])} ({t[1] + t[2]})"
++                    for t in scored_files[:2]
++                    if (t[1] + t[2]) > 0 or t[3]
++                ]
++                hub_line = f"\\nhubs: {_mermaid_escape(', '.join(top_names))}" if top_names else ""
++                short_lbl = _mermaid_short_module_label(m)
++                lbl = f"{_mermaid_escape(short_lbl)}\\n{len(files_in_m)} files | int:{mod_internal[m]}{hub_line}"
++                cls = "hubmod" if (mod_traffic[m] + mod_internal[m]) >= 12 else "mod"
++                lines.append(f'        {nid}["{lbl}"]:::{cls}')
++                nodes_out.append({
++                    "id": nid,
++                    "module": m,
++                    "subsystem": sub_name,
++                    "files": len(files_in_m),
++                    "internal_edges": mod_internal[m],
++                    "cross_module_traffic": mod_traffic[m],
++                    "top_files": [t[4] for t in scored_files[:3]],
++                })
++            lines.append("    end")
++
++        edges_out: List[Dict[str, Any]] = []
++        ranked_edges = sorted(
++            [
++                ((mu, mv), cnts)
++                for (mu, mv), cnts in mod_cross.items()
++                if mu in selected_set and mv in selected_set
++            ],
++            key=lambda kv: (-sum(kv[1].values()), kv[0][0], kv[0][1]),
++        )
++        for (mu, mv), cnts in ranked_edges[: max_nodes * 3]:
++            tot = sum(cnts.values())
++            rt = cnts.get("runtime", 0)
++            sp = cnts.get("same_package", 0)
++            to = cnts.get("type_only", 0)
++            if rt > 0:
++                lines.append(f'    {node_ids[mu]} -->|"{tot}"| {node_ids[mv]}')
++            elif sp > 0:
++                lines.append(f'    {node_ids[mu]} -. "pkg:{sp}" .-> {node_ids[mv]}')
++            else:
++                lines.append(f'    {node_ids[mu]} -. "type:{to}" .-> {node_ids[mv]}')
++            edges_out.append({
++                "from": mu,
++                "to": mv,
++                "total": tot,
++                "natures": dict(cnts),
++            })
++
++        top_hub_files_for_hints.sort(reverse=True)
++        zoom_hints = [
++            {
++                "target": m,
++                "target_kind": "module_files",
++                "reason": f"Inspect file-to-file connections inside module {m} ({len(mod_files[m])} files)",
++                "command": f"plw mermaid {root_arg} --depth 3 --focus {m}",
++            }
++            for m in selected_mods[:4]
++        ]
++        for score, fi, fo, ep, f_rel in top_hub_files_for_hints[:3]:
++            zoom_hints.append({
++                "target": f_rel,
++                "target_kind": "file_micro_neighborhood",
++                "reason": f"Inspect symbol declarations & blast radius of hub {os.path.basename(f_rel)} (in={fi}, out={fo})",
++                "command": f"plw mermaid {root_arg} --depth 4 --focus {f_rel}",
++            })
++
++        return {
++            "schema_version": "1.0.0-mermaid-graph",
++            "mode": "mermaid",
++            "decision": "MERMAID_GRAPH_READY",
++            "scan_root": scan_root,
++            "graph_signature": graph_sig,
++            "depth": depth,
++            "depth_name": _MERMAID_DEPTH_NAMES[depth],
++            "direction": norm_dir,
++            "focus": focus,
++            "include_tests": bool(include_tests),
++            "summary": {
++                "total_repo_files": inv.get("files", len(vertices)),
++                "active_files": len(active_abs),
++                "total_modules": len(all_modules),
++                "rendered_nodes": len(nodes_out),
++                "rendered_edges": len(edges_out),
++            },
++            "mermaid_source": "\n".join(lines),
++            "nodes": nodes_out,
++            "edges": edges_out,
++            "next_zoom_hints": zoom_hints,
++            "authority": {
++                "read_only": True,
++                "selects_PLW_capability": False,
++                "mutate_source": False,
++                "execute_runtime": False,
++                "commit_truth": False,
++            },
++        }
++
++    # =========================================================================
++    # DEPTH 3: FILE-LEVEL ARCHITECTURE (ENTRYPOINTS, HUBS & CYCLES)
++    # =========================================================================
++    if depth == 3:
++        mod_by_rel = {
++            rel: _mermaid_compact_group(rel, trie, target_splits=2)
++            for rel in rel_by_abs.values()
++        }
++        scored_all: List[tuple] = []
++        for v_abs, rel in rel_by_abs.items():
++            meta = node_meta.get(v_abs) or {}
++            fi = int(meta.get("fan_in", 0))
++            fo = int(meta.get("fan_out", 0))
++            ep = bool(meta.get("is_entrypoint", False))
++            in_cyc = rel in cyclic_files
++            score = (fi * 2) + fo + (25 if ep else 0) + (20 if in_cyc else 0)
++            scored_all.append((score, fi, fo, ep, in_cyc, rel, v_abs))
++        scored_all.sort(reverse=True)
++
++        if focus_norm:
++            seed_rels = {
++                item[5] for item in scored_all
++                if focus_norm.lower() in item[5].lower()
++                or focus_norm.lower() in mod_by_rel.get(item[5], "").lower()
++            }
++            if not seed_rels:
++                return {
++                    "schema_version": "1.0.0-mermaid-graph",
++                    "mode": "mermaid",
++                    "decision": "FOCUS_NOT_FOUND",
++                    "scan_root": scan_root,
++                    "graph_signature": graph_sig,
++                    "depth": depth,
++                    "depth_name": _MERMAID_DEPTH_NAMES[depth],
++                    "direction": norm_dir,
++                    "focus": focus,
++                    "mermaid_source": "",
++                    "nodes": [],
++                    "edges": [],
++                    "next_zoom_hints": [
++                        {
++                            "target": item[5],
++                            "target_kind": "file",
++                            "command": f"plw mermaid {root_arg} --depth 3 --focus {os.path.dirname(item[5]) or item[5]}",
++                        }
++                        for item in scored_all[:5]
++                    ],
++                    "authority": {
++                        "read_only": True,
++                        "selects_PLW_capability": False,
++                        "mutate_source": False,
++                        "execute_runtime": False,
++                        "commit_truth": False,
++                    },
++                }
++            selected_rels: List[str] = [
++                item[5] for item in scored_all if item[5] in seed_rels
++            ][:max_nodes]
++            # Add 1-hop neighbors if room remains
++            if len(selected_rels) < max_nodes:
++                neighbor_rels: set = set()
++                for u_abs, v_abs in raw_edges:
++                    if u_abs not in active_set or v_abs not in active_set:
++                        continue
++                    ur, vr = rel_by_abs[u_abs], rel_by_abs[v_abs]
++                    if ur in seed_rels:
++                        neighbor_rels.add(vr)
++                    if vr in seed_rels:
++                        neighbor_rels.add(ur)
++                for item in scored_all:
++                    if len(selected_rels) >= max_nodes:
++                        break
++                    if item[5] in neighbor_rels and item[5] not in selected_rels:
++                        selected_rels.append(item[5])
++        else:
++            selected_rels = [item[5] for item in scored_all[:max_nodes]]
++
++        selected_rel_set = set(selected_rels)
++        by_mod: Dict[str, List[str]] = defaultdict(list)
++        for rel in selected_rels:
++            by_mod[mod_by_rel.get(rel, "(root)")].append(rel)
++
++        lines = [
++            f"flowchart {norm_dir}",
++            "    classDef entrypoint fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#ecfdf5;",
++            "    classDef hub fill:#1e1b4b,stroke:#6366f1,stroke-width:2px,color:#e0e7ff;",
++            "    classDef cycle fill:#4c0519,stroke:#f43f5e,stroke-width:2.5px,color:#ffe4e6;",
++            "    classDef file fill:#0f172a,stroke:#475569,stroke-width:1px,color:#f1f5f9;",
++        ]
++        node_ids: Dict[str, str] = {}
++        nodes_out: List[Dict[str, Any]] = []
++        idx = 0
++        for mod_name, rels in sorted(by_mod.items(), key=lambda kv: (-len(kv[1]), kv[0])):
++            sg_id = f"FG_{abs(hash(mod_name)) % 100000}"
++            short_mod = _mermaid_short_module_label(mod_name)
++            lines.append(f'    subgraph {sg_id} ["{_mermaid_escape(short_mod)}"]')
++            for rel in sorted(rels):
++                nid = f"F{idx}"
++                idx += 1
++                node_ids[rel] = nid
++                v_abs = abs_by_rel[rel]
++                meta = node_meta.get(v_abs) or {}
++                fi = int(meta.get("fan_in", 0))
++                fo = int(meta.get("fan_out", 0))
++                ep = bool(meta.get("is_entrypoint", False))
++                ep_kind = str(meta.get("entrypoint_kind") or "")
++                in_cyc = rel in cyclic_files
++                badges = []
++                if ep:
++                    badges.append(f"ENTRYPOINT:{ep_kind}" if ep_kind else "ENTRYPOINT")
++                if in_cyc:
++                    badges.append("CYCLE")
++                if fi >= 6 or fo >= 8:
++                    badges.append("HUB")
++                badge_line = f"[{_mermaid_escape(', '.join(badges))}]\\n" if badges else ""
++                bname = os.path.basename(rel)
++                lbl = f"{badge_line}{_mermaid_escape(bname)}\\nin={fi} out={fo}"
++                if in_cyc:
++                    cls = "cycle"
++                elif ep:
++                    cls = "entrypoint"
++                elif fi >= 6 or fo >= 8:
++                    cls = "hub"
++                else:
++                    cls = "file"
++                lines.append(f'        {nid}["{lbl}"]:::{cls}')
++                nodes_out.append({
++                    "id": nid,
++                    "file": rel,
++                    "module": mod_name,
++                    "fan_in": fi,
++                    "fan_out": fo,
++                    "is_entrypoint": ep,
++                    "entrypoint_kind": ep_kind or None,
++                    "in_cycle": in_cyc,
++                })
++            lines.append("    end")
++
++        edges_out: List[Dict[str, Any]] = []
++        for u_abs, v_abs in raw_edges:
++            if u_abs not in active_set or v_abs not in active_set:
++                continue
++            ur, vr = rel_by_abs[u_abs], rel_by_abs[v_abs]
++            if ur not in selected_rel_set or vr not in selected_rel_set or ur == vr:
++                continue
++            nat = edge_natures.get(f"{u_abs} -> {v_abs}", "runtime")
++            if nat == "same_package":
++                lines.append(f"    {node_ids[ur]} -. same_pkg .-> {node_ids[vr]}")
++            elif nat == "type_only":
++                lines.append(f"    {node_ids[ur]} -. type .-> {node_ids[vr]}")
++            else:
++                lines.append(f"    {node_ids[ur]} --> {node_ids[vr]}")
++            edges_out.append({
++                "from": ur,
++                "to": vr,
++                "nature": nat,
++            })
++
++        zoom_hints = [
++            {
++                "target": n["file"],
++                "target_kind": "file_micro_neighborhood",
++                "reason": f"Inspect internal symbols and blast radius of {os.path.basename(n['file'])} (in={n['fan_in']}, out={n['fan_out']})",
++                "command": f"plw mermaid {root_arg} --depth 4 --focus {n['file']}",
++            }
++            for n in sorted(
++                nodes_out,
++                key=lambda x: (-(x["fan_in"] * 2 + x["fan_out"] + (20 if x["in_cycle"] else 0)), x["file"]),
++            )[:6]
++        ]
++
++        return {
++            "schema_version": "1.0.0-mermaid-graph",
++            "mode": "mermaid",
++            "decision": "MERMAID_GRAPH_READY",
++            "scan_root": scan_root,
++            "graph_signature": graph_sig,
++            "depth": depth,
++            "depth_name": _MERMAID_DEPTH_NAMES[depth],
++            "direction": norm_dir,
++            "focus": focus,
++            "include_tests": bool(include_tests),
++            "summary": {
++                "total_repo_files": inv.get("files", len(vertices)),
++                "active_files": len(active_abs),
++                "rendered_nodes": len(nodes_out),
++                "rendered_edges": len(edges_out),
++                "cyclic_files_rendered": sum(1 for n in nodes_out if n["in_cycle"]),
++                "entrypoints_rendered": sum(1 for n in nodes_out if n["is_entrypoint"]),
++            },
++            "mermaid_source": "\n".join(lines),
++            "nodes": nodes_out,
++            "edges": edges_out,
++            "next_zoom_hints": zoom_hints,
++            "authority": {
++                "read_only": True,
++                "selects_PLW_capability": False,
++                "mutate_source": False,
++                "execute_runtime": False,
++                "commit_truth": False,
++            },
++        }
++
++    # =========================================================================
++    # DEPTH 4: FILE MICRO-NEIGHBORHOOD (DECLARATIONS + BLAST RADIUS)
++    # =========================================================================
++    all_rel_files = { _rel(v): v for v in vertices }
++    target_rel: Optional[str] = None
++    auto_selected = False
++
++    if focus_norm:
++        # 1. Exact relative path match
++        if focus_norm in all_rel_files:
++            target_rel = focus_norm
++        else:
++            # 2. Suffix or basename match
++            suffix_matches = sorted(
++                r for r in all_rel_files
++                if r.endswith("/" + focus_norm) or os.path.basename(r) == focus_norm
++            )
++            if len(suffix_matches) == 1:
++                target_rel = suffix_matches[0]
++            elif len(suffix_matches) > 1:
++                # Pick highest fan_in + fan_out among suffix matches
++                suffix_matches.sort(
++                    key=lambda r: -(
++                        int((node_meta.get(all_rel_files[r]) or {}).get("fan_in", 0))
++                        + int((node_meta.get(all_rel_files[r]) or {}).get("fan_out", 0))
++                    )
++                )
++                target_rel = suffix_matches[0]
++            else:
++                # 3. Substring match (file or directory)
++                sub_matches = sorted(
++                    r for r in all_rel_files if focus_norm.lower() in r.lower()
++                )
++                if sub_matches:
++                    sub_matches.sort(
++                        key=lambda r: -(
++                            int((node_meta.get(all_rel_files[r]) or {}).get("fan_in", 0)) * 2
++                            + int((node_meta.get(all_rel_files[r]) or {}).get("fan_out", 0))
++                        )
++                    )
++                    target_rel = sub_matches[0]
++                    auto_selected = len(sub_matches) > 1
++
++        if target_rel is None:
++            return {
++                "schema_version": "1.0.0-mermaid-graph",
++                "mode": "mermaid",
++                "decision": "FOCUS_NOT_FOUND",
++                "scan_root": scan_root,
++                "graph_signature": graph_sig,
++                "depth": depth,
++                "depth_name": _MERMAID_DEPTH_NAMES[depth],
++                "direction": norm_dir,
++                "focus": focus,
++                "mermaid_source": "",
++                "nodes": [],
++                "edges": [],
++                "next_zoom_hints": [
++                    {
++                        "target": r,
++                        "target_kind": "file",
++                        "command": f"plw mermaid {root_arg} --depth 4 --focus {r}",
++                    }
++                    for r in sorted(
++                        rel_by_abs.values(),
++                        key=lambda r: -(
++                            int((node_meta.get(abs_by_rel[r]) or {}).get("fan_in", 0)) * 2
++                            + int((node_meta.get(abs_by_rel[r]) or {}).get("fan_out", 0))
++                        ),
++                    )[:5]
++                ],
++                "authority": {
++                    "read_only": True,
++                    "selects_PLW_capability": False,
++                    "mutate_source": False,
++                    "execute_runtime": False,
++                    "commit_truth": False,
++                },
++            }
++    else:
++        # Auto-select top hub/entrypoint file in repo
++        auto_selected = True
++        ranked_rels = sorted(
++            rel_by_abs.values(),
++            key=lambda r: -(
++                int((node_meta.get(abs_by_rel[r]) or {}).get("fan_in", 0)) * 2
++                + int((node_meta.get(abs_by_rel[r]) or {}).get("fan_out", 0))
++                + (15 if (node_meta.get(abs_by_rel[r]) or {}).get("is_entrypoint") else 0)
++            ),
++        )
++        target_rel = ranked_rels[0]
++
++    target_abs = all_rel_files[target_rel]
++    t_meta = node_meta.get(target_abs) or {}
++    outline_data = query_outline(graph, target_abs) if TOPO_QUERIES_AVAILABLE else {}
++    impact_data = query_impact(graph, target_abs) if TOPO_QUERIES_AVAILABLE else {}
++
++    decls = list(outline_data.get("declarations") or [])
++    decorators = list(outline_data.get("decorators") or [])
++    stats = dict(outline_data.get("stats") or {})
++    upstreams = [_rel(p) for p in (impact_data.get("direct_upstream") or [])]
++    downstreams = [_rel(p) for p in (impact_data.get("direct_downstream") or [])]
++    aff_eps = [_rel(p) for p in (impact_data.get("affected_entrypoints") or [])]
++    circ_refs = [_rel(p) for p in (impact_data.get("circular_references") or [])]
++    risk_level = str(impact_data.get("change_risk_level") or "unknown")
++
++    neighbor_cap = max(4, (max_nodes - 2) // 2)
++    shown_up = upstreams[:neighbor_cap]
++    shown_down = downstreams[:neighbor_cap]
++    shown_eps = [ep for ep in aff_eps if ep != target_rel and ep not in shown_down][:4]
++    shown_decls = decls[:10]
++
++    lines = [
++        f"flowchart {norm_dir}",
++        "    classDef target fill:#7c2d12,stroke:#f97316,stroke-width:3px,color:#ffedd5;",
++        "    classDef sym fill:#1e293b,stroke:#94a3b8,stroke-width:1px,color:#f8fafc;",
++        "    classDef upstream fill:#0f172a,stroke:#38bdf8,stroke-width:1.5px,color:#e0f2fe;",
++        "    classDef downstream fill:#064e3b,stroke:#34d399,stroke-width:1.5px,color:#d1fae5;",
++        "    classDef entrypoint fill:#3b0764,stroke:#c084fc,stroke-width:2px,color:#f3e8ff;",
++    ]
++
++    lines.append(f'    subgraph TARGET_BOX ["Focused Target: {_mermaid_escape(target_rel)}"]')
++    t_lines = stats.get("total_lines", t_meta.get("lines", "?"))
++    t_fi = impact_data.get("target_fan_in", t_meta.get("fan_in", 0))
++    t_fo = impact_data.get("target_fan_out", t_meta.get("fan_out", 0))
++    dec_str = f"\\ndecorators: {_mermaid_escape(', '.join(decorators[:3]))}" if decorators else ""
++    t_lbl = (
++        f"[TARGET] {_mermaid_escape(os.path.basename(target_rel))}\\n"
++        f"lines={t_lines} | in={t_fi} out={t_fo} | risk={_mermaid_escape(risk_level)}{dec_str}"
++    )
++    lines.append(f'        T0["{t_lbl}"]:::target')
++    for idx, d in enumerate(shown_decls):
++        sid = f"SYM{idx}"
++        kind = _mermaid_escape(d.get("kind", "symbol"))
++        name = _mermaid_escape(d.get("name", "?"))
++        lineno = d.get("line", "?")
++        exp_tag = " [export]" if d.get("exported") else ""
++        lines.append(f'        {sid}["{kind}: {name} (L{lineno}){exp_tag}"]:::sym')
++        lines.append(f"        T0 --- {sid}")
++    lines.append("    end")
++
++    nodes_out = [{
++        "id": "T0",
++        "role": "target",
++        "file": target_rel,
++        "lines": t_lines,
++        "fan_in": t_fi,
++        "fan_out": t_fo,
++        "change_risk_level": risk_level,
++        "declarations_count": len(decls),
++        "declarations_preview": shown_decls,
++    }]
++    edges_out = []
++
++    if shown_up:
++        lines.append(f'    subgraph UPSTREAM ["Direct Dependencies Imported by Target ({len(shown_up)}/{len(upstreams)})"]')
++        for idx, u_rel in enumerate(shown_up):
++            uid = f"U{idx}"
++            lines.append(f'        {uid}["{_mermaid_escape(os.path.basename(u_rel))}\\n{_mermaid_escape(os.path.dirname(u_rel))}"]:::upstream')
++            u_abs = all_rel_files.get(u_rel, "")
++            nat = edge_natures.get(f"{target_abs} -> {u_abs}", "runtime")
++            if u_rel in circ_refs:
++                lines.append(f'        T0 <-->|"cycle ({nat})"| {uid}')
++            elif nat == "same_package":
++                lines.append(f"        T0 -. same_pkg .-> {uid}")
++            elif nat == "type_only":
++                lines.append(f"        T0 -. type .-> {uid}")
++            else:
++                lines.append(f"        T0 -->|imports| {uid}")
++            nodes_out.append({"id": uid, "role": "direct_upstream", "file": u_rel})
++            edges_out.append({"from": target_rel, "to": u_rel, "relation": "imports", "nature": nat})
++        lines.append("    end")
++
++    if shown_down:
++        lines.append(f'    subgraph DOWNSTREAM ["Direct Dependents Importing Target ({len(shown_down)}/{len(downstreams)})"]')
++        for idx, d_rel in enumerate(shown_down):
++            did = f"D{idx}"
++            lines.append(f'        {did}["{_mermaid_escape(os.path.basename(d_rel))}\\n{_mermaid_escape(os.path.dirname(d_rel))}"]:::downstream')
++            d_abs = all_rel_files.get(d_rel, "")
++            nat = edge_natures.get(f"{d_abs} -> {target_abs}", "runtime")
++            if d_rel in circ_refs:
++                lines.append(f'        {did} <-->|"cycle ({nat})"| T0')
++            elif nat == "same_package":
++                lines.append(f"        {did} -. same_pkg .-> T0")
++            elif nat == "type_only":
++                lines.append(f"        {did} -. type .-> T0")
++            else:
++                lines.append(f"        {did} -->|imports| T0")
++            nodes_out.append({"id": did, "role": "direct_downstream", "file": d_rel})
++            edges_out.append({"from": d_rel, "to": target_rel, "relation": "imported_by", "nature": nat})
++        lines.append("    end")
++
++    if shown_eps:
++        lines.append('    subgraph ENTRYPOINTS ["Affected Entrypoints (Transitive Blast Radius)"]')
++        for idx, ep_rel in enumerate(shown_eps):
++            eid = f"EP{idx}"
++            lines.append(f'        {eid}["[ENTRYPOINT] {_mermaid_escape(os.path.basename(ep_rel))}\\n{_mermaid_escape(os.path.dirname(ep_rel))}"]:::entrypoint')
++            lines.append(f"        {eid} -. reaches .-> T0")
++            nodes_out.append({"id": eid, "role": "affected_entrypoint", "file": ep_rel})
++            edges_out.append({"from": ep_rel, "to": target_rel, "relation": "reaches_transitively"})
++        lines.append("    end")
++
++    zoom_hints = []
++    seen_hint_rels: set = set()
++    for n_rel in (shown_down[:4] + shown_up[:4]):
++        if n_rel in seen_hint_rels or len(seen_hint_rels) >= 5:
++            continue
++        seen_hint_rels.add(n_rel)
++        zoom_hints.append({
++            "target": n_rel,
++            "target_kind": "neighbor_file",
++            "reason": f"Pivot micro-neighborhood to connected file {os.path.basename(n_rel)}",
++            "command": f"plw mermaid {root_arg} --depth 4 --focus {n_rel}",
++        })
++    zoom_hints.append({
++        "target": target_rel,
++        "target_kind": "impact_projection",
++        "reason": "Run full transitive topological impact projection on this target",
++        "command": f"plw impact {target_rel} {root_arg} --json",
++    })
++
++    return {
++        "schema_version": "1.0.0-mermaid-graph",
++        "mode": "mermaid",
++        "decision": "MERMAID_GRAPH_READY",
++        "scan_root": scan_root,
++        "graph_signature": graph_sig,
++        "depth": depth,
++        "depth_name": _MERMAID_DEPTH_NAMES[depth],
++        "direction": norm_dir,
++        "focus": target_rel,
++        "requested_focus": focus,
++        "auto_selected_focus": auto_selected,
++        "include_tests": bool(include_tests),
++        "summary": {
++            "target_file": target_rel,
++            "lines": t_lines,
++            "declarations_count": len(decls),
++            "direct_upstream_count": len(upstreams),
++            "direct_downstream_count": len(downstreams),
++            "affected_entrypoints_count": len(aff_eps),
++            "circular_references_count": len(circ_refs),
++            "change_risk_level": risk_level,
++            "rendered_nodes": len(nodes_out),
++            "rendered_edges": len(edges_out),
++        },
++        "mermaid_source": "\n".join(lines),
++        "nodes": nodes_out,
++        "edges": edges_out,
++        "next_zoom_hints": zoom_hints,
++        "authority": {
++            "read_only": True,
++            "selects_PLW_capability": False,
++            "mutate_source": False,
++            "execute_runtime": False,
++            "commit_truth": False,
++        },
++    }
++
++
++
+ 
+ def kernel_resolve_target(
+     scan_root: str,
+diff --git a/plw_cli.py b/plw_cli.py
+index f73e35e..a083658 100644
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4056,6 +4056,98 @@ def cmd_topology(args: List[str]) -> int:
+     return code
+ 
+ 
++def cmd_mermaid(args: List[str]) -> int:
++    """Generate a multi-depth Mermaid architecture & dependency diagram (depths 1..4)."""
++    parser = _PlwArgumentParser(prog="plw mermaid")
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--depth", type=int, default=1)
++    parser.add_argument("--focus", default=None)
++    parser.add_argument("--direction", default="LR")
++    parser.add_argument("--max-nodes", type=int, default=24, dest="max_nodes")
++    parser.add_argument("--include-tests", action="store_true", dest="include_tests")
++    parser.add_argument("--out", default=None)
++    parser.add_argument("--json", action="store_true", dest="as_json")
++    opts = _parse_cli_args(parser, args)
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++
++    result = hott_kernel.kernel_mermaid(
++        opts.root,
++        depth=opts.depth,
++        focus=opts.focus,
++        direction=opts.direction,
++        max_nodes=opts.max_nodes,
++        include_tests=opts.include_tests,
++    )
++    has_err = bool(result.get("error")) or result.get("decision") == "FOCUS_NOT_FOUND"
++    code = 0 if not has_err else 3
++
++    if opts.out and not has_err and result.get("mermaid_source"):
++        try:
++            out_abs = os.path.abspath(opts.out)
++            os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
++            mmd_src = str(result.get("mermaid_source") or "")
++            if out_abs.lower().endswith(".md"):
++                payload_text = (
++                    f"# PLW Mermaid Graph (`depth={result.get('depth')}: {result.get('depth_name')}`)\n\n"
++                    f"```mermaid\n{mmd_src}\n```\n"
++                )
++            else:
++                payload_text = mmd_src + "\n"
++            Path(out_abs).write_text(payload_text, encoding="utf-8")
++            result["written_to"] = out_abs
++        except OSError as exc:
++            return _cli_error(
++                f"Failed to write Mermaid output to {opts.out}: {exc}",
++                "io_error",
++                as_json=opts.as_json,
++                rc=2,
++            )
++
++    if opts.as_json:
++        print(json.dumps(result, indent=2, ensure_ascii=False))
++    else:
++        print("# [PLW Multi-Depth Mermaid Graph]")
++        print("# Authority: static structural visualization only; read-only")
++        if result.get("error"):
++            print("# Error: " + str(result.get("error")))
++            if result.get("message"):
++                print("# Message: " + str(result.get("message")))
++            return code
++        print(
++            f"# Depth: {result.get('depth')} ({result.get('depth_name')}) | "
++            f"Direction: {result.get('direction')} | "
++            f"Focus: {result.get('focus') or 'all'}"
++        )
++        summary = result.get("summary") or {}
++        print(
++            f"# Decision: {result.get('decision')} | "
++            f"Rendered nodes: {summary.get('rendered_nodes', 0)} | "
++            f"Rendered edges: {summary.get('rendered_edges', 0)}"
++        )
++        if result.get("written_to"):
++            print(f"# Written to: {result.get('written_to')}")
++        if result.get("decision") == "FOCUS_NOT_FOUND":
++            avail = result.get("available_subsystems") or result.get("available_modules") or []
++            if avail:
++                print("# Available targets: " + ", ".join(str(x) for x in avail[:10]))
++        mmd = result.get("mermaid_source") or ""
++        if mmd:
++            print("")
++            print(mmd)
++            print("")
++        hints = result.get("next_zoom_hints") or []
++        if hints:
++            print("# Progressive Zoom Hints (for Humans & Coding Agents):")
++            for h in hints[:6]:
++                if isinstance(h, dict) and h.get("command"):
++                    reason = h.get("reason") or h.get("description") or ""
++                    suffix = f"  # {reason}" if reason else ""
++                    print(f"#   -> {h['command']}{suffix}")
++    return code
++
++
++
+ def _load_receipt_arg(value):
+     """Parse a --receipt value (JSON string or @path). Raises ValueError."""
+     raw = value
+@@ -5051,6 +5143,8 @@ Usage:
+       -> Lists or reads exact version-aligned embedded skill contracts
+   plw topology [root] [--top N] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
+       -> First-contact target-codebase map: file→import→file graph, hubs, entrypoints/tests, SCCs, unresolved/external imports
++  plw mermaid [root] [--depth 1|2|3|4] [--focus PATH] [--direction LR|TD] [--max-nodes N] [--include-tests] [--out FILE] [--json]
++      -> Multi-depth Mermaid architecture & dependency graph (L1 subsystems, L2 modules, L3 hubs/cycles, L4 file symbols+blast radius) with progressive zoom hints
+   plw resolve-target <task> [root] [--target file] [--top N] [--neighbors N] [--json]
+       -> Grounds task to graph nodes; ambiguity/unresolved blocks specialized routing
+   plw evidence-needs <task> [root] [--target file] [--json]
+@@ -5207,6 +5301,8 @@ Usage:
+         sys.exit(cmd_skill(sub_args))
+     elif cmd in ("topology", "codebase-topology", "codebase_topology", "import-graph", "import_graph"):
+         sys.exit(cmd_topology(sub_args))
++    elif cmd in ("mermaid", "mermaid-graph", "mermaid_graph", "diagram"):
++        sys.exit(cmd_mermaid(sub_args))
+     elif cmd in ("resolve-target", "resolve_target", "target-resolve", "target_resolve"):
+         sys.exit(cmd_resolve_target(sub_args))
+     elif cmd in ("evidence-needs", "evidence_needs", "evidence-need", "evidence_need"):
