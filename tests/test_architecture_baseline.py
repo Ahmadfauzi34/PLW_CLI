@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import ast
+import io
+import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
+from codebase import cycle_break as cycle_break_mod
 from codebase.cycle_break import analyze_cycle_breaks, compute_cycle_break_advisory
 from codebase.mermaid_graph import generate_mermaid_diagram
 from codebase.topology_analyzers import analyze_circular
-from core.shared_graph import build_shared_graph
+from core.shared_graph import _LANGUAGE_IMPORT_RESOLVERS, build_shared_graph
 import fullstack
 import hott_kernel
 import language_semantics
@@ -212,6 +219,114 @@ class ArchitectureBaselineTests(unittest.TestCase):
             "verify_execution_backed_proof_coverage",
         ):
             self.assertTrue(hasattr(fullstack, attr), f"missing export: {attr}")
+
+    def test_shared_python_type_checking_guard_is_single_source_of_truth(self) -> None:
+        self.assertIs(
+            cycle_break_mod._is_type_checking_guard,
+            language_semantics.is_python_type_checking_guard,
+        )
+        mod_direct = ast.parse("if TYPE_CHECKING:\n    pass\n")
+        mod_attr = ast.parse("if typing.TYPE_CHECKING:\n    pass\n")
+        mod_other = ast.parse("if DEBUG:\n    pass\n")
+        self.assertTrue(language_semantics.is_python_type_checking_guard(mod_direct.body[0].test))
+        self.assertTrue(language_semantics.is_python_type_checking_guard(mod_attr.body[0].test))
+        self.assertFalse(language_semantics.is_python_type_checking_guard(mod_other.body[0].test))
+
+    def test_shared_graph_language_resolvers_and_snapshot_parity(self) -> None:
+        self.assertEqual(set(_LANGUAGE_IMPORT_RESOLVERS), {"kotlin", "rust", "python"})
+
+        poly = self._tmp / "polyglot_repo"
+        poly.mkdir(parents=True)
+        (poly / "tsconfig.json").write_text(
+            json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"@core/*": ["src/core/*"]}}}),
+            encoding="utf-8",
+        )
+        (poly / "src" / "core").mkdir(parents=True)
+        (poly / "src" / "core" / "util.ts").write_text("export const x = 1;\n", encoding="utf-8")
+        (poly / "src" / "app.ts").write_text("import { x } from '@core/util';\nconsole.log(x);\n", encoding="utf-8")
+
+        (poly / "kotlin" / "com" / "example").mkdir(parents=True)
+        (poly / "kotlin" / "com" / "example" / "Models.kt").write_text(
+            "package com.example\nclass Model\n", encoding="utf-8"
+        )
+        (poly / "kotlin" / "com" / "example" / "Main.kt").write_text(
+            "package com.example\nimport com.other.Ext\nimport com.example.*\nfun run(m: Model) = m\n",
+            encoding="utf-8",
+        )
+
+        (poly / "rust_pkg" / "src").mkdir(parents=True)
+        (poly / "rust_pkg" / "Cargo.toml").write_text(
+            '[package]\nname = "demo-pkg"\nversion = "0.1.0"\n', encoding="utf-8"
+        )
+        (poly / "rust_pkg" / "src" / "helper.rs").write_text("pub fn ping() {}\n", encoding="utf-8")
+        (poly / "rust_pkg" / "src" / "lib.rs").write_text(
+            "mod helper;\nuse crate::helper::ping;\nuse std::fmt;\npub fn go() { ping(); }\n",
+            encoding="utf-8",
+        )
+
+        g_live = build_shared_graph(str(poly))
+        snapshot = {
+            fp: {"content": content, "imports": []}
+            for fp, content in g_live["file_map"].items()
+        }
+        g_snap = build_shared_graph(str(poly), _file_snapshot=snapshot)
+
+        self.assertEqual(g_live["edges"], g_snap["edges"])
+        self.assertEqual(g_live["edge_natures"], g_snap["edge_natures"])
+        app_ts = str((poly / "src" / "app.ts").resolve())
+        util_ts = str((poly / "src" / "core" / "util.ts").resolve())
+        self.assertIn((app_ts, util_ts), g_live["edges"])
+        kt_main = str((poly / "kotlin" / "com" / "example" / "Main.kt").resolve())
+        kt_model = str((poly / "kotlin" / "com" / "example" / "Models.kt").resolve())
+        self.assertEqual(g_live["edge_natures"].get(f"{kt_main} -> {kt_model}"), "same_package")
+        rs_lib = str((poly / "rust_pkg" / "src" / "lib.rs").resolve())
+        rs_helper = str((poly / "rust_pkg" / "src" / "helper.rs").resolve())
+        self.assertIn((rs_lib, rs_helper), g_live["edges"])
+
+    def test_hott_kernel_cli_dispatch_covers_all_public_modes(self) -> None:
+        self.assertEqual(
+            set(hott_kernel._KERNEL_CLI_DISPATCH),
+            set(hott_kernel.PUBLIC_KERNEL_MODES),
+        )
+
+        def _run_cli(*args: str):
+            buf = io.StringIO()
+            exit_code = 0
+            with mock.patch.object(sys, "argv", ["hott_kernel.py", *args]), redirect_stdout(buf):
+                try:
+                    hott_kernel.main()
+                except SystemExit as exc:
+                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            return exit_code, json.loads(buf.getvalue())
+
+        code, help_payload = _run_cli("--help")
+        self.assertEqual(code, 0)
+        self.assertEqual(help_payload["tool"], "hott_kernel")
+        self.assertIn("[--frame-only]", help_payload["usage"]["work"])
+
+        code, mode_help = _run_cli("work", "--help")
+        self.assertEqual(code, 0)
+        self.assertIn("[--frame-only]", mode_help["usage"])
+
+        code, analyzers_payload = _run_cli("analyzers")
+        self.assertEqual(code, 0)
+        self.assertIn("topo.circular", analyzers_payload["available_analyzers"])
+
+        code, bad_mode = _run_cli("nonexistent_mode")
+        self.assertEqual(code, 2)
+        self.assertEqual(bad_mode["error_code"], "unknown_mode")
+
+        code, bad_out = _run_cli("analyze", str(self.proj), "--output", "bogus")
+        self.assertEqual(code, 2)
+        self.assertEqual(bad_out["error_code"], "invalid_output_mode")
+
+        code, work_payload = _run_cli(
+            "work", "Audit utils cycle", str(self.proj),
+            "--target", "src/app/utils.py", "--frame-only",
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(work_payload["frame_only"])
+        self.assertIn("receipt", work_payload)
 
 
 if __name__ == "__main__":
