@@ -328,6 +328,91 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertTrue(work_payload["frame_only"])
         self.assertIn("receipt", work_payload)
 
+    def test_calibration_ux_v3_fixes(self) -> None:
+        from codebase.static_ui_reference import QUERY_STOPWORDS, _score
+        from codebase.cycle_break import _inspect_edge_import
+        import plw_cli
+
+        # 1. Stopwords & generic dev terms do not trigger false template matches
+        for sw in ("this", "between", "audit", "architecture", "angular"):
+            self.assertIn(sw, QUERY_STOPWORDS)
+        score, matched, _ = _score(
+            "Audit architecture, cycles, and Angular UI in this repo",
+            "input",
+            "",
+            {"placeholder": "Filter between this repo"},
+        )
+        self.assertEqual(score, 0)
+        self.assertEqual(matched, [])
+
+        # 2. Multi-line named imports populate symbols_involved
+        src_path = str((self.proj / "src" / "app" / "caller.ts").resolve())
+        tgt_path = str((self.proj / "src" / "app" / "target.ts").resolve())
+        info = _inspect_edge_import(
+            src_path,
+            tgt_path,
+            {
+                src_path: (
+                    "import {\n"
+                    "  alpha,\n"
+                    "  beta as b,\n"
+                    "  type Gamma,\n"
+                    "} from './target';\n"
+                ),
+                tgt_path: "export const alpha = 1; export const beta = 2; export type Gamma = string;\n",
+            },
+            {},
+        )
+        self.assertTrue(info["has_import"])
+        self.assertEqual(info["symbols"], ["alpha", "beta", "Gamma"])
+
+        # 3. _top_check_findings compacts oversized cycle_basis (> 5)
+        findings, _ = hott_kernel._top_check_findings(
+            {
+                "results": {
+                    "hott.manifold": {
+                        "findings": [
+                            {
+                                "type": "topological_cycle",
+                                "severity": "medium",
+                                "cycle_basis": [{"id": i} for i in range(12)],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(len(findings[0]["cycle_basis"]), 5)
+        self.assertEqual(findings[0]["cycle_basis_omitted_count"], 7)
+        self.assertTrue(findings[0]["cycle_basis_truncated"])
+
+        # 4. cycle-break hyphen alias & root-first impact arg order
+        def _run_cli(*args: str):
+            buf = io.StringIO()
+            exit_code = 0
+            with mock.patch.object(sys, "argv", ["hott_kernel.py", *args]), redirect_stdout(buf):
+                try:
+                    hott_kernel.main()
+                except SystemExit as exc:
+                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            return exit_code, json.loads(buf.getvalue())
+
+        cb_code, cb_payload = _run_cli("cycle-break", str(self.proj))
+        self.assertEqual(cb_code, 0)
+        self.assertEqual(cb_payload["mode"], "cycle_break")
+
+        imp_code, imp_payload = _run_cli("impact", str(self.proj), "src/app/utils.py")
+        self.assertEqual(imp_code, 0)
+        self.assertEqual(imp_payload["mode"], "impact")
+        self.assertTrue(imp_payload["exists"])
+
+        # 5. _load_receipt_arg accepts an existing file path directly
+        rcpt_file = self._tmp / "sample_receipt.json"
+        rcpt_file.write_text(json.dumps({"schema_version": "plw-task-receipt-v1"}), encoding="utf-8")
+        loaded = plw_cli._load_receipt_arg(str(rcpt_file))
+        self.assertEqual(loaded["schema_version"], "plw-task-receipt-v1")
+
 
 if __name__ == "__main__":
     unittest.main()

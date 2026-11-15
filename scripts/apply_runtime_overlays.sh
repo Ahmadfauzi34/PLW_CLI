@@ -371,6 +371,11 @@ grep -Fq '_KERNEL_CLI_DISPATCH' hott_kernel.py
 grep -Fq 'def _cli_memory_operation(' hott_kernel.py
 grep -Fq 'def is_python_type_checking_guard(' language_semantics.py
 grep -Fq 'is_python_type_checking_guard as _is_type_checking_guard' codebase/cycle_break.py
+apply_reviewable_overlay "calibration_ux_v3"
+grep -Fq '"between"' codebase/static_ui_reference.py
+grep -Fq 'cycle_basis_omitted_count' hott_kernel.py
+grep -Fq '{"cycle-break": "cycle_break"}' hott_kernel.py
+grep -Fq 'Path(value).is_file()' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
