@@ -396,6 +396,12 @@ grep -Fq '"cycle_break": "python3 hott_kernel.py cycle-break' hott_kernel.py
 grep -Fq '_CHECK_COMPACT_FINDINGS_LIMIT = 10' hott_kernel.py
 grep -Fq 'basis_cap = 2 if compact else 5' hott_kernel.py
 grep -Fq 'action="store_true", dest="compact"' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v7"
+grep -Fq '"ui_source_handoff": ui_handoff_frame,' hott_kernel.py
+grep -Fq 'if operation == "index" and pos1 in ("status", "warm", "clean"):' plw_cli.py
+grep -Fq 'def _query_ui_words(query: str) -> List[str]:' codebase/static_ui_reference.py
+grep -Fq 'def _blank_multiline_template_literals(content: str) -> str:' codebase/performance_analyzers.py
+grep -Fq 'if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:' codebase/topology_analyzers.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
