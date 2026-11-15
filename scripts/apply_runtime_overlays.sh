@@ -353,6 +353,11 @@ apply_reviewable_overlay "agent_ux_hardening_v2"
 grep -Fq 'mode == "defs" and total == 0' core/codesearch_engine.py
 grep -Fq '[--frame-only]' hott_kernel.py
 grep -Fq 'is_dynamic' codebase/cycle_break.py
+apply_reviewable_overlay "python_topology_v1"
+grep -Fq 'PYTHON_SOURCE_EXTENSIONS' language_semantics.py
+grep -Fq '"python"' core/portable_agent.py
+grep -Fq '_inspect_python_edge_import' codebase/cycle_break.py
+grep -Fq 'imports-v2-python' core/graph_cache.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

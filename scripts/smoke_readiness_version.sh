@@ -7,9 +7,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/js" "$TMP/python" "$TMP/run"
+mkdir -p "$TMP/js" "$TMP/python" "$TMP/empty" "$TMP/run"
 printf 'export const value = 1;\n' > "$TMP/js/main.ts"
 printf 'print(1)\n' > "$TMP/python/main.py"
+printf '# Empty\n' > "$TMP/empty/README.md"
 
 export HOME="$TMP/home" XDG_STATE_HOME="$TMP/state" XDG_CACHE_HOME="$TMP/cache"
 cd "$TMP/run"
@@ -18,6 +19,7 @@ cd "$TMP/run"
 "$BIN" version --json > "$TMP/version.json"
 "$BIN" doctor "$TMP/js" --json > "$TMP/doctor-js.json"
 "$BIN" doctor "$TMP/python" --json > "$TMP/doctor-py.json"
+"$BIN" doctor "$TMP/empty" --json > "$TMP/doctor-empty.json"
 "$BIN" work 'Find value export' "$TMP/js" --json > "$TMP/work.json"
 
 python - "$TMP" "$ROOT/VERSION" "$BIN" <<'PY'
@@ -38,14 +40,17 @@ assert bad.returncode == 2 and "accepts only --json" in bad.stderr, bad
 
 js = read("doctor-js.json")
 py = read("doctor-py.json")
-for doctor in (js, py):
+empty = read("doctor-empty.json")
+for doctor in (js, py, empty):
     assert doctor["version"] == version and doctor["ready"] is True, doctor
     assert doctor["readiness"]["portable_surface_ready"] is True, doctor
     assert doctor["readiness"]["action_readiness"] == "NOT_ASSESSED", doctor
 assert js["readiness"]["stable_target_topology_ready"] is True, js
-assert py["readiness"]["stable_target_topology_ready"] is False, py
-assert py["readiness"]["stable_target_topology_reason"] == "NO_STABLE_TOPOLOGY_SOURCE_FILES", py
-assert py["target_support"]["authority"]["experimental_python_promoted"] is False, py
+assert py["readiness"]["stable_target_topology_ready"] is True, py
+assert py["readiness"]["stable_target_topology_reason"] == "STABLE_TOPOLOGY_SOURCE_FILES_FOUND", py
+assert py["target_support"]["authority"]["experimental_python_promoted"] is True, py
+assert empty["readiness"]["stable_target_topology_ready"] is False, empty
+assert empty["readiness"]["stable_target_topology_reason"] == "NO_STABLE_TOPOLOGY_SOURCE_FILES", empty
 
 work = read("work.json")
 assert work["work_status"] == "ready", work
