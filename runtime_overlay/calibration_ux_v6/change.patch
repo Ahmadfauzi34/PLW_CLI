@@ -1,0 +1,191 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -444,6 +444,7 @@
+     "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+     "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+     "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++    "cycle_break": "python3 hott_kernel.py cycle-break [root] [--root DIR] [--target FILE] [--output full|summary]",
+     "memory": "python3 hott_kernel.py memory <submode> ...",
+     "fiber": "python3 hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]",
+ }
+@@ -2189,13 +2190,16 @@
+ 
+ 
+ _CHECK_FINDINGS_LIMIT = 100
++_CHECK_COMPACT_FINDINGS_LIMIT = 10
++_CHECK_LIMIT_AUTO = object()
+ 
+ 
+ def kernel_analyze(
+     scan_root: str = ".",
+     analyzer_names: Optional[List[str]] = None,
+     output_mode: str = "full",
+-    findings_limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
++    findings_limit: Any = _CHECK_LIMIT_AUTO,
++    compact: bool = False,
+ ) -> Dict[str, Any]:
+     """
+     Orkestrasi penuh: build SharedGraph + run analyzers + synthesize.
+@@ -2261,24 +2265,62 @@
+         ),
+     }
+ 
+-    base = {
++    if findings_limit is _CHECK_LIMIT_AUTO:
++        effective_limit: Optional[int] = (
++            _CHECK_COMPACT_FINDINGS_LIMIT if compact else _CHECK_FINDINGS_LIMIT
++        )
++    else:
++        effective_limit = findings_limit
++
++    raw_graph_cache = shared_graph.get("cache", {}) or {}
++    raw_analyzer_cache = analyzer_output.get("cache", {}) or {}
++    if compact:
++        graph_cache = {
++            k: raw_graph_cache[k]
++            for k in ("mode", "status", "cache_key", "graph_content_signature")
++            if k in raw_graph_cache
++        }
++        analyzer_cache = {
++            k: raw_analyzer_cache[k]
++            for k in ("status", "cache_key", "source_cache_key", "cache_path")
++            if k in raw_analyzer_cache
++        }
++    else:
++        graph_cache = raw_graph_cache
++        analyzer_cache = raw_analyzer_cache
++
++    base: Dict[str, Any] = {
+         "schema_version": "3.0.0-kernel",
+         "mode": "analyze",
+         "output_mode": output_mode,
+         "scan_root": scan_root,
+         "timestamp": _utc_timestamp(),
+-        "graph_cache": shared_graph.get("cache", {}),
+-        "analyzer_cache": analyzer_output.get("cache", {}),
+-    }
++        "graph_cache": graph_cache,
++        "analyzer_cache": analyzer_cache,
++    }
++    if compact:
++        base["compact"] = True
+ 
+     # Step 4: Filter output berdasarkan mode
+     if output_mode == "summary":
+         base["unified_summary"] = unified_summary
+         top_findings, findings_truncated = _top_check_findings(
+-            analyzer_output, limit=findings_limit
++            analyzer_output, limit=effective_limit, compact=compact
+         )
+         base["findings"] = top_findings
+         base["findings_truncated"] = findings_truncated
++        if compact:
++            base["detail_contract"] = {
++                "compact": True,
++                "findings_limit": effective_limit,
++                "cycle_basis_cap": 2,
++                "omitted_cache_fields": [
++                    "graph_cache.stat_trust_boundary",
++                    "graph_cache.cache_path",
++                    "analyzer_cache.analyzers_*",
++                ],
++                "full_output_hint": "omit --compact (or inspect analyzer_cache.cache_path) to retrieve full check envelope",
++            }
+         return base
+ 
+     elif output_mode == "findings":
+@@ -2308,6 +2350,7 @@
+ def _top_check_findings(
+     analyzer_output: Dict[str, Any],
+     limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
++    compact: bool = False,
+ ) -> tuple:
+     """Flatten actionable findings for the `plw check --json` envelope.
+ 
+@@ -2350,8 +2393,9 @@
+             item.setdefault("analyzer", name)
+             raw_basis = item.get("cycle_basis")
+             if isinstance(raw_basis, list):
++                basis_cap = 2 if compact else 5
+                 compacted_basis = []
+-                for entry in raw_basis[:5]:
++                for entry in raw_basis[:basis_cap]:
+                     if isinstance(entry, dict) and (
+                         "witness_edges" in entry or "vertices" in entry
+                     ):
+@@ -2366,8 +2410,8 @@
+                     else:
+                         compacted_basis.append(entry)
+                 item["cycle_basis"] = compacted_basis
+-                if len(raw_basis) > 5:
+-                    item["cycle_basis_omitted_count"] = len(raw_basis) - 5
++                if len(raw_basis) > basis_cap:
++                    item["cycle_basis_omitted_count"] = len(raw_basis) - basis_cap
+                     item["cycle_basis_truncated"] = True
+             items.append(item)
+         if items:
+@@ -4715,6 +4759,7 @@
+         "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+         "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+         "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++        "cycle_break": "python3 hott_kernel.py cycle-break [root] [--root DIR] [--target FILE] [--output full|summary]",
+         "context": "python3 hott_kernel.py context <query> [root] [--root DIR] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
+         "establish": "python3 hott_kernel.py establish [root] [--root DIR] [--baseline path]",
+         "synthesize": "python3 hott_kernel.py synthesize [root] [--root DIR] [--output full|summary]",
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -19,7 +19,7 @@
+   plw context <query> [root] [--target file] [--budget N] [--cache-mode MODE] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]
+   plw transitions <query> [root] [--target file] [--budget N] [--lineage sha256:id] [--json]
+   plw kan <target_file_or_query> [root] [--mode lan|ran|both] [--json]
+-  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]
+   plw steer [root] [--json]
+   plw brief <file> [root] [--json]
+   plw impact <file> [root] [--json]
+@@ -937,17 +937,20 @@
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--limit", type=int, default=None)
+     parser.add_argument("--all", action="store_true", dest="all_findings")
++    parser.add_argument("--compact", action="store_true", dest="compact")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     root = opts.root_flag or opts.root or "."
+     analyzers = opts.analyzers.split(",") if opts.analyzers else None
+     cache_mode = opts.cache_mode
+     as_json = opts.as_json
+-    # --all wins over --limit; neither means the default 100-slot envelope.
++    # --all wins over --limit; --compact defaults to the compact slot cap when neither --all nor --limit is set.
+     if opts.all_findings:
+         findings_limit = None
+     elif opts.limit is not None:
+         findings_limit = opts.limit
++    elif opts.compact:
++        findings_limit = hott_kernel._CHECK_COMPACT_FINDINGS_LIMIT
+     else:
+         findings_limit = hott_kernel._CHECK_FINDINGS_LIMIT
+ 
+@@ -957,7 +960,13 @@
+             _format_check_output(cache_error, as_json=as_json)
+             return 2
+ 
+-    res = hott_kernel.kernel_analyze(root, analyzer_names=analyzers, output_mode="summary", findings_limit=findings_limit)
++    res = hott_kernel.kernel_analyze(
++        root,
++        analyzer_names=analyzers,
++        output_mode="summary",
++        findings_limit=findings_limit,
++        compact=opts.compact,
++    )
+     _format_check_output(res, as_json=as_json)
+     return 0 if "error" not in res else 1
+ 
+@@ -5214,7 +5223,7 @@
+       -> Imputes expected imports, callers, and conventions for new/isolated files
+ 
+ 2. Analysis, quality & context
+-  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]
+       -> Quick architectural and boundary violation check; --json includes high+medium findings (low/info stay in the analyzer cache)
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
