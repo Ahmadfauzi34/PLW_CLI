@@ -1,0 +1,220 @@
+--- a/codebase/static_ui_reference.py
++++ b/codebase/static_ui_reference.py
+@@ -34,12 +34,21 @@
+     "same", "than", "too", "very", "just", "also", "now", "here", "there",
+     "when", "why", "how", "who", "whom", "whose", "its", "our", "your",
+     "their", "his", "her",
++    "to", "of", "is", "be", "by", "as", "at", "or", "an", "if", "it",
++    "no", "so", "we", "he", "me", "my", "us", "do", "go", "am",
++    "ts", "js", "py", "kt", "rs",
+     "find", "locate", "check", "assess", "audit", "refactor", "fix", "break",
+     "debug", "test", "tests", "repo", "repository", "codebase", "project",
+     "file", "files", "module", "modules", "cycle", "cycles", "architecture",
++    "remove", "extract", "split", "cleanup", "dependency", "dependencies",
++    "circular", "circularity", "coupling", "scc", "sccs", "function",
++    "functions", "class", "classes", "method", "methods", "symbol", "symbols",
++    "import", "imports", "export", "exports", "tsconfig", "schema", "cache",
++    "receipt", "topology", "mermaid", "graph",
+     "angular", "ui", "page", "link", "button", "component", "mobile",
+     "responsive", "overlap", "layout", "navigation", "element",
+-    "tautan", "tombol", "yang", "dan",
++    "tautan", "tombol", "yang", "dan", "di", "ke", "ya", "ini", "itu",
++    "atau", "dari", "untuk", "pada", "dengan",
+ }
+ 
+ 
+@@ -156,8 +165,10 @@
+     tokens = {word for word in _words(query) if len(word) >= 2 and word not in QUERY_STOPWORDS}
+     label_words = _words(label)
+     label_matches = sorted(tokens.intersection(label_words))
+-    # Short words may distinguish labels such as "Sign in" and "Sign up", but
+-    # matching one in a long placeholder is weak evidence of control identity.
++    # Short words may distinguish short labels such as "Sign in" and "Sign up", but
++    # a 2-char token alone on a multi-word sentence is weak evidence of control identity.
++    if len(label_words) > 4 and not any(len(word) >= 3 for word in label_matches):
++        label_matches = []
+     attribute_tokens = {word for word in tokens if len(word) >= 3}
+     attribute_matches = {name: sorted(attribute_tokens.intersection(_words(value)))
+                          for name, value in sorted(attrs.items())}
+--- a/codebase/cycle_break.py
++++ b/codebase/cycle_break.py
+@@ -60,11 +60,13 @@
+             if cleaned:
+                 symbols.append(cleaned)
+     else:
+-        # Default or namespace import (e.g. `import Foo` or `import * as Foo`)
++        # Default, namespace, or wildcard import/re-export (e.g. `import Foo`, `import * as Foo`, `export *`)
+         default_name = clause.split(",")[0].strip()
++        if default_name == "*":
++            return []
+         if default_name.startswith("* as "):
+             default_name = default_name[5:].strip()
+-        if default_name:
++        if default_name and default_name != "*":
+             symbols.append(default_name)
+     return symbols
+ 
+@@ -219,6 +221,8 @@
+         "has_import": False,
+         "is_type_only": False,
+         "is_dynamic": False,
++        "is_reexport": False,
++        "is_wildcard_reexport": False,
+         "symbols": [],
+         "raw_statement": "",
+     }
+@@ -262,7 +266,15 @@
+         if is_match:
+             clause = match.group("clause") or match.group("export_clause") or ""
+             is_type_kw = bool(match.group("type_kw") or match.group("export_type"))
+-            symbols = _extract_imported_symbols(clause)
++            is_reexport = bool(
++                match.group("export_clause") is not None
++                or match.group(0).lstrip().startswith("export")
++            )
++            clause_stripped = clause.strip()
++            is_wildcard_reexport = is_reexport and (
++                clause_stripped == "*" or clause_stripped.startswith("* as ")
++            )
++            symbols = [] if is_wildcard_reexport else _extract_imported_symbols(clause)
+             raw_stmt = match.group(0)
+ 
+             # Detect dynamic import: e.g. import(...) or await import(...)
+@@ -281,6 +293,8 @@
+                 "has_import": True,
+                 "is_type_only": is_type_only,
+                 "is_dynamic": is_dynamic,
++                "is_reexport": is_reexport,
++                "is_wildcard_reexport": is_wildcard_reexport,
+                 "symbols": symbols,
+                 "raw_statement": raw_stmt,
+             }
+@@ -364,6 +378,7 @@
+     else:
+         is_type_only = import_info.get("is_type_only", False)
+     is_dynamic = import_info.get("is_dynamic", False)
++    is_wildcard_reexport = bool(import_info.get("is_wildcard_reexport", False))
+     symbols = import_info.get("symbols", [])
+ 
+     # Base cost calibration
+@@ -375,9 +390,9 @@
+ 
+     # Fan-in adjustment: lower target fan-in = more isolated = easier to refactor
+     # Only discount if this is a static import with concrete symbols or type-only.
+-    # A dynamic import with empty symbols should not receive a fan-in discount.
++    # Dynamic imports and wildcard barrel re-exports must not receive a fan-in discount.
+     if target_fan_in <= 1:
+-        if not is_dynamic and (symbols or is_type_only):
++        if not is_dynamic and not is_wildcard_reexport and (symbols or is_type_only):
+             cost -= 15
+         elif is_dynamic:
+             cost += 25
+@@ -386,7 +401,7 @@
+ 
+     # Concrete symbols discount: having specific identified symbols to extract
+     # makes extract_shared_module concrete, targeted, and lower risk.
+-    if symbols and not is_dynamic:
++    if symbols and not is_dynamic and not is_wildcard_reexport:
+         cost -= 15
+ 
+     # Strategy determination
+@@ -439,6 +454,20 @@
+             f"Pass '{target}' instance or factory into '{source}' at initialization rather than using inline dynamic import.",
+             f"Alternatively, check if '{target}' statically imports definitions from '{source}' and extract those into a shared leaf module.",
+         ]
++    elif is_wildcard_reexport:
++        # Barrel wildcard re-export (`export * from './target'`) — cannot extract `*`
++        strategy = "barrel_reexport"
++        estimated_effort = "medium"
++        cost += 15
++        rationale = (
++            f"Module '{source}' is a barrel wildcard re-export ('export *') of '{target}'. "
++            f"Internal modules importing from barrel '{source}' pull in '{target}' and create "
++            f"a cycle when '{target}' depends back on those modules."
++        )
++        actionable_steps = [
++            f"Update internal callers that import from barrel '{source}' to import directly from the specific submodule they need (or from '{target}').",
++            f"Alternatively, replace 'export *' in '{source}' or extract the reverse-imported symbols out of '{target}' into a leaf module.",
++        ]
+     elif u_rank < v_rank:
+         # Layer violation: lower layer imports higher layer (e.g. Helper -> Service or Service -> Component)
+         strategy = "architectural_inversion"
+@@ -494,6 +523,7 @@
+         "symbols_involved": symbols,
+         "is_type_only": is_type_only,
+         "is_dynamic": is_dynamic,
++        "is_wildcard_reexport": is_wildcard_reexport,
+         "target_fan_in": target_fan_in,
+         "source_fan_out": source_fan_out,
+         "suggested_leaf": suggested_leaf,
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2349,10 +2349,26 @@
+             item = dict(finding)
+             item.setdefault("analyzer", name)
+             raw_basis = item.get("cycle_basis")
+-            if isinstance(raw_basis, list) and len(raw_basis) > 5:
+-                item["cycle_basis"] = raw_basis[:5]
+-                item["cycle_basis_omitted_count"] = len(raw_basis) - 5
+-                item["cycle_basis_truncated"] = True
++            if isinstance(raw_basis, list):
++                compacted_basis = []
++                for entry in raw_basis[:5]:
++                    if isinstance(entry, dict) and (
++                        "witness_edges" in entry or "vertices" in entry
++                    ):
++                        compacted = {
++                            k: v
++                            for k, v in entry.items()
++                            if k not in ("witness_edges", "vertices")
++                        }
++                        if isinstance(entry.get("witness_edges"), list):
++                            compacted["witness_edge_count"] = len(entry["witness_edges"])
++                        compacted_basis.append(compacted)
++                    else:
++                        compacted_basis.append(entry)
++                item["cycle_basis"] = compacted_basis
++                if len(raw_basis) > 5:
++                    item["cycle_basis_omitted_count"] = len(raw_basis) - 5
++                    item["cycle_basis_truncated"] = True
+             items.append(item)
+         if items:
+             items.sort(key=_order)
+@@ -2514,6 +2530,7 @@
+     plan = advisor_result.get("summary", {})
+     advisories = advisor_result.get("advisories", [])
+ 
++    target_norm: Optional[str] = None
+     if target_file:
+         target_norm = os.path.normpath(target_file).replace("\\", "/")
+         if target_norm.startswith("./"):
+@@ -2536,7 +2553,6 @@
+             "recommended_cuts": recommended_cuts,
+         }
+ 
+-    target_norm_out = os.path.normpath(target_file).replace("\\", "/").lstrip("./") if target_file else None
+     if output_mode == "summary":
+         out: Dict[str, Any] = {
+             "schema_version": CODEBASE_SCHEMA_VERSION,
+@@ -2545,8 +2561,8 @@
+             "graph_cache": graph.get("cache", {}),
+             "summary": plan,
+         }
+-        if target_norm_out is not None:
+-            out["target"] = target_norm_out
++        if target_norm is not None:
++            out["target"] = target_norm
+         return out
+ 
+     out = {
+@@ -2557,8 +2573,8 @@
+         "summary": plan,
+         "advisories": advisories,
+     }
+-    if target_norm_out is not None:
+-        out["target"] = target_norm_out
++    if target_norm is not None:
++        out["target"] = target_norm
+     return out
+ 
+ 

@@ -432,6 +432,101 @@ class ArchitectureBaselineTests(unittest.TestCase):
         cb = hott_kernel.kernel_cycle_break(str(self.proj), target_file="src/app/utils.py")
         self.assertEqual(cb["target"], "src/app/utils.py")
 
+    def test_calibration_ux_v5_ui_stopwords_barrel_reexport_and_check_basis(self) -> None:
+        from codebase.static_ui_reference import QUERY_STOPWORDS, _score
+        from codebase.cycle_break import (
+            _extract_imported_symbols,
+            _inspect_edge_import,
+            evaluate_edge_cut,
+        )
+
+        # 1. Non-UI refactoring tasks must not false-match via 2-char words like "to"
+        for sw in ("to", "of", "remove", "extract", "dependency"):
+            self.assertIn(sw, QUERY_STOPWORDS)
+        score, matched, _ = _score(
+            "Refactor patcher.ts to remove HomotopyTelemetryRegistry cycle",
+            "p",
+            "Simulate critical thread anomalies to protect the host",
+            {},
+        )
+        self.assertEqual(score, 0)
+        self.assertEqual(matched, [])
+
+        # Short label distinction (e.g. "Sign in" vs "Sign up") remains intact
+        s_in, m_in, _ = _score("Sign in", "button", "Sign in", {})
+        s_up, _, _ = _score("Sign in", "button", "Sign up", {})
+        self.assertGreater(s_in, s_up)
+        self.assertIn("in", m_in)
+
+        # 2. Wildcard barrel re-export (`export * from './x'`) uses barrel_reexport
+        self.assertEqual(_extract_imported_symbols("*"), [])
+        barrel_path = str((self.proj / "src" / "app" / "index.ts").resolve())
+        leaf_path = str((self.proj / "src" / "app" / "leaf.ts").resolve())
+        consumer_path = str((self.proj / "src" / "app" / "consumer.ts").resolve())
+        fmap = {
+            barrel_path: "export * from './leaf';\n",
+            leaf_path: "export const LeafVal = 1;\n",
+            consumer_path: "import { LeafVal } from './leaf';\n",
+        }
+        info = _inspect_edge_import(barrel_path, leaf_path, fmap, {})
+        self.assertTrue(info["has_import"])
+        self.assertTrue(info["is_reexport"])
+        self.assertTrue(info["is_wildcard_reexport"])
+        self.assertEqual(info["symbols"], [])
+
+        fake_graph = {
+            "file_map": fmap,
+            "node_metadata": {
+                barrel_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+                leaf_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+                consumer_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+            },
+            "type_shapes": {},
+            "edge_natures": {},
+        }
+        barrel_cut = evaluate_edge_cut(barrel_path, leaf_path, fake_graph, cycle_overlap_count=1)
+        concrete_cut = evaluate_edge_cut(consumer_path, leaf_path, fake_graph, cycle_overlap_count=1)
+        self.assertEqual(barrel_cut["strategy"], "barrel_reexport")
+        self.assertEqual(barrel_cut["symbols_involved"], [])
+        self.assertTrue(barrel_cut["is_wildcard_reexport"])
+        self.assertGreater(barrel_cut["cut_cost"], concrete_cut["cut_cost"])
+
+        # 3. _top_check_findings strips bulky witness_edges & vertices from cycle_basis
+        findings, _ = hott_kernel._top_check_findings(
+            {
+                "results": {
+                    "hott.manifold": {
+                        "findings": [
+                            {
+                                "type": "independent_cycles",
+                                "severity": "medium",
+                                "cycle_basis": [
+                                    {
+                                        "basis_index": 1,
+                                        "closed_path": ["a.ts", "b.ts", "a.ts"],
+                                        "closing_edge": ["b.ts", "a.ts"],
+                                        "vertices": ["a.ts", "b.ts"],
+                                        "witness_edges": [{"edge": ["a.ts", "b.ts"]}],
+                                        "length": 2,
+                                        "orientation": "directed",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+        basis0 = findings[0]["cycle_basis"][0]
+        self.assertNotIn("witness_edges", basis0)
+        self.assertNotIn("vertices", basis0)
+        self.assertEqual(basis0["witness_edge_count"], 1)
+        self.assertEqual(basis0["closed_path"], ["a.ts", "b.ts", "a.ts"])
+
+        # 4. kernel_cycle_break preserves hidden dot-directory prefix on target
+        cb_hidden = hott_kernel.kernel_cycle_break(str(self.proj), target_file="./.hidden/ci.ts")
+        self.assertEqual(cb_hidden["target"], ".hidden/ci.ts")
+
 
 if __name__ == "__main__":
     unittest.main()

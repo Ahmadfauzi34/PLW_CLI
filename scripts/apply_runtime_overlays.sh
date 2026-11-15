@@ -380,6 +380,11 @@ apply_reviewable_overlay "calibration_ux_v4"
 grep -Fq 'include_engine: bool = True' hott_kernel.py
 grep -Fq 'out["target"] = target_norm_out' hott_kernel.py
 grep -Fq '"--compact", "--no-engine"' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v5"
+grep -Fq 'len(label_words) > 4' codebase/static_ui_reference.py
+grep -Fq 'strategy = "barrel_reexport"' codebase/cycle_break.py
+grep -Fq 'compacted["witness_edge_count"]' hott_kernel.py
+grep -Fq 'target_norm: Optional[str] = None' hott_kernel.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
