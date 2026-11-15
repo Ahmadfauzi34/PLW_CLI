@@ -364,6 +364,13 @@ grep -Fq 'def generate_mermaid_diagram(' codebase/mermaid_graph.py
 grep -Fq 'def project_execution_backed_proof_obligations(' fullstack/execution_backed_proof_coverage.py
 grep -Fq 'OMITTED_IN_FRAME_ONLY' hott_kernel.py
 grep -Fq '_is_python_type_checking_guard' language_semantics.py
+apply_reviewable_overlay "solid_architecture_v2"
+grep -Fq '_LANGUAGE_IMPORT_RESOLVERS' core/shared_graph.py
+grep -Fq 'def _collect_corpus_sources(' core/shared_graph.py
+grep -Fq '_KERNEL_CLI_DISPATCH' hott_kernel.py
+grep -Fq 'def _cli_memory_operation(' hott_kernel.py
+grep -Fq 'def is_python_type_checking_guard(' language_semantics.py
+grep -Fq 'is_python_type_checking_guard as _is_type_checking_guard' codebase/cycle_break.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

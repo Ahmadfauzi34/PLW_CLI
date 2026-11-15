@@ -1,0 +1,2782 @@
+--- a/codebase/cycle_break.py
++++ b/codebase/cycle_break.py
+@@ -14,6 +14,7 @@
+ from language_semantics import (
+     _python_relative_module,
+     candidate_targets as _candidate_targets,
++    is_python_type_checking_guard as _is_type_checking_guard,
+     normalize_path as _normalize_path,
+     python_module_candidates as _python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
+@@ -68,14 +69,6 @@
+     return symbols
+ 
+ 
+-def _is_type_checking_guard(test: ast.AST) -> bool:
+-    if isinstance(test, ast.Name):
+-        return test.id == "TYPE_CHECKING"
+-    if isinstance(test, ast.Attribute):
+-        return test.attr == "TYPE_CHECKING"
+-    return False
+-
+-
+ def _inspect_python_edge_import(
+     source: str,
+     target: str,
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -20,7 +20,8 @@
+ import json
+ import hashlib
+ import datetime
+-from typing import Any, Dict, List, Optional, Set, Tuple
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+ 
+ from language_semantics import (
+     JS_RESOLUTION_EXTENSIONS as RESOLUTION_EXTENSIONS,
+@@ -740,94 +741,116 @@
+         directory = parent
+ 
+ 
+-def build_shared_graph(
+-    scan_root: str = ".",
+-    ignore_dirs: Optional[Set[str]] = None,
+-    _file_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
+-    include_tool_source: bool = False,
+-) -> Dict[str, Any]:
+-    """
+-    Bangun SharedGraph dari satu discovery pass atau snapshot tervalidasi.
+-
+-    Discovery filesystem tetap terpusat di modul ini. Semua analyzer
+-    mengonsumsi output fungsi ini dan tidak melakukan scan sendiri.
+-    """
+-    if ignore_dirs is None:
+-        ignore_dirs = set(DEFAULT_IGNORE_DIRS)
++@dataclass
++class _KotlinCorpusIndex:
++    packages: Set[str]
++    roots: List[str]
++    symbol_index: Dict[Tuple[str, str], str]
++    file_packages: Dict[str, str]
++    same_pkg_index: Dict[str, List[Tuple[str, str, str]]]
++    stripped_map: Dict[str, str]
++
++
++@dataclass
++class _RustCorpusIndex:
++    file_module: Dict[str, Tuple[str, Tuple[str, ...]]]
++    module_index: Dict[Tuple[str, Tuple[str, ...]], str]
++    symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str]
++    top_modules: Dict[str, Set[str]]
++    package_lib: Dict[str, str]
++
++
++@dataclass
++class _ImportResolutionState:
++    scan_root_norm: str
++    all_files_set: Set[str]
++    alias_rules: List[Dict[str, Any]]
++    kotlin_index: _KotlinCorpusIndex
++    rust_index: _RustCorpusIndex
++    edges: List[Tuple[str, str]]
++    unresolved_imports: List[Dict[str, Any]]
++    external_imports: List[Dict[str, Any]]
++    resolved_edge_natures: Dict[Tuple[str, str], List[str]]
++    resolved_edge_usages: Dict[Tuple[str, str], List[str]]
+ 
+-    scan_root_norm = _normalize_path(scan_root)
+-    alias_rules = _load_alias_rules([scan_root_norm, "."])
+ 
+-    # ============================================================
+-    # PASS 1: Filesystem scan + file reading + import parsing
+-    # ============================================================
++def _collect_corpus_sources(
++    scan_root: str,
++    ignore_dirs: Set[str],
++    _file_snapshot: Optional[Dict[str, Dict[str, Any]]],
++    include_tool_source: bool,
++) -> Tuple[List[str], Dict[str, str], Dict[str, List[Dict[str, Any]]]]:
++    """PASS 1: Filesystem discovery (or snapshot load) + file reading + import parsing."""
+     all_files: List[str] = []
+-    file_map: Dict[str, str] = {}           # path -> content
+-    file_imports: Dict[str, List[Dict[str, str]]] = {}  # path -> list of import dicts
++    file_map: Dict[str, str] = {}
++    file_imports: Dict[str, List[Dict[str, Any]]] = {}
+ 
+     if _file_snapshot is None:
+-        for full_path in discover_source_files(scan_root, ignore_dirs, include_tool_source=include_tool_source):
++        for full_path in discover_source_files(
++            scan_root, ignore_dirs, include_tool_source=include_tool_source
++        ):
+             content = _read_file(full_path)
+             if content is None:
+                 continue
+-
+             all_files.append(full_path)
+             file_map[full_path] = content
+             file_imports[full_path] = parse_imports_with_nature(content, full_path)
+-    else:
+-        for full_path in sorted(_file_snapshot):
+-            if not source_path_allowed(full_path, include_tool_source=include_tool_source, scan_root=scan_root):
+-                continue
+-            record = _file_snapshot[full_path]
+-            content = record.get("content")
+-            imports = record.get("imports")
+-            if not isinstance(content, str) or not isinstance(imports, list):
+-                continue
+-            all_files.append(full_path)
+-            file_map[full_path] = content
+-            if content:
+-                file_imports[full_path] = parse_imports_with_nature(content, full_path)
+-            else:
+-                file_imports[full_path] = [
+-                    {"raw_import": str(value), "import_nature": "runtime"}
+-                    for value in imports
+-                ]
+-
+-    # ============================================================
+-    # PASS 1.5: Kotlin package/symbol index (K5)
+-    # Built from the contents PASS 1 already read. Source roots are
+-    # derived per file (path minus package path), so multi-module
+-    # layouts need no configuration. Top-level declarations are indexed
+-    # as (package, name) -> file, so imports of types declared in a
+-    # differently-named file still resolve (Kotlin file names need not
+-    # match the declared type). When a snapshot is supplied, file_map
+-    # already holds its contents, so this pass works unchanged.
+-    # ============================================================
++        return all_files, file_map, file_imports
++
++    for full_path in sorted(_file_snapshot):
++        if not source_path_allowed(
++            full_path, include_tool_source=include_tool_source, scan_root=scan_root
++        ):
++            continue
++        record = _file_snapshot[full_path]
++        content = record.get("content")
++        imports = record.get("imports")
++        if not isinstance(content, str) or not isinstance(imports, list):
++            continue
++        all_files.append(full_path)
++        file_map[full_path] = content
++        if content:
++            file_imports[full_path] = parse_imports_with_nature(content, full_path)
++        else:
++            file_imports[full_path] = [
++                {"raw_import": str(value), "import_nature": "runtime"}
++                for value in imports
++            ]
++    return all_files, file_map, file_imports
++
++
++def _build_kotlin_index(
++    all_files: List[str],
++    file_map: Dict[str, str],
++) -> _KotlinCorpusIndex:
++    """PASS 1.5 (Kotlin K5): Build package, root, top-level symbol, and same-package indexes."""
+     kotlin_packages: Set[str] = set()
+     kotlin_roots: List[str] = []
+     kotlin_symbol_index: Dict[Tuple[str, str], str] = {}
+     kotlin_file_packages: Dict[str, str] = {}
+     kotlin_same_pkg_raw: Dict[Tuple[str, str], Dict[str, str]] = {}
+     kotlin_stripped_map: Dict[str, str] = {}
++
+     for _fp in all_files:
+         if not _fp.endswith(".kt"):
+             continue
+         _content = file_map.get(_fp, "")
+         _pkg = _kotlin_package_of(_content)
+-        if _pkg:
+-            kotlin_packages.add(_pkg)
+-            kotlin_file_packages[_fp] = _pkg
+-            _root = _kotlin_source_root(_fp, _pkg)
+-            if _root and _root not in kotlin_roots:
+-                kotlin_roots.append(_root)
+-            for _name in _kotlin_top_level_names(_content):
+-                kotlin_symbol_index.setdefault((_pkg, _name), _fp)
+-            _stripped_kt = _kotlin_strip_comments_and_strings(_content)
+-            kotlin_stripped_map[_fp] = _stripped_kt
+-            for _sym, _skind in _kotlin_same_package_declarations(
+-                _content, _stripped=_stripped_kt
+-            ).items():
+-                kotlin_same_pkg_raw.setdefault((_pkg, _sym), {})[_fp] = _skind
++        if not _pkg:
++            continue
++        kotlin_packages.add(_pkg)
++        kotlin_file_packages[_fp] = _pkg
++        _root = _kotlin_source_root(_fp, _pkg)
++        if _root and _root not in kotlin_roots:
++            kotlin_roots.append(_root)
++        for _name in _kotlin_top_level_names(_content):
++            kotlin_symbol_index.setdefault((_pkg, _name), _fp)
++        _stripped_kt = _kotlin_strip_comments_and_strings(_content)
++        kotlin_stripped_map[_fp] = _stripped_kt
++        for _sym, _skind in _kotlin_same_package_declarations(
++            _content, _stripped=_stripped_kt
++        ).items():
++            kotlin_same_pkg_raw.setdefault((_pkg, _sym), {})[_fp] = _skind
+ 
+     # Keep only unique (package, symbol) owners so duplicate-named top-level
+     # symbols across variant source roots (e.g. src/debug vs src/release) fail closed.
+@@ -839,25 +862,27 @@
+     for _pkg in kotlin_same_pkg_index:
+         kotlin_same_pkg_index[_pkg].sort()
+ 
+-    # ============================================================
+-    # PASS 1.5 (cont.): Rust module/symbol index (R1)
+-    # Built from the contents PASS 1 already read. Crate roots are
+-    # derived per file (nearest ancestor lib.rs/main.rs; bin/examples/
+-    # tests/benches files are their own crates), so workspace layouts
+-    # need no configuration. Top-level declarations are indexed as
+-    # (root, module, name) -> file, so `use crate::foo::greet` resolves
+-    # even when `greet` is declared in a differently-named file.
+-    # Package names come from the nearest Cargo.toml ([package] name,
+-    # `-` -> `_`; explicit [lib] name wins) so integration tests can
+-    # `use <pkg>::...` the library crate. When the manifest is absent
+-    # (e.g. snapshot mode) the package map stays empty and `<pkg>::`
+-    # imports classify as external — never as wrong edges.
+-    # ============================================================
++    return _KotlinCorpusIndex(
++        packages=kotlin_packages,
++        roots=kotlin_roots,
++        symbol_index=kotlin_symbol_index,
++        file_packages=kotlin_file_packages,
++        same_pkg_index=kotlin_same_pkg_index,
++        stripped_map=kotlin_stripped_map,
++    )
++
++
++def _build_rust_index(
++    all_files: List[str],
++    file_map: Dict[str, str],
++) -> _RustCorpusIndex:
++    """PASS 1.5 (Rust R1): Build crate-relative module, symbol, and Cargo package indexes."""
+     rust_file_module: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+     rust_module_index: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+     rust_symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str] = {}
+     rust_top_modules: Dict[str, Set[str]] = {}
+     rust_package_lib: Dict[str, str] = {}
++
+     for _fp in all_files:
+         if not _fp.endswith(".rs"):
+             continue
+@@ -873,11 +898,23 @@
+         if _lib_name and _lib_root:
+             rust_package_lib.setdefault(_lib_name, _lib_root)
+ 
+-    # ============================================================
+-    # PASS 2: Node metadata extraction
+-    # ============================================================
+-    all_files_set = set(all_files)
+-    # G5a + Phase 3: AndroidManifest.xml, Cargo.toml, package.json, shebang, tool config entrypoints.
++    return _RustCorpusIndex(
++        file_module=rust_file_module,
++        module_index=rust_module_index,
++        symbol_index=rust_symbol_index,
++        top_modules=rust_top_modules,
++        package_lib=rust_package_lib,
++    )
++
++
++def _build_node_metadata_table(
++    scan_root_norm: str,
++    all_files: List[str],
++    all_files_set: Set[str],
++    file_map: Dict[str, str],
++    ignore_dirs: Set[str],
++) -> Dict[str, Dict[str, Any]]:
++    """PASS 2: Extract node classifications, test markers, and multi-source entrypoints."""
+     manifest_entrypoints = _android_manifest_entrypoints(
+         scan_root_norm,
+         [(fp, file_map[fp]) for fp in all_files if fp.endswith(".kt")],
+@@ -894,7 +931,6 @@
+     )
+ 
+     node_metadata: Dict[str, Dict[str, Any]] = {}
+-
+     for fp in all_files:
+         content = file_map[fp]
+         filename = os.path.basename(fp)
+@@ -928,346 +964,380 @@
+         is_entrypoint, ep_kind, ep_conf = _pick_preferred_entrypoint(
+             base_ep, manifest_ep, rust_ep, pkg_ep, shebang_ep, config_ep
+         )
+-        is_test = _is_test_file(fp)
+-        node_type = _classify_node(fp, content)
+-
+         node_metadata[fp] = {
+-            "type": node_type,
++            "type": _classify_node(fp, content),
+             "is_entrypoint": is_entrypoint,
+             "entrypoint_kind": ep_kind,
+             "entrypoint_confidence": ep_conf,
+-            "is_test": is_test,
++            "is_test": _is_test_file(fp),
+         }
++    return node_metadata
+ 
+-    # ============================================================
+-    # PASS 3: Import resolution + graph construction
+-    # ============================================================
+-    edges: List[Tuple[str, str]] = []
+-    resolved_imports: Dict[str, List[str]] = {}
+-    unresolved_imports: List[Dict[str, Any]] = []
+-    external_imports: List[Dict[str, Any]] = []
+-    resolved_edge_natures: Dict[Tuple[str, str], List[str]] = {}
+-    resolved_edge_usages: Dict[Tuple[str, str], List[str]] = {}
+ 
++def _record_resolved_edge(
++    state: _ImportResolutionState,
++    fp: str,
++    target: str,
++    nature: str,
++    usages: List[str],
++    resolved_targets: List[str],
++) -> None:
++    """Record one resolved dependency edge along with its nature and semantic usages."""
++    state.edges.append((fp, target))
++    state.resolved_edge_natures.setdefault((fp, target), []).append(nature)
++    if usages:
++        state.resolved_edge_usages.setdefault((fp, target), []).extend(usages)
++    resolved_targets.append(target)
++
++
++def _resolve_relative_import(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    resolved_base = _resolve_import_path(fp, raw_import)
++    language = item.get("language", source_language(fp))
++    candidates = _candidate_targets(resolved_base, language)
++    matched = next((cand for cand in candidates if cand in state.all_files_set), None)
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    else:
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "attempted_candidates": candidates,
++        })
++
++
++def _resolve_kotlin_import(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    if item.get("wildcard"):
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "kotlin_wildcard",
++        })
++        return
++
++    matched = next(
++        (
++            cand
++            for cand in _kotlin_module_candidates(raw_import, state.kotlin_index.roots)
++            if cand in state.all_files_set
++        ),
++        None,
++    )
++    if not matched:
++        parts = raw_import.split(".")
++        for k in range(len(parts) - 1, 0, -1):
++            cand_file = state.kotlin_index.symbol_index.get(
++                (".".join(parts[:k]), parts[k])
++            )
++            if cand_file is not None and cand_file in state.all_files_set:
++                matched = cand_file
++                break
++
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    elif _kotlin_is_generated(raw_import, state.kotlin_index.packages):
++        state.external_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "kotlin_generated",
++        })
++    elif _kotlin_is_internal(raw_import, state.kotlin_index.packages):
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "kotlin_unresolved",
++        })
++    else:
++        state.external_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "kotlin_external",
++        })
++
++
++def _resolve_rust_mod_declaration(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    own_root, own_mod = state.rust_index.file_module.get(fp, (fp, ()))
++    target_mod = own_mod + (raw_import,)
++    matched = state.rust_index.module_index.get((own_root, target_mod))
++    if matched is None and own_root == fp:
++        mod_dir = os.path.dirname(fp)
++        mod_cands = [
++            _normalize_path(os.path.join(mod_dir, raw_import + ".rs")),
++            _normalize_path(os.path.join(mod_dir, raw_import, "mod.rs")),
++        ]
++        matched = next((c for c in mod_cands if c in state.all_files_set), None)
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    else:
++        mod_base = (
++            _normalize_path(os.path.join(own_root, *target_mod))
++            if own_root != fp
++            else _normalize_path(os.path.join(os.path.dirname(fp), raw_import))
++        )
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "rust_mod_unresolved",
++            "attempted_candidates": [
++                mod_base + ".rs",
++                mod_base + "/mod.rs",
++            ],
++        })
++
++
++def _resolve_rust_import(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    if item.get("rust_mod"):
++        _resolve_rust_mod_declaration(state, fp, item, resolved_targets)
++        return
++
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    segs = raw_import.split("::")
++    own_root, own_mod = state.rust_index.file_module.get(fp, (fp, ()))
++    target_root = own_root
++    anchored = False
++    own_package = False
++
++    if segs[0] == "crate":
++        base: Tuple[str, ...] = ()
++        rest = segs[1:]
++        anchored = True
++    elif segs[0] == "self":
++        base = own_mod
++        rest = segs[1:]
++        anchored = True
++    elif segs[0] == "super":
++        ups = 0
++        while ups < len(segs) and segs[ups] == "super":
++            ups += 1
++        base = own_mod[: max(0, len(own_mod) - ups)]
++        rest = segs[ups:]
++        anchored = True
++    elif segs[0] in RUST_STDLIB_CRATES:
++        state.external_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "rust_stdlib",
++        })
++        return
++    elif segs[0] in state.rust_index.package_lib:
++        target_root = state.rust_index.package_lib[segs[0]]
++        base = ()
++        rest = segs[1:]
++        own_package = True
++    else:
++        base = ()
++        rest = segs
++
++    full = base + tuple(rest)
++    matched = None
++    if rest:
++        matched = state.rust_index.module_index.get((target_root, full))
++    if not matched and rest and not item.get("wildcard"):
++        matched = state.rust_index.symbol_index.get(
++            (target_root, base + tuple(rest[:-1]), rest[-1])
++        )
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    elif anchored or own_package or (
++        rest and rest[0] in state.rust_index.top_modules.get(target_root, set())
++    ):
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "rust_glob" if item.get("wildcard") else "rust_unresolved",
++        })
++    else:
++        state.external_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "rust_external",
++        })
++
++
++def _resolve_python_import(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    python_roots = [state.scan_root_norm]
++    src_root = (
++        _normalize_path(os.path.join(state.scan_root_norm, "src"))
++        if state.scan_root_norm not in ("", ".")
++        else "src"
++    )
++    if src_root not in python_roots:
++        python_roots.append(src_root)
++    python_candidates = python_module_candidates(raw_import, python_roots)
++    matched = next((cand for cand in python_candidates if cand in state.all_files_set), None)
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    else:
++        state.external_imports.append({"importer": fp, "raw_import": raw_import})
++
++
++def _resolve_alias_import(
++    state: _ImportResolutionState,
++    fp: str,
++    item: Dict[str, Any],
++    resolved_targets: List[str],
++) -> None:
++    raw_import = item["raw_import"]
++    nature = item.get("import_nature", "runtime")
++    usages = item.get("semantic_usages", [])
++    alias_bases = _alias_candidates(raw_import, state.alias_rules) if state.alias_rules else []
++    if not alias_bases:
++        state.external_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++        })
++        return
++
++    attempted_candidates: List[str] = []
++    matched = None
++    for alias_base in alias_bases:
++        candidates = _candidate_targets(alias_base)
++        attempted_candidates.extend(candidates)
++        for cand in candidates:
++            if cand in state.all_files_set:
++                matched = cand
++                break
++        if matched:
++            break
++
++    if matched:
++        _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
++    else:
++        state.unresolved_imports.append({
++            "importer": fp,
++            "raw_import": raw_import,
++            "reason": "alias_candidate_not_found",
++            "attempted_candidates": attempted_candidates,
++        })
++
++
++_LANGUAGE_IMPORT_RESOLVERS: Dict[
++    str,
++    Callable[[_ImportResolutionState, str, Dict[str, Any], List[str]], None],
++] = {
++    "kotlin": _resolve_kotlin_import,
++    "rust": _resolve_rust_import,
++    "python": _resolve_python_import,
++}
++
++
++def _resolve_kotlin_same_package_edges(
++    state: _ImportResolutionState,
++    fp: str,
++    file_map: Dict[str, str],
++    resolved_targets: List[str],
++) -> None:
++    """PASS 3b: Resolve implicit Kotlin same-package symbol references."""
++    pkg = state.kotlin_index.file_packages.get(fp, "")
++    pkg_entries = state.kotlin_index.same_pkg_index.get(pkg)
++    if not (pkg and pkg_entries):
++        return
++    body_kt = state.kotlin_index.stripped_map.get(fp)
++    if body_kt is None:
++        body_kt = _kotlin_strip_comments_and_strings(file_map.get(fp, ""))
++    body_kt = re.sub(
++        r"^[ \t]*(?:package|import)\b[^\n]*",
++        "",
++        body_kt,
++        flags=re.MULTILINE,
++    )
++    tokens = set(
++        re.findall(r"(?<!::)(?<![.\w])[A-Za-z_][A-Za-z0-9_]*\b", body_kt)
++    )
++    explicit_set = set(resolved_targets)
++    same_pkg_targets: Set[str] = set()
++    for sym, target_fp, kind in pkg_entries:
++        if target_fp == fp or target_fp in explicit_set:
++            continue
++        if sym not in tokens:
++            continue
++        if kind == "fun" and not re.search(
++            rf"(?<!::)(?<![.\w]){re.escape(sym)}\s*\(",
++            body_kt,
++        ):
++            continue
++        same_pkg_targets.add(target_fp)
++    for target_fp in sorted(same_pkg_targets):
++        _record_resolved_edge(
++            state,
++            fp,
++            target_fp,
++            "same_package",
++            ["same_package_ref"],
++            resolved_targets,
++        )
++
++
++def _resolve_corpus_imports(
++    all_files: List[str],
++    file_map: Dict[str, str],
++    file_imports: Dict[str, List[Dict[str, Any]]],
++    state: _ImportResolutionState,
++) -> Dict[str, List[str]]:
++    """PASS 3: Resolve imports across all discovered files via extensible language dispatch."""
++    resolved_imports: Dict[str, List[str]] = {}
+     for fp in all_files:
+         resolved_targets: List[str] = []
+-
+         for item in file_imports.get(fp, []):
+             raw_import = item["raw_import"]
+-            nature = item.get("import_nature", "runtime")
+-            usages = item.get("semantic_usages", [])
+-
+             if raw_import.startswith("."):
+-                resolved_base = _resolve_import_path(fp, raw_import)
+-                language = item.get("language", source_language(fp))
+-                candidates = _candidate_targets(resolved_base, language)
+-                matched = None
+-
+-                for cand in candidates:
+-                    if cand in all_files_set:
+-                        matched = cand
+-                        break
+-
+-                if matched:
+-                    edges.append((fp, matched))
+-                    resolved_edge_natures.setdefault((fp, matched), []).append(nature)
+-                    resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
+-                    resolved_targets.append(matched)
+-                else:
+-                    unresolved_imports.append({
+-                        "importer": fp,
+-                        "raw_import": raw_import,
+-                        "attempted_candidates": candidates,
+-                    })
+-            else:
+-                language = item.get("language", source_language(fp))
+-                if language == "kotlin":
+-                    # K5: Kotlin imports are fully-qualified names. Resolve in
+-                    # two stages — FQN-as-path under a derived source root,
+-                    # then the (package, name) symbol index — so types declared
+-                    # in a differently-named file still resolve. Unmatched
+-                    # imports are classified, not silently dropped: generated
+-                    # (`<pkg>.R`) and foreign packages are external, a known
+-                    # package that does not resolve is unresolved.
+-                    if item.get("wildcard"):
+-                        unresolved_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "kotlin_wildcard",
+-                        })
+-                        continue
+-                    matched = None
+-                    for cand in _kotlin_module_candidates(raw_import, kotlin_roots):
+-                        if cand in all_files_set:
+-                            matched = cand
+-                            break
+-                    if not matched:
+-                        parts = raw_import.split(".")
+-                        for k in range(len(parts) - 1, 0, -1):
+-                            cand_file = kotlin_symbol_index.get(
+-                                (".".join(parts[:k]), parts[k])
+-                            )
+-                            if cand_file is not None and cand_file in all_files_set:
+-                                matched = cand_file
+-                                break
+-                    if matched:
+-                        edges.append((fp, matched))
+-                        resolved_edge_natures.setdefault((fp, matched), []).append(nature)
+-                        resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
+-                        resolved_targets.append(matched)
+-                    elif _kotlin_is_generated(raw_import, kotlin_packages):
+-                        external_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "kotlin_generated",
+-                        })
+-                    elif _kotlin_is_internal(raw_import, kotlin_packages):
+-                        unresolved_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "kotlin_unresolved",
+-                        })
+-                    else:
+-                        external_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "kotlin_external",
+-                        })
+-                    continue
+-                if language == "rust":
+-                    # R1: Rust `use` paths, plus `mod` declarations. A `mod`
+-                    # is resolved against sibling files next to the
+-                    # declaring file (`<name>.rs`, then `<name>/mod.rs`) —
+-                    # a `mod` is relative to the declaring *module's*
+-                    # directory, so the generic relative branch (file
+-                    # directory) would mis-resolve it. `use` paths resolve
+-                    # in two stages — module path under the importer's crate
+-                    # root, then the (module, name) symbol index — mirroring
+-                    # the Kotlin branch. No parent-module fallback: a typo
+-                    # stays unresolved, honestly. Unmatched imports are
+-                    # classified, not silently dropped: a `::*` glob resolves
+-                    # through the module stage (it targets one module file)
+-                    # and is unresolved (rust_glob) only when that module
+-                    # does not resolve; std/core/alloc are external
+-                    # (rust_stdlib); other unknown first segments are
+-                    # external crates (rust_external); anchored
+-                    # (`crate`/`self`/`super`), own-package (`<pkg>::`) and
+-                    # known-local-module paths that do not resolve are
+-                    # unresolved (rust_unresolved).
+-                    if item.get("rust_mod"):
+-                        # A `mod` is relative to the declaring *module's*
+-                        # directory: resolve through the module index (it
+-                        # encodes exactly that: lib.rs -> (foo,) is
+-                        # src/foo.rs, foo.rs -> (foo, bar) is
+-                        # src/foo/bar.rs, foo/mod.rs -> (foo, bar) is the
+-                        # same file). Files that are their own crate
+-                        # (src/bin/*, examples/*, tests/*, benches/*,
+-                        # standalone files: root == the file itself) have
+-                        # no module directory, so their child modules live
+-                        # next to the file instead.
+-                        _own_root, _own_mod = rust_file_module.get(fp, (fp, ()))
+-                        _target_mod = _own_mod + (raw_import,)
+-                        _mod_matched = rust_module_index.get((_own_root, _target_mod))
+-                        if _mod_matched is None and _own_root == fp:
+-                            _mod_dir = os.path.dirname(fp)
+-                            _mod_cands = [
+-                                _normalize_path(os.path.join(_mod_dir, raw_import + ".rs")),
+-                                _normalize_path(os.path.join(_mod_dir, raw_import, "mod.rs")),
+-                            ]
+-                            _mod_matched = next(
+-                                (c for c in _mod_cands if c in all_files_set), None
+-                            )
+-                        if _mod_matched:
+-                            edges.append((fp, _mod_matched))
+-                            resolved_edge_natures.setdefault((fp, _mod_matched), []).append(nature)
+-                            resolved_edge_usages.setdefault((fp, _mod_matched), []).extend(usages)
+-                            resolved_targets.append(_mod_matched)
+-                        else:
+-                            _mod_base = _normalize_path(
+-                                os.path.join(_own_root, * _target_mod)
+-                            ) if _own_root != fp else _normalize_path(
+-                                os.path.join(os.path.dirname(fp), raw_import)
+-                            )
+-                            unresolved_imports.append({
+-                                "importer": fp,
+-                                "raw_import": raw_import,
+-                                "reason": "rust_mod_unresolved",
+-                                "attempted_candidates": [
+-                                    _mod_base + ".rs",
+-                                    _mod_base + "/mod.rs",
+-                                ],
+-                            })
+-                        continue
+-                    # A glob (`use a::b::*;`) targets one module file, so
+-                    # it resolves through the module stage below; only a
+-                    # glob whose module does not resolve stays unresolved
+-                    # (rust_glob). (Unlike a Kotlin wildcard, which targets
+-                    # a multi-file package and has no single file to edge
+-                    # to, so it stays unresolved there.)
+-                    _segs = raw_import.split("::")
+-                    _own_root, _own_mod = rust_file_module.get(fp, (fp, ()))
+-                    _target_root = _own_root
+-                    _anchored = False
+-                    _own_package = False
+-                    if _segs[0] == "crate":
+-                        _base: Tuple[str, ...] = ()
+-                        _rest = _segs[1:]
+-                        _anchored = True
+-                    elif _segs[0] == "self":
+-                        _base = _own_mod
+-                        _rest = _segs[1:]
+-                        _anchored = True
+-                    elif _segs[0] == "super":
+-                        _ups = 0
+-                        while _ups < len(_segs) and _segs[_ups] == "super":
+-                            _ups += 1
+-                        _base = _own_mod[: max(0, len(_own_mod) - _ups)]
+-                        _rest = _segs[_ups:]
+-                        _anchored = True
+-                    elif _segs[0] in RUST_STDLIB_CRATES:
+-                        external_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "rust_stdlib",
+-                        })
+-                        continue
+-                    elif _segs[0] in rust_package_lib:
+-                        _target_root = rust_package_lib[_segs[0]]
+-                        _base = ()
+-                        _rest = _segs[1:]
+-                        _own_package = True
+-                    else:
+-                        _base = ()
+-                        _rest = _segs
+-                    _full = _base + tuple(_rest)
+-                    matched = None
+-                    if _rest:
+-                        matched = rust_module_index.get((_target_root, _full))
+-                    if not matched and _rest and not item.get("wildcard"):
+-                        matched = rust_symbol_index.get(
+-                            (_target_root, _base + tuple(_rest[:-1]), _rest[-1])
+-                        )
+-                    if matched:
+-                        edges.append((fp, matched))
+-                        resolved_edge_natures.setdefault((fp, matched), []).append(nature)
+-                        resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
+-                        resolved_targets.append(matched)
+-                    elif _anchored or _own_package or (
+-                        _rest and _rest[0] in rust_top_modules.get(_target_root, set())
+-                    ):
+-                        unresolved_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "rust_glob" if item.get("wildcard") else "rust_unresolved",
+-                        })
+-                    else:
+-                        external_imports.append({
+-                            "importer": fp,
+-                            "raw_import": raw_import,
+-                            "reason": "rust_external",
+-                        })
+-                    continue
+-                if language == "python":
+-                    python_roots = [scan_root_norm]
+-                    src_root = _normalize_path(os.path.join(scan_root_norm, "src")) if scan_root_norm not in ("", ".") else "src"
+-                    if src_root not in python_roots:
+-                        python_roots.append(src_root)
+-                    python_candidates = python_module_candidates(raw_import, python_roots)
+-                    matched = next((cand for cand in python_candidates if cand in all_files_set), None)
+-                    if matched:
+-                        edges.append((fp, matched))
+-                        resolved_edge_natures.setdefault((fp, matched), []).append(nature)
+-                        resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
+-                        resolved_targets.append(matched)
+-                    else:
+-                        external_imports.append({"importer": fp, "raw_import": raw_import})
+-                    continue
+-
+-                alias_bases = _alias_candidates(raw_import, alias_rules) if alias_rules else []
+-                if not alias_bases:
+-                    external_imports.append({
+-                        "importer": fp,
+-                        "raw_import": raw_import,
+-                    })
+-                    continue
+-
+-                attempted_candidates: List[str] = []
+-                matched = None
++                _resolve_relative_import(state, fp, item, resolved_targets)
++                continue
++            language = item.get("language", source_language(fp))
++            resolver = _LANGUAGE_IMPORT_RESOLVERS.get(language, _resolve_alias_import)
++            resolver(state, fp, item, resolved_targets)
+ 
+-                for alias_base in alias_bases:
+-                    candidates = _candidate_targets(alias_base)
+-                    attempted_candidates.extend(candidates)
+-
+-                    for cand in candidates:
+-                        if cand in all_files_set:
+-                            matched = cand
+-                            break
+-
+-                    if matched:
+-                        break
+-
+-                if matched:
+-                    edges.append((fp, matched))
+-                    resolved_edge_natures.setdefault((fp, matched), []).append(nature)
+-                    resolved_edge_usages.setdefault((fp, matched), []).extend(usages)
+-                    resolved_targets.append(matched)
+-                else:
+-                    unresolved_imports.append({
+-                        "importer": fp,
+-                        "raw_import": raw_import,
+-                        "reason": "alias_candidate_not_found",
+-                        "attempted_candidates": attempted_candidates,
+-                    })
+-
+-        # PASS 3b: Kotlin same-package symbol usage resolution.
+-        # Files in the same Kotlin package can reference each other's
+-        # non-private top-level declarations without an import statement.
+-        # Marked import_nature="same_package" so topo.orphan / impact /
+-        # test_reachability stay honest while topo.circular excludes them.
+         if fp.endswith(".kt"):
+-            pkg = kotlin_file_packages.get(fp, "")
+-            pkg_entries = kotlin_same_pkg_index.get(pkg)
+-            if pkg and pkg_entries:
+-                body_kt = kotlin_stripped_map.get(fp)
+-                if body_kt is None:
+-                    body_kt = _kotlin_strip_comments_and_strings(file_map.get(fp, ""))
+-                body_kt = re.sub(
+-                    r"^[ \t]*(?:package|import)\b[^\n]*",
+-                    "",
+-                    body_kt,
+-                    flags=re.MULTILINE,
+-                )
+-                tokens = set(
+-                    re.findall(r"(?<!::)(?<![.\w])[A-Za-z_][A-Za-z0-9_]*\b", body_kt)
+-                )
+-                explicit_set = set(resolved_targets)
+-                same_pkg_targets: Set[str] = set()
+-                for sym, target_fp, kind in pkg_entries:
+-                    if target_fp == fp or target_fp in explicit_set:
+-                        continue
+-                    if sym not in tokens:
+-                        continue
+-                    if kind == "fun" and not re.search(
+-                        rf"(?<!::)(?<![.\w]){re.escape(sym)}\s*\(",
+-                        body_kt,
+-                    ):
+-                        continue
+-                    same_pkg_targets.add(target_fp)
+-                for target_fp in sorted(same_pkg_targets):
+-                    edges.append((fp, target_fp))
+-                    resolved_edge_natures.setdefault((fp, target_fp), []).append(
+-                        "same_package"
+-                    )
+-                    resolved_edge_usages.setdefault((fp, target_fp), []).append(
+-                        "same_package_ref"
+-                    )
+-                    resolved_targets.append(target_fp)
+-
++            _resolve_kotlin_same_package_edges(state, fp, file_map, resolved_targets)
+         resolved_imports[fp] = resolved_targets
++    return resolved_imports
+ 
+-    # Deduplicate edges
+-    edges = sorted(set(edges))
+ 
++def _finalize_edge_metadata(
++    raw_edges: List[Tuple[str, str]],
++    resolved_edge_natures: Dict[Tuple[str, str], List[str]],
++    resolved_edge_usages: Dict[Tuple[str, str], List[str]],
++) -> Tuple[List[Tuple[str, str]], Dict[str, str], List[Dict[str, Any]]]:
++    """Deduplicate edges and aggregate edge_natures and semantic edge_details."""
++    edges = sorted(set(raw_edges))
+     edge_natures: Dict[str, str] = {}
+     for edge in edges:
+         u, v = edge
+@@ -1284,43 +1354,43 @@
+ 
+     edge_details = [
+         {
+-            "source": u, 
+-            "target": v, 
++            "source": u,
++            "target": v,
+             "import_nature": edge_natures.get(f"{u} -> {v}", "runtime"),
+-            "semantic_usages": sorted(set(resolved_edge_usages.get((u, v), [])))
++            "semantic_usages": sorted(set(resolved_edge_usages.get((u, v), []))),
+         }
+         for u, v in edges
+     ]
++    return edges, edge_natures, edge_details
+ 
+-    # ============================================================
+-    # PASS 4: Fan in/out calculation
+-    # ============================================================
++
++def _compute_degree_metrics(
++    all_files: List[str],
++    edges: List[Tuple[str, str]],
++    node_metadata: Dict[str, Dict[str, Any]],
++) -> None:
++    """PASS 4: Populate fan_in and fan_out on each node's metadata entry."""
+     fan_in: Dict[str, int] = {}
+     fan_out: Dict[str, int] = {}
+-
+     for src, tgt in edges:
+         fan_out[src] = fan_out.get(src, 0) + 1
+         fan_in[tgt] = fan_in.get(tgt, 0) + 1
+-
+     for fp in all_files:
+         node_metadata[fp]["fan_in"] = fan_in.get(fp, 0)
+         node_metadata[fp]["fan_out"] = fan_out.get(fp, 0)
+ 
+-    # ============================================================
+-    # PASS 5: Boundary detection
+-    # ============================================================
+-    boundaries, file_to_boundary = _detect_boundaries(all_files, scan_root)
+ 
+-    # ============================================================
+-    # PASS 6: Type shape extraction
+-    # ============================================================
++def _extract_corpus_type_shapes(
++    all_files: List[str],
++    file_map: Dict[str, str],
++) -> Dict[str, Dict[str, List[str]]]:
++    """PASS 6: Two-pass type/interface shape extraction with cross-file inheritance."""
+     type_shapes: Dict[str, Dict[str, List[str]]] = {}
+     known_global_shapes: Dict[str, Set[str]] = {}
+     shape_candidate_files: List[str] = []
+ 
+     for fp in all_files:
+-        content = file_map[fp]
+-        shapes = _extract_type_shapes(content)
++        shapes = _extract_type_shapes(file_map[fp])
+         if shapes:
+             shape_candidate_files.append(fp)
+             for sname, sprops in shapes.items():
+@@ -1330,16 +1400,69 @@
+                     known_global_shapes[sname].update(sprops)
+ 
+     for fp in shape_candidate_files:
+-        content = file_map[fp]
+-        shapes = _extract_type_shapes(content, known_shapes=known_global_shapes)
++        shapes = _extract_type_shapes(file_map[fp], known_shapes=known_global_shapes)
+         if shapes:
+             type_shapes[fp] = {
+                 name: sorted(props) for name, props in shapes.items()
+             }
++    return type_shapes
++
++
++def build_shared_graph(
++    scan_root: str = ".",
++    ignore_dirs: Optional[Set[str]] = None,
++    _file_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
++    include_tool_source: bool = False,
++) -> Dict[str, Any]:
++    """
++    Bangun SharedGraph dari satu discovery pass atau snapshot tervalidasi.
++
++    Discovery filesystem tetap terpusat di modul ini. Semua analyzer
++    mengonsumsi output fungsi ini dan tidak melakukan scan sendiri.
++    """
++    if ignore_dirs is None:
++        ignore_dirs = set(DEFAULT_IGNORE_DIRS)
++
++    scan_root_norm = _normalize_path(scan_root)
++    alias_rules = _load_alias_rules([scan_root_norm, "."])
++
++    all_files, file_map, file_imports = _collect_corpus_sources(
++        scan_root, ignore_dirs, _file_snapshot, include_tool_source
++    )
++    all_files_set = set(all_files)
++
++    kotlin_index = _build_kotlin_index(all_files, file_map)
++    rust_index = _build_rust_index(all_files, file_map)
++
++    node_metadata = _build_node_metadata_table(
++        scan_root_norm, all_files, all_files_set, file_map, ignore_dirs
++    )
++
++    resolution_state = _ImportResolutionState(
++        scan_root_norm=scan_root_norm,
++        all_files_set=all_files_set,
++        alias_rules=alias_rules,
++        kotlin_index=kotlin_index,
++        rust_index=rust_index,
++        edges=[],
++        unresolved_imports=[],
++        external_imports=[],
++        resolved_edge_natures={},
++        resolved_edge_usages={},
++    )
++    resolved_imports = _resolve_corpus_imports(
++        all_files, file_map, file_imports, resolution_state
++    )
++    edges, edge_natures, edge_details = _finalize_edge_metadata(
++        resolution_state.edges,
++        resolution_state.resolved_edge_natures,
++        resolution_state.resolved_edge_usages,
++    )
++
++    _compute_degree_metrics(all_files, edges, node_metadata)
++    boundaries, file_to_boundary = _detect_boundaries(all_files, scan_root)
++    type_shapes = _extract_corpus_type_shapes(all_files, file_map)
+ 
+-    # ============================================================
+-    # Assemble SharedGraph
+-    # ============================================================
+     result = {
+         "schema_version": SCHEMA_VERSION,
+         "scan_root": scan_root_norm,
+@@ -1359,8 +1482,8 @@
+ 
+         # Import resolution
+         "resolved_imports": resolved_imports,
+-        "unresolved_imports": unresolved_imports,
+-        "external_imports": external_imports,
++        "unresolved_imports": resolution_state.unresolved_imports,
++        "external_imports": resolution_state.external_imports,
+ 
+         # Boundaries
+         "boundaries": boundaries,
+@@ -1378,8 +1501,8 @@
+             "same_package_edge_count": sum(1 for (u, v) in edges if edge_natures.get(f"{u} -> {v}", "runtime") == "same_package"),
+             "total_boundaries": len(boundaries),
+             "total_type_shapes": sum(len(v) for v in type_shapes.values()),
+-            "total_unresolved": len(unresolved_imports),
+-            "total_external": len(external_imports),
++            "total_unresolved": len(resolution_state.unresolved_imports),
++            "total_external": len(resolution_state.external_imports),
+             "alias_rules_count": len(alias_rules),
+             "entrypoint_count": sum(
+                 1 for m in node_metadata.values() if m.get("is_entrypoint")
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -16,7 +16,7 @@
+ import json
+ import hashlib
+ import datetime
+-from typing import Any, Dict, List, Optional
++from typing import Any, Callable, Dict, List, Optional
+ 
+ # Import kernel components
+ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+@@ -4576,63 +4576,61 @@
+     return default
+ 
+ 
+-def main():
+-    global _MEMORY_SCOPE_EXPLICIT
++_KERNEL_MAIN_HELP = {
++    "tool": "hott_kernel",
++    "schema_version": "4.0.0-kernel",
++    "global_options": {
++        "cache_mode": "--cache-mode auto|refresh|off (or AI_STUDIO_GRAPH_CACHE)",
++        "memory_project_root": "--memory-project-root PATH (or AI_STUDIO_PROJECT_ROOT)",
++        "memory_scope": "--memory-scope NAME (or AI_STUDIO_MEMORY_SCOPE)",
++        "memory_state_dir": "--memory-state-dir PATH (or AI_STUDIO_STATE_DIR)",
++    },
++    "usage": {
++        "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep] [--frame-only]",
++        "analyze": "python3 hott_kernel.py analyze [root] [--root DIR] [--analyzers a,b] [--output full|summary|findings|graph]",
++        "analyzers": "python3 hott_kernel.py analyzers",
++        "cache": "python3 hott_kernel.py cache status|refresh|clear [root] [--root DIR]",
++        "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
++        "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
++        "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++        "context": "python3 hott_kernel.py context <query> [root] [--root DIR] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
++        "establish": "python3 hott_kernel.py establish [root] [--root DIR] [--baseline path]",
++        "synthesize": "python3 hott_kernel.py synthesize [root] [--root DIR] [--output full|summary]",
++        "steer": "python3 hott_kernel.py steer [root] [--root DIR] [--output full|summary] [--baseline path]",
++        "memory_store": "python3 hott_kernel.py memory_store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]",
++        "memory_recall": "python3 hott_kernel.py memory_recall [query] [--type t] [--tags t1,t2] [--limit 20]",
++        "memory_analyze": "python3 hott_kernel.py memory_analyze [--analyzers a,b] [--output full|summary] [--include-historical] [--include-provenance]",
++        "memory_stats": "python3 hott_kernel.py memory_stats",
++        "memory_associate": "python3 hott_kernel.py memory_associate <from_id> <to_id> <type> [--strength 0.7]",
++        "memory_consolidate": "python3 hott_kernel.py memory_consolidate <id1,id2,...> --content '...' [--tags t1,t2]",
++        "memory_steer": "python3 hott_kernel.py memory_steer [--output full|summary]",
++        "memory_establish": "python3 hott_kernel.py memory_establish",
++        "memory_drift": "python3 hott_kernel.py memory_drift",
++        "memory_compact": "python3 hott_kernel.py memory compact [--consolidated|--all] [--type episodic] [--dry-run|--stats|--restore <id>|--restore-all]",
++        "memory_bridge": "python3 hott_kernel.py memory bridge <from_id> <to_id> [type] [--strength 0.7] [--unsafe]",
++        "memory_bridge_auto": "python3 hott_kernel.py memory bridge_auto [--min-shared-tags 1] [--type semantic] [--dry-run]",
++        "memory_bridge_candidates": "python3 hott_kernel.py memory bridge_candidates [--min-shared-tags 1]",
++        "memory_kan": "python3 hott_kernel.py memory kan <query> [--mode lan|ran|both] [--max-depth 2]",
++        "fiber_init": "python3 hott_kernel.py fiber init <task> <focus>",
++        "fiber_lift": "python3 hott_kernel.py fiber lift [--query q] [--type t] [--tags t1,t2] [--max 10]",
++        "fiber_descend": "python3 hott_kernel.py fiber descend <memory_id> | --all [--reason r]",
++        "fiber_status": "python3 hott_kernel.py fiber status",
++        "fiber_section_start": "python3 hott_kernel.py fiber section_start <name> <narrative>",
++        "fiber_section_add": "python3 hott_kernel.py fiber section_add <memory_id>",
++        "fiber_section_status": "python3 hott_kernel.py fiber section_status",
++        "fiber_switch": "python3 hott_kernel.py fiber switch <new_task> <new_focus>",
++        "fiber_transport": "python3 hott_kernel.py fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]",
++        "fiber_list_archives": "python3 hott_kernel.py fiber list_archives",
++        "xanalyze": "python3 hott_kernel.py xanalyze [root] [--root DIR] [--output summary|full] [--no-store] [--analyzers a,b]",
++        "xsteer": "python3 hott_kernel.py xsteer [root] [--root DIR] [--output full|summary]",
++        "xcontext": "python3 hott_kernel.py xcontext <file_path>",
++    },
++}
+ 
+-    if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
+-        print(json.dumps({
+-            "tool": "hott_kernel",
+-            "schema_version": "4.0.0-kernel",
+-            "global_options": {
+-                "cache_mode": "--cache-mode auto|refresh|off (or AI_STUDIO_GRAPH_CACHE)",
+-                "memory_project_root": "--memory-project-root PATH (or AI_STUDIO_PROJECT_ROOT)",
+-                "memory_scope": "--memory-scope NAME (or AI_STUDIO_MEMORY_SCOPE)",
+-                "memory_state_dir": "--memory-state-dir PATH (or AI_STUDIO_STATE_DIR)",
+-            },
+-            "usage": {
+-                "work": "python3 hott_kernel.py work <task> [root] [--root DIR] [--target file[,file]] [--goal auto|understand|change|architecture|performance|runtime|history] [--depth auto|quick|standard|deep] [--frame-only]",
+-                "analyze": "python3 hott_kernel.py analyze [root] [--root DIR] [--analyzers a,b] [--output full|summary|findings|graph]",
+-                "analyzers": "python3 hott_kernel.py analyzers",
+-                "cache": "python3 hott_kernel.py cache status|refresh|clear [root] [--root DIR]",
+-                "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+-                "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+-                "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
+-                "context": "python3 hott_kernel.py context <query> [root] [--root DIR] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
+-                "establish": "python3 hott_kernel.py establish [root] [--root DIR] [--baseline path]",
+-                "synthesize": "python3 hott_kernel.py synthesize [root] [--root DIR] [--output full|summary]",
+-                "steer": "python3 hott_kernel.py steer [root] [--root DIR] [--output full|summary] [--baseline path]",
+-                "memory_store": "python3 hott_kernel.py memory_store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]",
+-                "memory_recall": "python3 hott_kernel.py memory_recall [query] [--type t] [--tags t1,t2] [--limit 20]",
+-                "memory_analyze": "python3 hott_kernel.py memory_analyze [--analyzers a,b] [--output full|summary] [--include-historical] [--include-provenance]",
+-                "memory_stats": "python3 hott_kernel.py memory_stats",
+-                "memory_associate": "python3 hott_kernel.py memory_associate <from_id> <to_id> <type> [--strength 0.7]",
+-                "memory_consolidate": "python3 hott_kernel.py memory_consolidate <id1,id2,...> --content '...' [--tags t1,t2]",
+-                "memory_steer": "python3 hott_kernel.py memory_steer [--output full|summary]",
+-                "memory_establish": "python3 hott_kernel.py memory_establish",
+-                "memory_drift": "python3 hott_kernel.py memory_drift",
+-                "memory_compact": "python3 hott_kernel.py memory compact [--consolidated|--all] [--type episodic] [--dry-run|--stats|--restore <id>|--restore-all]",
+-                "memory_bridge": "python3 hott_kernel.py memory bridge <from_id> <to_id> [type] [--strength 0.7] [--unsafe]",
+-                "memory_bridge_auto": "python3 hott_kernel.py memory bridge_auto [--min-shared-tags 1] [--type semantic] [--dry-run]",
+-                "memory_bridge_candidates": "python3 hott_kernel.py memory bridge_candidates [--min-shared-tags 1]",
+-                "memory_kan": "python3 hott_kernel.py memory kan <query> [--mode lan|ran|both] [--max-depth 2]",
+-                "fiber_init": "python3 hott_kernel.py fiber init <task> <focus>",
+-                "fiber_lift": "python3 hott_kernel.py fiber lift [--query q] [--type t] [--tags t1,t2] [--max 10]",
+-                "fiber_descend": "python3 hott_kernel.py fiber descend <memory_id> | --all [--reason r]",
+-                "fiber_status": "python3 hott_kernel.py fiber status",
+-                "fiber_section_start": "python3 hott_kernel.py fiber section_start <name> <narrative>",
+-                "fiber_section_add": "python3 hott_kernel.py fiber section_add <memory_id>",
+-                "fiber_section_status": "python3 hott_kernel.py fiber section_status",
+-                "fiber_switch": "python3 hott_kernel.py fiber switch <new_task> <new_focus>",
+-                "fiber_transport": "python3 hott_kernel.py fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]",
+-                "fiber_list_archives": "python3 hott_kernel.py fiber list_archives",
+-                "xanalyze": "python3 hott_kernel.py xanalyze [root] [--root DIR] [--output summary|full] [--no-store] [--analyzers a,b]",
+-                "xsteer": "python3 hott_kernel.py xsteer [root] [--root DIR] [--output full|summary]",
+-                "xcontext": "python3 hott_kernel.py xcontext <file_path>",
+-            },
+-        }, indent=2))
+-        return
+ 
+-    runtime_options = {
++def _configure_cli_memory_runtime(argv: List[str]) -> None:
++    global _MEMORY_SCOPE_EXPLICIT
++    runtime_options: Dict[str, Optional[str]] = {
+         "project_root": None,
+         "scope": None,
+         "state_dir": None,
+@@ -4642,17 +4640,17 @@
+         "--memory-scope": "scope",
+         "--memory-state-dir": "state_dir",
+     }
+-    for index, argument in enumerate(sys.argv):
++    for index, argument in enumerate(argv):
+         option_name = runtime_flags.get(argument)
+         if option_name is None:
+             continue
+-        if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):
++        if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+             _emit_cli_result(_kernel_error(
+                 "missing_memory_runtime_option",
+                 f"{argument} requires a non-empty value.",
+                 option=argument,
+             ))
+-        runtime_options[option_name] = sys.argv[index + 1]
++        runtime_options[option_name] = argv[index + 1]
+     if any(value is not None for value in runtime_options.values()):
+         if not MEMORY_RUNTIME_AVAILABLE:
+             _emit_cli_result(_kernel_error(
+@@ -4663,840 +4661,643 @@
+         if runtime_options["project_root"] is not None or runtime_options["scope"] is not None:
+             _MEMORY_SCOPE_EXPLICIT = True
+ 
++
++def _configure_cli_cache_mode(argv: List[str]) -> None:
+     requested_cache_mode = _ACTIVE_GRAPH_CACHE_MODE
+-    for index, argument in enumerate(sys.argv):
++    for index, argument in enumerate(argv):
+         if argument == "--cache-mode":
+-            if index + 1 >= len(sys.argv):
++            if index + 1 >= len(argv):
+                 _emit_cli_result(_kernel_error(
+                     "missing_graph_cache_mode",
+                     "--cache-mode requires auto, refresh, or off.",
+                     supported_cache_modes=list(CACHE_MODES),
+                 ))
+-            requested_cache_mode = sys.argv[index + 1]
++            requested_cache_mode = argv[index + 1]
+     cache_mode_error = _set_graph_cache_mode(requested_cache_mode)
+     if cache_mode_error:
+         _emit_cli_result(cache_mode_error)
+ 
+-    mode = sys.argv[1]
+ 
+-    # Valid modes contract and self-healing guidance for AI tools
+-    valid_modes = set(PUBLIC_KERNEL_MODES)
++def _cli_positional_root(argv: List[str], idx: int = 2) -> str:
++    root = argv[idx] if len(argv) > idx and not argv[idx].startswith("--") else "."
++    return _root_flag_from_argv(root)
++
++
++def _cli_flag_value(argv: List[str], *flags: str, default: Any = None) -> Any:
++    value = default
++    flag_set = set(flags)
++    for i, arg in enumerate(argv):
++        if arg in flag_set and i + 1 < len(argv):
++            value = argv[i + 1]
++    return value
++
++
++def _cli_float_flag(argv: List[str], flag: str, default: float) -> float:
++    raw = _cli_flag_value(argv, flag)
++    if raw is None:
++        return default
++    try:
++        return float(raw)
++    except ValueError:
++        return default
+ 
+-    if mode not in valid_modes:
++
++def _cli_int_flag(argv: List[str], flag: str, default: int) -> int:
++    raw = _cli_flag_value(argv, flag)
++    if raw is None:
++        return default
++    try:
++        return int(raw)
++    except ValueError:
++        return default
++
++
++def _cli_work(argv: List[str]) -> None:
++    if len(argv) < 3 or argv[2].startswith("--"):
+         _emit_cli_result(_kernel_error(
+-            "unknown_mode",
+-            f"Unknown mode: '{mode}'.",
+-            valid_modes=sorted(valid_modes),
+-            suggested_fix=(
+-                "Use work for an ordinary agent task, or choose an explicit mode: analyze, context, synthesize, "
+-                "steer, impact, outline, brief, cache, memory_recall, memory_store, xanalyze, xsteer, xcontext."
+-            ),
++            "missing_work_task",
++            "Usage: hott_kernel.py work <task> [root] [--target file[,file]] [--goal GOAL] [--depth DEPTH] [--frame-only]",
+         ))
+-        return
++    task = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    targets: List[str] = []
++    goal = "auto"
++    depth = "auto"
++    budget_tokens = DEFAULT_BUDGET_TOKENS
++    max_hops = DEFAULT_MAX_HOPS
++    detail = "source"
++    max_findings = 24
++    proactive_truth = True
++    truth_scope = None
++    ui_selector = None
++    full_engine = False
++    full_engine_edges = False
++    frame_only = False
++    receipt_arg = None
++    parse_error = None
++    for i, arg in enumerate(argv):
++        if arg in ("--target", "--targets", "--target-file", "--target-files") and i + 1 < len(argv):
++            targets.extend(value.strip() for value in argv[i + 1].split(",") if value.strip())
++        elif arg == "--goal" and i + 1 < len(argv):
++            goal = argv[i + 1]
++        elif arg == "--depth" and i + 1 < len(argv):
++            depth = argv[i + 1]
++        elif arg in ("--frame-only", "--frame_only"):
++            frame_only = True
++        elif arg in ("--budget-tokens", "--budget_tokens", "--budget") and i + 1 < len(argv):
++            try:
++                budget_tokens = int(argv[i + 1])
++            except ValueError:
++                parse_error = _kernel_error(
++                    "invalid_context_budget",
++                    "--budget-tokens must be an integer.",
++                    budget_tokens=argv[i + 1],
++                )
++        elif arg in ("--max-hops", "--max_hops") and i + 1 < len(argv):
++            try:
++                max_hops = int(argv[i + 1])
++            except ValueError:
++                parse_error = _kernel_error(
++                    "invalid_context_hops",
++                    "--max-hops must be an integer.",
++                    max_hops=argv[i + 1],
++                )
++        elif arg == "--detail" and i + 1 < len(argv):
++            detail = argv[i + 1]
++        elif arg == "--max-findings" and i + 1 < len(argv):
++            try:
++                max_findings = int(argv[i + 1])
++            except ValueError:
++                parse_error = _kernel_error(
++                    "invalid_work_finding_limit",
++                    "--max-findings must be an integer.",
++                    max_findings=argv[i + 1],
++                )
++        elif arg == "--truth-scope" and i + 1 < len(argv):
++            truth_scope = argv[i + 1]
++        elif arg == "--ui-selector" and i + 1 < len(argv):
++            ui_selector = argv[i + 1]
++        elif arg == "--no-proactive-truth":
++            proactive_truth = False
++        elif arg == "--full-engine":
++            full_engine = True
++        elif arg == "--full-engine-edges":
++            full_engine_edges = True
++        elif arg == "--receipt" and i + 1 < len(argv):
++            receipt_arg = argv[i + 1]
++    if receipt_arg is not None:
++        _emit_cli_result(_kernel_error(
++            "receipt_not_accepted",
++            "plw work is an entry stage and takes no receipt; it issues the first receipt.",
++        ))
++    if parse_error:
++        _emit_cli_result(parse_error)
++    work_result = kernel_work(
++        scan_root=root,
++        task=task,
++        target_files=targets or None,
++        goal=goal,
++        depth=depth,
++        budget_tokens=budget_tokens,
++        max_hops=max_hops,
++        detail=detail,
++        max_findings=max_findings,
++        proactive_truth=proactive_truth,
++        truth_scope=truth_scope,
++        ui_selector=ui_selector,
++        full_engine=full_engine,
++        full_engine_edges=full_engine_edges,
++        frame_only=frame_only,
++    )
++    _emit_cli_result(_attach_task_receipt(work_result, "work", task, root))
+ 
+-    if ("--help" in sys.argv[2:] or "-h" in sys.argv[2:]) and mode in _MODE_HELP_USAGE:
+-        print(json.dumps({
+-            "tool": "hott_kernel",
+-            "schema_version": "4.0.0-kernel",
+-            "mode": mode,
+-            "usage": _MODE_HELP_USAGE[mode],
+-        }, indent=2))
+-        return
+ 
+-    if mode == "work":
+-        if len(sys.argv) < 3 or sys.argv[2].startswith("--"):
+-            _emit_cli_result(_kernel_error(
+-                "missing_work_task",
+-                "Usage: hott_kernel.py work <task> [root] [--target file[,file]] [--goal GOAL] [--depth DEPTH] [--frame-only]",
+-            ))
+-        task = sys.argv[2]
+-        root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        targets: List[str] = []
+-        goal = "auto"
+-        depth = "auto"
+-        budget_tokens = DEFAULT_BUDGET_TOKENS
+-        max_hops = DEFAULT_MAX_HOPS
+-        detail = "source"
+-        max_findings = 24
+-        proactive_truth = True
+-        truth_scope = None
+-        ui_selector = None
+-        full_engine = False
+-        full_engine_edges = False
+-        frame_only = False
+-        receipt_arg = None
+-        parse_error = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg in ("--target", "--targets", "--target-file", "--target-files") and i + 1 < len(sys.argv):
+-                targets.extend(value.strip() for value in sys.argv[i + 1].split(",") if value.strip())
+-            elif arg == "--goal" and i + 1 < len(sys.argv):
+-                goal = sys.argv[i + 1]
+-            elif arg == "--depth" and i + 1 < len(sys.argv):
+-                depth = sys.argv[i + 1]
+-            elif arg in ("--frame-only", "--frame_only"):
+-                frame_only = True
+-            elif arg in ("--budget-tokens", "--budget_tokens", "--budget") and i + 1 < len(sys.argv):
+-                try:
+-                    budget_tokens = int(sys.argv[i + 1])
+-                except ValueError:
+-                    parse_error = _kernel_error(
+-                        "invalid_context_budget",
+-                        "--budget-tokens must be an integer.",
+-                        budget_tokens=sys.argv[i + 1],
+-                    )
+-            elif arg in ("--max-hops", "--max_hops") and i + 1 < len(sys.argv):
+-                try:
+-                    max_hops = int(sys.argv[i + 1])
+-                except ValueError:
+-                    parse_error = _kernel_error(
+-                        "invalid_context_hops",
+-                        "--max-hops must be an integer.",
+-                        max_hops=sys.argv[i + 1],
+-                    )
+-            elif arg == "--detail" and i + 1 < len(sys.argv):
+-                detail = sys.argv[i + 1]
+-            elif arg == "--max-findings" and i + 1 < len(sys.argv):
+-                try:
+-                    max_findings = int(sys.argv[i + 1])
+-                except ValueError:
+-                    parse_error = _kernel_error(
+-                        "invalid_work_finding_limit",
+-                        "--max-findings must be an integer.",
+-                        max_findings=sys.argv[i + 1],
+-                    )
+-            elif arg == "--truth-scope" and i + 1 < len(sys.argv):
+-                truth_scope = sys.argv[i + 1]
+-            elif arg == "--ui-selector" and i + 1 < len(sys.argv):
+-                ui_selector = sys.argv[i + 1]
+-            elif arg == "--no-proactive-truth":
+-                proactive_truth = False
+-            elif arg == "--full-engine":
+-                full_engine = True
+-            elif arg == "--full-engine-edges":
+-                full_engine_edges = True
+-            elif arg == "--receipt" and i + 1 < len(sys.argv):
+-                receipt_arg = sys.argv[i + 1]
+-        if receipt_arg is not None:
+-            _emit_cli_result(_kernel_error(
+-                "receipt_not_accepted",
+-                "plw work is an entry stage and takes no receipt; it issues the first receipt.",
+-            ))
+-        if parse_error:
+-            _emit_cli_result(parse_error)
+-        work_result = kernel_work(
+-            scan_root=root,
+-            task=task,
+-            target_files=targets or None,
+-            goal=goal,
+-            depth=depth,
+-            budget_tokens=budget_tokens,
+-            max_hops=max_hops,
+-            detail=detail,
+-            max_findings=max_findings,
+-            proactive_truth=proactive_truth,
+-            truth_scope=truth_scope,
+-            ui_selector=ui_selector,
+-            full_engine=full_engine,
+-            full_engine_edges=full_engine_edges,
+-            frame_only=frame_only,
+-        )
+-        _emit_cli_result(_attach_task_receipt(work_result, "work", task, root))
++def _cli_analyze(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    analyzers_raw = _cli_flag_value(argv, "--analyzers")
++    analyzers = analyzers_raw.split(",") if analyzers_raw is not None else None
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    if output_mode not in ("full", "summary", "findings", "graph"):
++        _emit_cli_result(_kernel_error(
++            "invalid_output_mode",
++            f"Invalid output mode: {output_mode}",
++            output_mode=output_mode,
++            supported_output_modes=["full", "summary", "findings", "graph"],
++        ))
++    _emit_cli_result(kernel_analyze(root, analyzers, output_mode))
+ 
+-    elif mode == "analyze":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+ 
+-        # Parse flags
+-        analyzers = None
+-        output_mode = "full"
++def _cli_analyzers(_argv: List[str]) -> None:
++    if REGISTRY_AVAILABLE:
++        _emit_cli_result({"available_analyzers": get_available_analyzers()})
++    else:
++        _emit_cli_result(_kernel_error("registry_unavailable", "registry not available"))
+ 
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--analyzers" and i + 1 < len(sys.argv):
+-                analyzers = sys.argv[i + 1].split(",")
+-            elif arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+ 
+-        if output_mode not in ("full", "summary", "findings", "graph"):
+-            _emit_cli_result(_kernel_error(
+-                "invalid_output_mode",
+-                f"Invalid output mode: {output_mode}",
+-                output_mode=output_mode,
+-                supported_output_modes=["full", "summary", "findings", "graph"],
+-            ))
++def _cli_cache(argv: List[str]) -> None:
++    if len(argv) < 3 or argv[2].startswith("--"):
++        _emit_cli_result(_kernel_error(
++            "missing_cache_action",
++            "Usage: hott_kernel.py cache status|refresh|clear [root]",
++            supported_actions=["status", "refresh", "clear"],
++        ))
++    action = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    _emit_cli_result(kernel_cache(action, root))
+ 
+-        result = kernel_analyze(root, analyzers, output_mode)
+-        _emit_cli_result(result)
+ 
+-    elif mode == "analyzers":
+-        if REGISTRY_AVAILABLE:
+-            _emit_cli_result({
+-                "available_analyzers": get_available_analyzers(),
+-            })
+-        else:
+-            _emit_cli_result(_kernel_error(
+-                "registry_unavailable",
+-                "registry not available",
+-            ))
++def _cli_impact(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result(_kernel_error(
++            "missing_argument",
++            "Usage: hott_kernel.py impact <file> [root]",
++        ))
++    target = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    _emit_cli_result(kernel_impact(root, target, output_mode))
+ 
+-    elif mode == "cache":
+-        if len(sys.argv) < 3 or sys.argv[2].startswith("--"):
+-            _emit_cli_result(_kernel_error(
+-                "missing_cache_action",
+-                "Usage: hott_kernel.py cache status|refresh|clear [root]",
+-                supported_actions=["status", "refresh", "clear"],
+-            ))
+-        action = sys.argv[2]
+-        root = (
+-            sys.argv[3]
+-            if len(sys.argv) > 3 and not sys.argv[3].startswith("--")
+-            else "."
+-        )
+-        root = _root_flag_from_argv(root)
+-        _emit_cli_result(kernel_cache(action, root))
+ 
+-    elif mode == "impact":
+-        if len(sys.argv) < 3:
+-            _emit_cli_result(_kernel_error(
+-                "missing_argument",
+-                "Usage: hott_kernel.py impact <file> [root]",
+-            ))
+-        target = sys.argv[2]
+-        root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_impact(root, target, output_mode)
+-        _emit_cli_result(result)
++def _cli_outline(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result(_kernel_error(
++            "missing_argument",
++            "Usage: hott_kernel.py outline <file> [root]",
++        ))
++    target = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    _emit_cli_result(kernel_outline(root, target))
+ 
+-    elif mode == "outline":
+-        if len(sys.argv) < 3:
+-            _emit_cli_result(_kernel_error(
+-                "missing_argument",
+-                "Usage: hott_kernel.py outline <file> [root]",
+-            ))
+-        target = sys.argv[2]
+-        root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        result = kernel_outline(root, target)
+-        _emit_cli_result(result)
+ 
+-    elif mode == "brief":
+-        if len(sys.argv) < 3:
+-            _emit_cli_result(_kernel_error(
+-                "missing_argument",
+-                "Usage: hott_kernel.py brief <file> [root]",
+-            ))
+-        target = sys.argv[2]
+-        root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_brief(root, target, output_mode)
+-        _emit_cli_result(result)
+-
+-    elif mode == "cycle_break":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        target_file = None
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg in ("--target", "--target-file", "--file") and i + 1 < len(sys.argv):
+-                target_file = sys.argv[i + 1]
+-            elif arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_cycle_break(root, target_file, output_mode)
+-        _emit_cli_result(result)
++def _cli_brief(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result(_kernel_error(
++            "missing_argument",
++            "Usage: hott_kernel.py brief <file> [root]",
++        ))
++    target = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    _emit_cli_result(kernel_brief(root, target, output_mode))
+ 
+-    elif mode == "context":
+-        if len(sys.argv) < 3 or sys.argv[2].startswith("--"):
+-            _emit_cli_result(_kernel_error(
+-                "missing_argument",
+-                "Usage: hott_kernel.py context <query> [root] [--target file[,file]] [--budget-tokens N] [--max-hops N] [--detail outline|source] [--truth-scope ID] [--no-proactive-truth] [--output prompt|summary|full]",
+-            ))
+-        query = sys.argv[2]
+-        root = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        target_files: List[str] = []
+-        budget_tokens = DEFAULT_BUDGET_TOKENS
+-        max_hops = DEFAULT_MAX_HOPS
+-        detail = "source"
+-        output_mode = "prompt"
+-        proactive_truth = True
+-        truth_scope = None
+-        parse_error = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg in ("--target", "--targets", "--target-file", "--target-files") and i + 1 < len(sys.argv):
+-                target_files.extend(
+-                    value.strip()
+-                    for value in sys.argv[i + 1].split(",")
+-                    if value.strip()
+-                )
+-            elif arg in ("--budget-tokens", "--budget_tokens") and i + 1 < len(sys.argv):
+-                try:
+-                    budget_tokens = int(sys.argv[i + 1])
+-                except ValueError:
+-                    parse_error = _kernel_error(
+-                        "invalid_context_budget",
+-                        "--budget-tokens must be an integer.",
+-                        budget_tokens=sys.argv[i + 1],
+-                    )
+-            elif arg in ("--max-hops", "--max_hops") and i + 1 < len(sys.argv):
+-                try:
+-                    max_hops = int(sys.argv[i + 1])
+-                except ValueError:
+-                    parse_error = _kernel_error(
+-                        "invalid_context_hops",
+-                        "--max-hops must be an integer.",
+-                        max_hops=sys.argv[i + 1],
+-                    )
+-            elif arg == "--detail" and i + 1 < len(sys.argv):
+-                detail = sys.argv[i + 1]
+-            elif arg == "--no-proactive-truth":
+-                proactive_truth = False
+-            elif arg == "--truth-scope" and i + 1 < len(sys.argv):
+-                truth_scope = sys.argv[i + 1]
+-            elif arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        if parse_error:
+-            _emit_cli_result(parse_error)
+-        result = kernel_context(
+-            root,
+-            query,
+-            target_files=target_files,
+-            budget_tokens=budget_tokens,
+-            max_hops=max_hops,
+-            detail=detail,
+-            output_mode=output_mode,
+-            proactive_truth=proactive_truth,
+-            truth_scope=truth_scope,
+-        )
+-        _emit_cli_result(result)
+ 
+-    elif mode == "establish":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        baseline_path = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--baseline" and i + 1 < len(sys.argv):
+-                baseline_path = sys.argv[i + 1]
+-        result = kernel_establish(root, baseline_path)
+-        _emit_cli_result(result)
+-
+-    elif mode == "synthesize":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_synthesize(root, output_mode)
+-        _emit_cli_result(result)
+-
+-    elif mode == "steer":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "full"
+-        baseline_path = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-            elif arg == "--baseline" and i + 1 < len(sys.argv):
+-                baseline_path = sys.argv[i + 1]
+-        result = kernel_steer(root, baseline_path, output_mode)
+-        _emit_cli_result(result)
+-
+-    elif mode == "memory_store":
+-        if len(sys.argv) < 4:
+-            _emit_cli_result({"error": "Usage: hott_kernel.py memory_store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]"})
+-            return
+-        m_type = sys.argv[2]
+-        m_content = sys.argv[3]
+-        m_source = "manual"
+-        m_importance = 0.5
+-        m_tags = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--source" and i + 1 < len(sys.argv):
+-                m_source = sys.argv[i + 1]
+-            elif arg == "--importance" and i + 1 < len(sys.argv):
+-                try:
+-                    m_importance = float(sys.argv[i + 1])
+-                except ValueError:
+-                    pass
+-            elif arg == "--tags" and i + 1 < len(sys.argv):
+-                m_tags = sys.argv[i + 1]
+-        result = kernel_memory_store(m_type, m_content, m_source, m_importance, m_tags)
+-        _emit_cli_result(result)
+-
+-    elif mode == "memory_recall":
+-        m_query = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+-        m_type = None
+-        m_tags = None
+-        m_limit = 20
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--type" and i + 1 < len(sys.argv):
+-                m_type = sys.argv[i + 1]
+-            elif arg == "--tags" and i + 1 < len(sys.argv):
+-                m_tags = sys.argv[i + 1]
+-            elif arg == "--limit" and i + 1 < len(sys.argv):
+-                try:
+-                    m_limit = int(sys.argv[i + 1])
+-                except ValueError:
+-                    pass
+-        result = kernel_memory_recall(m_query, m_type, m_tags, m_limit)
+-        _emit_cli_result(result)
++def _cli_cycle_break(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    target_file = _cli_flag_value(argv, "--target", "--target-file", "--file")
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    _emit_cli_result(kernel_cycle_break(root, target_file, output_mode))
+ 
+-    elif mode == "memory_analyze":
+-        m_analyzers = None
+-        m_output = "full"
+-        m_include_historical = "--include-historical" in sys.argv
+-        m_include_provenance = "--include-provenance" in sys.argv
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--analyzers" and i + 1 < len(sys.argv):
+-                m_analyzers = sys.argv[i + 1].split(",")
+-            elif arg == "--output" and i + 1 < len(sys.argv):
+-                m_output = sys.argv[i + 1]
+-        result = kernel_memory_analyze(
+-            m_analyzers,
+-            m_output,
+-            include_historical=m_include_historical,
+-            include_provenance=m_include_provenance,
+-        )
+-        _emit_cli_result(result)
+-
+-    elif mode == "memory_stats":
+-        result = kernel_memory_stats()
+-        _emit_cli_result(result)
+-
+-    elif mode in ("memory_associate", "associate"):
+-        if len(sys.argv) < 5:
+-            _emit_cli_result({"error": "Usage: hott_kernel.py memory_associate <from_id> <to_id> <type> [--strength 0.7]"})
+-            return
+-        from_id = sys.argv[2]
+-        to_id = sys.argv[3]
+-        assoc_type = sys.argv[4]
+-        strength = 0.5
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--strength" and i + 1 < len(sys.argv):
+-                try:
+-                    strength = float(sys.argv[i + 1])
+-                except ValueError:
+-                    pass
+-        result = kernel_memory_associate(from_id, to_id, assoc_type, strength)
+-        _emit_cli_result(result)
+ 
+-    elif mode in ("memory_consolidate", "consolidate"):
+-        if len(sys.argv) < 3:
+-            _emit_cli_result({"error": "Usage: hott_kernel.py memory_consolidate <id1,id2,...> --content '...'"})
+-            return
+-        source_ids = sys.argv[2].split(",")
+-        content = ""
+-        tags = None
+-        importance = 0.9
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--content" and i + 1 < len(sys.argv):
+-                content = sys.argv[i + 1]
+-            elif arg == "--tags" and i + 1 < len(sys.argv):
+-                tags = sys.argv[i + 1]
+-            elif arg == "--importance" and i + 1 < len(sys.argv):
+-                try:
+-                    importance = float(sys.argv[i + 1])
+-                except ValueError:
+-                    pass
++def _cli_context(argv: List[str]) -> None:
++    if len(argv) < 3 or argv[2].startswith("--"):
++        _emit_cli_result(_kernel_error(
++            "missing_argument",
++            "Usage: hott_kernel.py context <query> [root] [--target file[,file]] [--budget-tokens N] [--max-hops N] [--detail outline|source] [--truth-scope ID] [--no-proactive-truth] [--output prompt|summary|full]",
++        ))
++    query = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    target_files: List[str] = []
++    budget_tokens = DEFAULT_BUDGET_TOKENS
++    max_hops = DEFAULT_MAX_HOPS
++    detail = "source"
++    output_mode = "prompt"
++    proactive_truth = True
++    truth_scope = None
++    parse_error = None
++    for i, arg in enumerate(argv):
++        if arg in ("--target", "--targets", "--target-file", "--target-files") and i + 1 < len(argv):
++            target_files.extend(
++                value.strip()
++                for value in argv[i + 1].split(",")
++                if value.strip()
++            )
++        elif arg in ("--budget-tokens", "--budget_tokens") and i + 1 < len(argv):
++            try:
++                budget_tokens = int(argv[i + 1])
++            except ValueError:
++                parse_error = _kernel_error(
++                    "invalid_context_budget",
++                    "--budget-tokens must be an integer.",
++                    budget_tokens=argv[i + 1],
++                )
++        elif arg in ("--max-hops", "--max_hops") and i + 1 < len(argv):
++            try:
++                max_hops = int(argv[i + 1])
++            except ValueError:
++                parse_error = _kernel_error(
++                    "invalid_context_hops",
++                    "--max-hops must be an integer.",
++                    max_hops=argv[i + 1],
++                )
++        elif arg == "--detail" and i + 1 < len(argv):
++            detail = argv[i + 1]
++        elif arg == "--no-proactive-truth":
++            proactive_truth = False
++        elif arg == "--truth-scope" and i + 1 < len(argv):
++            truth_scope = argv[i + 1]
++        elif arg == "--output" and i + 1 < len(argv):
++            output_mode = argv[i + 1]
++    if parse_error:
++        _emit_cli_result(parse_error)
++    _emit_cli_result(kernel_context(
++        root,
++        query,
++        target_files=target_files,
++        budget_tokens=budget_tokens,
++        max_hops=max_hops,
++        detail=detail,
++        output_mode=output_mode,
++        proactive_truth=proactive_truth,
++        truth_scope=truth_scope,
++    ))
++
++
++def _cli_establish(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    baseline_path = _cli_flag_value(argv, "--baseline")
++    _emit_cli_result(kernel_establish(root, baseline_path))
++
++
++def _cli_synthesize(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    _emit_cli_result(kernel_synthesize(root, output_mode))
++
++
++def _cli_steer(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    output_mode = _cli_flag_value(argv, "--output", default="full")
++    baseline_path = _cli_flag_value(argv, "--baseline")
++    _emit_cli_result(kernel_steer(root, baseline_path, output_mode))
++
++
++def _cli_memory_operation(op: str, argv: List[str], arg_offset: int) -> bool:
++    """Shared CLI parser for both legacy `memory_<op>` and `memory <op>` commands."""
++    usage_prefix = "hott_kernel.py memory_" if arg_offset == 2 else "memory "
++
++    if op == "store":
++        if len(argv) < arg_offset + 2:
++            _emit_cli_result({"error": f"Usage: {usage_prefix}store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]"})
++            return True
++        _emit_cli_result(kernel_memory_store(
++            argv[arg_offset],
++            argv[arg_offset + 1],
++            _cli_flag_value(argv, "--source", default="manual"),
++            _cli_float_flag(argv, "--importance", 0.5),
++            _cli_flag_value(argv, "--tags"),
++        ))
++        return True
++    if op == "recall":
++        query = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++        _emit_cli_result(kernel_memory_recall(
++            query,
++            _cli_flag_value(argv, "--type"),
++            _cli_flag_value(argv, "--tags"),
++            _cli_int_flag(argv, "--limit", 20),
++        ))
++        return True
++    if op == "analyze":
++        analyzers_raw = _cli_flag_value(argv, "--analyzers")
++        _emit_cli_result(kernel_memory_analyze(
++            analyzers_raw.split(",") if analyzers_raw is not None else None,
++            _cli_flag_value(argv, "--output", default="full"),
++            include_historical="--include-historical" in argv,
++            include_provenance="--include-provenance" in argv,
++        ))
++        return True
++    if op == "stats":
++        _emit_cli_result(kernel_memory_stats())
++        return True
++    if op == "associate":
++        if len(argv) < arg_offset + 3:
++            _emit_cli_result({"error": f"Usage: {usage_prefix}associate <from_id> <to_id> <type> [--strength 0.7]"})
++            return True
++        _emit_cli_result(kernel_memory_associate(
++            argv[arg_offset],
++            argv[arg_offset + 1],
++            argv[arg_offset + 2],
++            _cli_float_flag(argv, "--strength", 0.5),
++        ))
++        return True
++    if op == "consolidate":
++        min_len = 3 if arg_offset == 2 else 5
++        if len(argv) < min_len:
++            _emit_cli_result({"error": f"Usage: {usage_prefix}consolidate <id1,id2,...> --content '...'"})
++            return True
++        content = _cli_flag_value(argv, "--content", default="")
+         if not content:
+             _emit_cli_result({"error": "--content is required"})
+-            return
+-        result = kernel_memory_consolidate(source_ids, content, tags, importance)
+-        _emit_cli_result(result)
+-
+-    elif mode in ("memory_steer",):
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_memory_steer(output_mode)
+-        _emit_cli_result(result)
+-
+-    elif mode in ("memory_establish",):
+-        result = kernel_memory_establish()
+-        _emit_cli_result(result)
+-
+-    elif mode in ("memory_drift",):
+-        result = kernel_memory_drift()
+-        _emit_cli_result(result)
+-
+-    elif mode == "memory":
+-        if len(sys.argv) < 3:
+-            _emit_cli_result({"error": "Usage: hott_kernel.py memory <submode> ..."})
+-            return
+-        submode = sys.argv[2]
+-        if submode == "store":
+-            if len(sys.argv) < 5:
+-                _emit_cli_result({"error": "Usage: memory store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]"})
+-                return
+-            m_type = sys.argv[3]
+-            m_content = sys.argv[4]
+-            m_source = "manual"
+-            m_importance = 0.5
+-            m_tags = None
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--source" and i + 1 < len(sys.argv):
+-                    m_source = sys.argv[i + 1]
+-                elif arg == "--importance" and i + 1 < len(sys.argv):
+-                    try:
+-                        m_importance = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                elif arg == "--tags" and i + 1 < len(sys.argv):
+-                    m_tags = sys.argv[i + 1]
+-            result = kernel_memory_store(m_type, m_content, m_source, m_importance, m_tags)
+-            _emit_cli_result(result)
+-        elif submode == "get":
+-            if len(sys.argv) < 4:
+-                _emit_cli_result({"error": "Usage: memory get <memory_id>"})
+-                return
+-            result = kernel_memory_get(sys.argv[3])
+-            _emit_cli_result(result)
+-        elif submode == "recall":
+-            m_query = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else None
+-            m_type = None
+-            m_tags = None
+-            m_limit = 20
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--type" and i + 1 < len(sys.argv):
+-                    m_type = sys.argv[i + 1]
+-                elif arg == "--tags" and i + 1 < len(sys.argv):
+-                    m_tags = sys.argv[i + 1]
+-                elif arg == "--limit" and i + 1 < len(sys.argv):
+-                    try:
+-                        m_limit = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            result = kernel_memory_recall(m_query, m_type, m_tags, m_limit)
+-            _emit_cli_result(result)
+-        elif submode == "analyze":
+-            m_analyzers = None
+-            m_output = "full"
+-            m_include_historical = "--include-historical" in sys.argv
+-            m_include_provenance = "--include-provenance" in sys.argv
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--analyzers" and i + 1 < len(sys.argv):
+-                    m_analyzers = sys.argv[i + 1].split(",")
+-                elif arg == "--output" and i + 1 < len(sys.argv):
+-                    m_output = sys.argv[i + 1]
+-            result = kernel_memory_analyze(
+-                m_analyzers,
+-                m_output,
+-                include_historical=m_include_historical,
+-                include_provenance=m_include_provenance,
+-            )
+-            _emit_cli_result(result)
+-        elif submode == "stats":
+-            result = kernel_memory_stats()
+-            _emit_cli_result(result)
+-        elif submode == "associate":
+-            if len(sys.argv) < 6:
+-                _emit_cli_result({"error": "Usage: memory associate <from_id> <to_id> <type> [--strength 0.7]"})
+-                return
+-            from_id = sys.argv[3]
+-            to_id = sys.argv[4]
+-            assoc_type = sys.argv[5]
+-            strength = 0.5
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--strength" and i + 1 < len(sys.argv):
+-                    try:
+-                        strength = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            result = kernel_memory_associate(from_id, to_id, assoc_type, strength)
+-            _emit_cli_result(result)
+-        elif submode == "consolidate":
+-            if len(sys.argv) < 5:
+-                _emit_cli_result({"error": "Usage: memory consolidate <id1,id2,...> --content '...'"})
+-                return
+-            source_ids = sys.argv[3].split(",")
+-            content = ""
+-            tags = None
+-            importance = 0.9
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--content" and i + 1 < len(sys.argv):
+-                    content = sys.argv[i + 1]
+-                elif arg == "--tags" and i + 1 < len(sys.argv):
+-                    tags = sys.argv[i + 1]
+-                elif arg == "--importance" and i + 1 < len(sys.argv):
+-                    try:
+-                        importance = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            if not content:
+-                _emit_cli_result({"error": "--content is required"})
+-                return
+-            result = kernel_memory_consolidate(source_ids, content, tags, importance)
+-            _emit_cli_result(result)
+-        elif submode == "steer":
+-            output_mode = "full"
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--output" and i + 1 < len(sys.argv):
+-                    output_mode = sys.argv[i + 1]
+-            result = kernel_memory_steer(output_mode)
+-            _emit_cli_result(result)
+-        elif submode == "establish":
+-            result = kernel_memory_establish()
+-            _emit_cli_result(result)
+-        elif submode == "drift":
+-            result = kernel_memory_drift()
+-            _emit_cli_result(result)
+-        elif submode == "betti_breakdown":
+-            result = kernel_memory_betti_breakdown()
+-            _emit_cli_result(result)
+-        elif submode == "consolidate_by_tag":
+-            if len(sys.argv) < 4:
+-                _emit_cli_result({"error": "Usage: memory consolidate_by_tag <tag> [--content '...'] [--importance 0.9]"})
+-                return
+-            m_tag = sys.argv[3]
+-            m_content = None
+-            m_importance = 0.9
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--content" and i + 1 < len(sys.argv):
+-                    m_content = sys.argv[i + 1]
+-                elif arg == "--importance" and i + 1 < len(sys.argv):
+-                    try:
+-                        m_importance = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            result = kernel_memory_consolidate_by_tag(m_tag, m_content, m_importance)
+-            _emit_cli_result(result)
+-        elif submode == "consolidate_auto":
+-            min_size = 3
+-            m_importance = 0.9
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--min-size" and i + 1 < len(sys.argv):
+-                    try:
+-                        min_size = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                elif arg == "--importance" and i + 1 < len(sys.argv):
+-                    try:
+-                        m_importance = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            result = kernel_memory_consolidate_auto(min_size, m_importance)
+-            _emit_cli_result(result)
+-        elif submode == "unconsolidated_tags":
+-            result = kernel_memory_unconsolidated_tags()
+-            _emit_cli_result(result)
+-        elif submode == "compact":
+-            # Parse flags
+-            only_consolidated = True
+-            memory_type = "episodic"
+-            dry_run = False
+-            restore_all = False
+-            restore_id = None
+-            stats = False
+-
+-            i = 3
+-            while i < len(sys.argv):
+-                arg = sys.argv[i]
+-                if arg == "--consolidated":
+-                    only_consolidated = True
+-                elif arg == "--all":
+-                    only_consolidated = False
+-                elif arg == "--type" and i + 1 < len(sys.argv):
+-                    memory_type = sys.argv[i + 1]
+-                    i += 1
+-                elif arg == "--dry-run":
+-                    dry_run = True
+-                elif arg == "--restore-all":
+-                    restore_all = True
+-                elif arg == "--restore" and i + 1 < len(sys.argv):
+-                    restore_id = sys.argv[i + 1]
+-                    i += 1
+-                elif arg == "--stats":
+-                    stats = True
++            return True
++        _emit_cli_result(kernel_memory_consolidate(
++            argv[arg_offset].split(","),
++            content,
++            _cli_flag_value(argv, "--tags"),
++            _cli_float_flag(argv, "--importance", 0.9),
++        ))
++        return True
++    if op == "steer":
++        _emit_cli_result(kernel_memory_steer(_cli_flag_value(argv, "--output", default="full")))
++        return True
++    if op == "establish":
++        _emit_cli_result(kernel_memory_establish())
++        return True
++    if op == "drift":
++        _emit_cli_result(kernel_memory_drift())
++        return True
++    if op == "get":
++        if len(argv) < 4:
++            _emit_cli_result({"error": "Usage: memory get <memory_id>"})
++            return True
++        _emit_cli_result(kernel_memory_get(argv[3]))
++        return True
++    if op == "betti_breakdown":
++        _emit_cli_result(kernel_memory_betti_breakdown())
++        return True
++    if op == "consolidate_by_tag":
++        if len(argv) < 4:
++            _emit_cli_result({"error": "Usage: memory consolidate_by_tag <tag> [--content '...'] [--importance 0.9]"})
++            return True
++        _emit_cli_result(kernel_memory_consolidate_by_tag(
++            argv[3],
++            _cli_flag_value(argv, "--content"),
++            _cli_float_flag(argv, "--importance", 0.9),
++        ))
++        return True
++    if op == "consolidate_auto":
++        _emit_cli_result(kernel_memory_consolidate_auto(
++            _cli_int_flag(argv, "--min-size", 3),
++            _cli_float_flag(argv, "--importance", 0.9),
++        ))
++        return True
++    if op == "unconsolidated_tags":
++        _emit_cli_result(kernel_memory_unconsolidated_tags())
++        return True
++    if op == "compact":
++        only_consolidated = True
++        memory_type = "episodic"
++        dry_run = False
++        restore_all = False
++        restore_id = None
++        stats = False
++        i = 3
++        while i < len(argv):
++            arg = argv[i]
++            if arg == "--consolidated":
++                only_consolidated = True
++            elif arg == "--all":
++                only_consolidated = False
++            elif arg == "--type" and i + 1 < len(argv):
++                memory_type = argv[i + 1]
++                i += 1
++            elif arg == "--dry-run":
++                dry_run = True
++            elif arg == "--restore-all":
++                restore_all = True
++            elif arg == "--restore" and i + 1 < len(argv):
++                restore_id = argv[i + 1]
+                 i += 1
++            elif arg == "--stats":
++                stats = True
++            i += 1
++        _emit_cli_result(kernel_memory_compact(
++            only_consolidated=only_consolidated,
++            memory_type=memory_type,
++            dry_run=dry_run,
++            restore_id=restore_id,
++            restore_all=restore_all,
++            stats=stats,
++        ))
++        return True
++    if op == "bridge":
++        if len(argv) < 5:
++            _emit_cli_result({"error": "Usage: memory bridge <from_id> <to_id> [type] [--strength 0.7]"})
++            return True
++        assoc_type = argv[5] if len(argv) > 5 and not argv[5].startswith("--") else "semantic"
++        _emit_cli_result(kernel_memory_bridge(
++            argv[3],
++            argv[4],
++            assoc_type,
++            _cli_float_flag(argv, "--strength", 0.7),
++            "--unsafe" not in argv,
++        ))
++        return True
++    if op == "bridge_auto":
++        _emit_cli_result(kernel_memory_bridge_auto(
++            _cli_int_flag(argv, "--min-shared-tags", 1),
++            _cli_flag_value(argv, "--type", default="semantic"),
++            "--unsafe" not in argv,
++            "--dry-run" in argv,
++        ))
++        return True
++    if op == "bridge_candidates":
++        _emit_cli_result(kernel_memory_bridge_candidates(
++            _cli_int_flag(argv, "--min-shared-tags", 1)
++        ))
++        return True
++    if op == "kan":
++        if len(argv) < 4:
++            _emit_cli_result({"error": "Usage: memory kan <query> [--mode lan|ran|both] [--max-depth 2]"})
++            return True
++        kan_mode = _cli_flag_value(argv, "--mode", default="both")
++        if kan_mode not in ("lan", "ran", "both"):
++            _emit_cli_result({"error": f"Invalid mode: {kan_mode}. Use lan, ran, or both."})
++            return True
++        _emit_cli_result(kernel_memory_kan(
++            argv[3],
++            kan_mode,
++            _cli_int_flag(argv, "--max-depth", 2),
++        ))
++        return True
++    return False
+ 
+-            result = kernel_memory_compact(
+-                only_consolidated=only_consolidated,
+-                memory_type=memory_type,
+-                dry_run=dry_run,
+-                restore_id=restore_id,
+-                restore_all=restore_all,
+-                stats=stats,
+-            )
+-            _emit_cli_result(result)
+-        elif submode == "bridge":
+-            # memory bridge <from_id> <to_id> [type] [--strength 0.7] [--unsafe]
+-            if len(sys.argv) < 5:
+-                _emit_cli_result({"error": "Usage: memory bridge <from_id> <to_id> [type] [--strength 0.7]"})
+-                return
+-            from_id = sys.argv[3]
+-            to_id = sys.argv[4]
+-            assoc_type = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].startswith("--") else "semantic"
+-            strength = 0.7
+-            safe_mode = True
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--strength" and i + 1 < len(sys.argv):
+-                    try:
+-                        strength = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                elif arg == "--unsafe":
+-                    safe_mode = False
+-            result = kernel_memory_bridge(from_id, to_id, assoc_type, strength, safe_mode)
+-            _emit_cli_result(result)
+-
+-        elif submode == "bridge_auto":
+-            # memory bridge_auto [--min-shared-tags 1] [--type semantic] [--dry-run] [--unsafe]
+-            min_shared_tags = 1
+-            assoc_type = "semantic"
+-            dry_run = False
+-            safe_mode = True
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--min-shared-tags" and i + 1 < len(sys.argv):
+-                    try:
+-                        min_shared_tags = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                elif arg == "--type" and i + 1 < len(sys.argv):
+-                    assoc_type = sys.argv[i + 1]
+-                elif arg == "--dry-run":
+-                    dry_run = True
+-                elif arg == "--unsafe":
+-                    safe_mode = False
+-            result = kernel_memory_bridge_auto(min_shared_tags, assoc_type, safe_mode, dry_run)
+-            _emit_cli_result(result)
+-
+-        elif submode == "bridge_candidates":
+-            # memory bridge_candidates [--min-shared-tags 1]
+-            min_shared_tags = 1
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--min-shared-tags" and i + 1 < len(sys.argv):
+-                    try:
+-                        min_shared_tags = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            result = kernel_memory_bridge_candidates(min_shared_tags)
+-            _emit_cli_result(result)
+-        elif submode == "kan":
+-            # memory kan <query> [--mode lan|ran|both] [--max-depth 2]
+-            if len(sys.argv) < 4:
+-                _emit_cli_result({"error": "Usage: memory kan <query> [--mode lan|ran|both] [--max-depth 2]"})
+-                return
+-            query = sys.argv[3]
+-            kan_mode = "both"
+-            max_depth = 2
+-            for i, arg in enumerate(sys.argv):
+-                if arg == "--mode" and i + 1 < len(sys.argv):
+-                    kan_mode = sys.argv[i + 1]
+-                elif arg == "--max-depth" and i + 1 < len(sys.argv):
+-                    try:
+-                        max_depth = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-            if kan_mode not in ("lan", "ran", "both"):
+-                _emit_cli_result({"error": f"Invalid mode: {kan_mode}. Use lan, ran, or both."})
+-                return
+-            result = kernel_memory_kan(query, kan_mode, max_depth)
+-            _emit_cli_result(result)
+-        else:
+-            _emit_cli_result({"error": f"Unknown memory submode: {submode}"})
+ 
+-    elif mode == "xanalyze":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "summary"
+-        auto_store = True
+-        analyzers = None
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-            elif arg == "--no-store":
+-                auto_store = False
+-            elif arg == "--analyzers" and i + 1 < len(sys.argv):
+-                analyzers = sys.argv[i + 1].split(",")
+-        result = kernel_xanalyze(root, analyzers, output_mode, auto_store)
+-        _emit_cli_result(result)
+-
+-    elif mode == "xsteer":
+-        root = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "."
+-        root = _root_flag_from_argv(root)
+-        output_mode = "full"
+-        for i, arg in enumerate(sys.argv):
+-            if arg == "--output" and i + 1 < len(sys.argv):
+-                output_mode = sys.argv[i + 1]
+-        result = kernel_xsteer(root, output_mode)
+-        _emit_cli_result(result)
+-
+-    elif mode == "xcontext":
+-        if len(sys.argv) < 3:
+-            _emit_cli_result({"error": "Usage: hott_kernel.py xcontext <file_path>"})
+-            return
+-        file_path = sys.argv[2]
+-        result = kernel_xcontext(file_path)
+-        _emit_cli_result(result)
++def _cli_memory(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result({"error": "Usage: hott_kernel.py memory <submode> ..."})
++        return
++    submode = argv[2]
++    if not _cli_memory_operation(submode, argv, arg_offset=3):
++        _emit_cli_result({"error": f"Unknown memory submode: {submode}"})
++
++
++def _cli_xanalyze(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    analyzers_raw = _cli_flag_value(argv, "--analyzers")
++    _emit_cli_result(kernel_xanalyze(
++        root,
++        analyzers_raw.split(",") if analyzers_raw is not None else None,
++        _cli_flag_value(argv, "--output", default="summary"),
++        "--no-store" not in argv,
++    ))
++
++
++def _cli_xsteer(argv: List[str]) -> None:
++    root = _cli_positional_root(argv, idx=2)
++    _emit_cli_result(kernel_xsteer(root, _cli_flag_value(argv, "--output", default="full")))
++
++
++def _cli_xcontext(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result({"error": "Usage: hott_kernel.py xcontext <file_path>"})
++        return
++    _emit_cli_result(kernel_xcontext(argv[2]))
++
+ 
+-    elif mode == "fiber":
+-        if len(sys.argv) < 3:
++def _cli_fiber(argv: List[str]) -> None:
++    if len(argv) < 3:
++        _emit_cli_result({
++            "error": "Usage: hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]"
++        })
++        return
++    subcommand = argv[2]
++    if subcommand == "transport":
++        if len(argv) < 6:
+             _emit_cli_result({
+-                "error": "Usage: hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]"
++                "error": "Usage: fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]"
+             })
+             return
+-        subcommand = sys.argv[2]
+-        
+-        if subcommand == "transport":
+-            # fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]
+-            if len(sys.argv) < 6:
+-                _emit_cli_result({
+-                    "error": "Usage: fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]"
+-                })
+-                return
+-            source_id = sys.argv[3]
+-            new_task = sys.argv[4]
+-            new_focus = sys.argv[5]
+-            threshold = 0.6
+-            max_transport = 10
+-            dry_run = False
+-            i = 6
+-            while i < len(sys.argv):
+-                if sys.argv[i] == "--threshold" and i + 1 < len(sys.argv):
+-                    try:
+-                        threshold = float(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                    i += 2
+-                elif sys.argv[i] == "--max" and i + 1 < len(sys.argv):
+-                    try:
+-                        max_transport = int(sys.argv[i + 1])
+-                    except ValueError:
+-                        pass
+-                    i += 2
+-                elif sys.argv[i] == "--dry-run":
+-                    dry_run = True
+-                    i += 1
+-                else:
+-                    i += 1
+-            result = kernel_fiber_transport(source_id, new_task, new_focus, threshold, max_transport, dry_run)
+-            _emit_cli_result(result)
+-        
+-        elif subcommand == "list_archives":
+-            result = kernel_fiber_list_archives()
+-            _emit_cli_result(result)
+-        
+-        else:
+-            args = sys.argv[3:]
+-            result = kernel_fiber(subcommand, args)
+-            _emit_cli_result(result)
+-
++        _emit_cli_result(kernel_fiber_transport(
++            argv[3],
++            argv[4],
++            argv[5],
++            _cli_float_flag(argv, "--threshold", 0.6),
++            _cli_int_flag(argv, "--max", 10),
++            "--dry-run" in argv,
++        ))
++    elif subcommand == "list_archives":
++        _emit_cli_result(kernel_fiber_list_archives())
+     else:
++        _emit_cli_result(kernel_fiber(subcommand, argv[3:]))
++
++
++def _memory_alias_handler(submode: str) -> Callable[[List[str]], None]:
++    def _handler(argv: List[str]) -> None:
++        _cli_memory_operation(submode, argv, arg_offset=2)
++    return _handler
++
++
++def _rewire_memory_submode_handler(submode: str) -> Callable[[List[str]], None]:
++    def _handler(argv: List[str]) -> None:
++        _cli_memory_operation(submode, [argv[0], "memory", submode, *argv[2:]], arg_offset=3)
++    return _handler
++
++
++_KERNEL_CLI_DISPATCH: Dict[str, Callable[[List[str]], None]] = {
++    "work": _cli_work,
++    "analyze": _cli_analyze,
++    "analyzers": _cli_analyzers,
++    "cache": _cli_cache,
++    "impact": _cli_impact,
++    "outline": _cli_outline,
++    "brief": _cli_brief,
++    "cycle_break": _cli_cycle_break,
++    "context": _cli_context,
++    "establish": _cli_establish,
++    "synthesize": _cli_synthesize,
++    "steer": _cli_steer,
++    "memory_store": _memory_alias_handler("store"),
++    "memory_recall": _memory_alias_handler("recall"),
++    "memory_analyze": _memory_alias_handler("analyze"),
++    "memory_stats": _memory_alias_handler("stats"),
++    "memory_associate": _memory_alias_handler("associate"),
++    "memory_consolidate": _memory_alias_handler("consolidate"),
++    "memory_steer": _memory_alias_handler("steer"),
++    "memory_establish": _memory_alias_handler("establish"),
++    "memory_drift": _memory_alias_handler("drift"),
++    "memory_compact": _rewire_memory_submode_handler("compact"),
++    "memory_bridge": _rewire_memory_submode_handler("bridge"),
++    "memory_bridge_auto": _rewire_memory_submode_handler("bridge_auto"),
++    "memory_bridge_candidates": _rewire_memory_submode_handler("bridge_candidates"),
++    "memory_kan": _rewire_memory_submode_handler("kan"),
++    "memory": _cli_memory,
++    "fiber": _cli_fiber,
++    "xanalyze": _cli_xanalyze,
++    "xsteer": _cli_xsteer,
++    "xcontext": _cli_xcontext,
++}
++
++
++def main() -> None:
++    if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
++        print(json.dumps(_KERNEL_MAIN_HELP, indent=2))
++        return
++
++    _configure_cli_memory_runtime(sys.argv)
++    _configure_cli_cache_mode(sys.argv)
++
++    mode = sys.argv[1]
++    valid_modes = set(PUBLIC_KERNEL_MODES)
++    if mode not in valid_modes:
+         _emit_cli_result(_kernel_error(
+             "unknown_mode",
+-            f"Unknown mode: {mode}",
+-            mode=mode,
++            f"Unknown mode: '{mode}'.",
++            valid_modes=sorted(valid_modes),
++            suggested_fix=(
++                "Use work for an ordinary agent task, or choose an explicit mode: analyze, context, synthesize, "
++                "steer, impact, outline, brief, cache, memory_recall, memory_store, xanalyze, xsteer, xcontext."
++            ),
+         ))
++        return
++
++    if ("--help" in sys.argv[2:] or "-h" in sys.argv[2:]) and mode in _MODE_HELP_USAGE:
++        print(json.dumps({
++            "tool": "hott_kernel",
++            "schema_version": "4.0.0-kernel",
++            "mode": mode,
++            "usage": _MODE_HELP_USAGE[mode],
++        }, indent=2))
++        return
++
++    handler = _KERNEL_CLI_DISPATCH.get(mode)
++    if handler is not None:
++        handler(sys.argv)
++        return
++
++    _emit_cli_result(_kernel_error(
++        "unknown_mode",
++        f"Unknown mode: {mode}",
++        mode=mode,
++    ))
+ 
+ 
+ 
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -414,7 +414,7 @@
+     return prefix + suffix if suffix else prefix
+ 
+ 
+-def _is_python_type_checking_guard(test: ast.AST) -> bool:
++def is_python_type_checking_guard(test: ast.AST) -> bool:
+     if isinstance(test, ast.Name):
+         return test.id == "TYPE_CHECKING"
+     if isinstance(test, ast.Attribute):
+@@ -422,6 +422,9 @@
+     return False
+ 
+ 
++_is_python_type_checking_guard = is_python_type_checking_guard
++
++
+ def parse_python_imports(content: str) -> List[Dict[str, Any]]:
+     """Parse Python imports using the stdlib AST without executing the file."""
+     try:
+@@ -433,7 +436,7 @@
+ 
+     def _visit(node: ast.AST, in_type_checking: bool) -> None:
+         if isinstance(node, ast.If):
+-            guarded = in_type_checking or _is_python_type_checking_guard(node.test)
++            guarded = in_type_checking or is_python_type_checking_guard(node.test)
+             for child in node.body:
+                 _visit(child, guarded)
+             for child in node.orelse:
+@@ -1442,6 +1445,7 @@
+     "has_cli_shebang",
+     "is_declaration_file",
+     "is_generated_or_vendored_asset",
++    "is_python_type_checking_guard",
+     "is_tool_config_file",
+     "is_tool_implementation_path",
+     "source_path_allowed",
