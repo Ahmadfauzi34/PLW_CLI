@@ -383,8 +383,14 @@ grep -Fq '"--compact", "--no-engine"' plw_cli.py
 apply_reviewable_overlay "calibration_ux_v5"
 grep -Fq 'len(label_words) > 4' codebase/static_ui_reference.py
 grep -Fq 'strategy = "barrel_reexport"' codebase/cycle_break.py
+grep -Fq 'is_index_barrel' codebase/cycle_break.py
 grep -Fq 'compacted["witness_edge_count"]' hott_kernel.py
 grep -Fq 'target_norm: Optional[str] = None' hott_kernel.py
+grep -Fq 'def _normalize_target_root_pair(' hott_kernel.py
+grep -Fq '"target_resolution": target_res_frame' hott_kernel.py
+grep -Fq 'root_relative_exact' codebase/topology_analyzers.py
+grep -Fq 'scan_root: Optional[str] = None,' core/context_optimizer.py
+grep -Fq 'detail=detail,' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
