@@ -1,0 +1,105 @@
+--- a/codebase/static_ui_reference.py
++++ b/codebase/static_ui_reference.py
+@@ -22,10 +22,25 @@
+ INTERACTIVE_TAGS = {"a", "button", "input", "label", "select", "textarea"}
+ VISIBLE_ATTRIBUTES = {"href", "routerlink", "[routerlink]", "type", "name",
+                       "formcontrolname", "aria-label", "placeholder", "id", "class"}
+-QUERY_STOPWORDS = {"the", "for", "and", "with", "from", "where", "which", "what",
+-                   "find", "locate", "check", "assess", "ui", "page", "link",
+-                   "button", "component", "mobile", "responsive", "overlap", "layout",
+-                   "navigation", "element", "tautan", "tombol", "yang", "dan"}
++QUERY_STOPWORDS = {
++    "the", "for", "and", "with", "from", "where", "which", "what",
++    "this", "that", "these", "those", "between", "into", "onto", "about",
++    "above", "below", "under", "over", "after", "before", "through", "during",
++    "without", "within", "across", "against", "among", "around", "behind",
++    "beside", "beyond", "near", "since", "until", "upon", "via", "are", "was",
++    "were", "been", "being", "have", "has", "had", "does", "did", "will",
++    "would", "should", "could", "can", "may", "might", "must", "shall", "not",
++    "but", "all", "any", "each", "every", "some", "such", "only", "own",
++    "same", "than", "too", "very", "just", "also", "now", "here", "there",
++    "when", "why", "how", "who", "whom", "whose", "its", "our", "your",
++    "their", "his", "her",
++    "find", "locate", "check", "assess", "audit", "refactor", "fix", "break",
++    "debug", "test", "tests", "repo", "repository", "codebase", "project",
++    "file", "files", "module", "modules", "cycle", "cycles", "architecture",
++    "angular", "ui", "page", "link", "button", "component", "mobile",
++    "responsive", "overlap", "layout", "navigation", "element",
++    "tautan", "tombol", "yang", "dan",
++}
+ 
+ 
+ def _sha(data: bytes) -> str:
+--- a/codebase/cycle_break.py
++++ b/codebase/cycle_break.py
+@@ -31,7 +31,7 @@
+ }
+ 
+ IMPORT_REGEX = re.compile(
+-    r"""(?:import\s+(?P<type_kw>type\s+)?(?:(?P<clause>[^"';\n]+?)\s+from\s+)?|export\s+(?P<export_type>type\s+)?(?:(?P<export_clause>[^"';\n]+?)\s+from\s+)?|import\s*\(\s*)["'](?P<path>[^"']+)["']""",
++    r"""(?:import\s+(?P<type_kw>type\s+)?(?:(?P<clause>[^"';]+?)\s+from\s+)?|export\s+(?P<export_type>type\s+)?(?:(?P<export_clause>[^"';]+?)\s+from\s+)?|import\s*\(\s*)["'](?P<path>[^"']+)["']""",
+     re.MULTILINE,
+ )
+ 
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2343,6 +2343,11 @@
+                 continue
+             item = dict(finding)
+             item.setdefault("analyzer", name)
++            raw_basis = item.get("cycle_basis")
++            if isinstance(raw_basis, list) and len(raw_basis) > 5:
++                item["cycle_basis"] = raw_basis[:5]
++                item["cycle_basis_omitted_count"] = len(raw_basis) - 5
++                item["cycle_basis_truncated"] = True
+             items.append(item)
+         if items:
+             items.sort(key=_order)
+@@ -4854,6 +4859,13 @@
+         ))
+     target = argv[2]
+     root = _cli_positional_root(argv, idx=3)
++    if (
++        len(argv) >= 4
++        and not argv[3].startswith("--")
++        and os.path.isdir(target)
++        and not os.path.isdir(argv[3])
++    ):
++        root, target = target, argv[3]
+     output_mode = _cli_flag_value(argv, "--output", default="full")
+     _emit_cli_result(kernel_impact(root, target, output_mode))
+ 
+@@ -5265,7 +5277,7 @@
+     _configure_cli_memory_runtime(sys.argv)
+     _configure_cli_cache_mode(sys.argv)
+ 
+-    mode = sys.argv[1]
++    mode = {"cycle-break": "cycle_break"}.get(sys.argv[1], sys.argv[1])
+     valid_modes = set(PUBLIC_KERNEL_MODES)
+     if mode not in valid_modes:
+         _emit_cli_result(_kernel_error(
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4153,10 +4153,12 @@
+ 
+ 
+ def _load_receipt_arg(value):
+-    """Parse a --receipt value (JSON string or @path). Raises ValueError."""
++    """Parse a --receipt value (JSON string, @path, or file path). Raises ValueError."""
+     raw = value
+     if value.startswith("@"):
+         raw = Path(value[1:]).read_text(encoding="utf-8")
++    elif not value.lstrip().startswith("{") and Path(value).is_file():
++        raw = Path(value).read_text(encoding="utf-8")
+     data = json.loads(raw)
+     if not isinstance(data, dict):
+         raise ValueError("--receipt must be a JSON object")
+@@ -5173,6 +5175,8 @@
+       -> First-contact target-codebase map: file→import→file graph, hubs, entrypoints/tests, SCCs, unresolved/external imports
+   plw mermaid [root] [--depth 1|2|3|4] [--focus PATH] [--direction LR|TD] [--max-nodes N] [--include-tests] [--out FILE] [--json]
+       -> Multi-depth Mermaid architecture & dependency graph (L1 subsystems, L2 modules, L3 hubs/cycles, L4 file symbols+blast radius) with progressive zoom hints
++  plw cycle-break [root] [--target FILE] [--json]
++      -> Prescriptive cycle-break advisories and Feedback Arc Set cut plan for circular dependencies
+   plw resolve-target <task> [root] [--target file] [--top N] [--neighbors N] [--json]
+       -> Grounds task to graph nodes; ambiguity/unresolved blocks specialized routing
+   plw evidence-needs <task> [root] [--target file] [--json]
