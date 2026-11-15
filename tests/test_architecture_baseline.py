@@ -432,6 +432,178 @@ class ArchitectureBaselineTests(unittest.TestCase):
         cb = hott_kernel.kernel_cycle_break(str(self.proj), target_file="src/app/utils.py")
         self.assertEqual(cb["target"], "src/app/utils.py")
 
+    def test_calibration_ux_v5_ui_stopwords_barrel_reexport_and_check_basis(self) -> None:
+        from codebase.static_ui_reference import QUERY_STOPWORDS, _score
+        from codebase.cycle_break import (
+            _extract_imported_symbols,
+            _inspect_edge_import,
+            evaluate_edge_cut,
+        )
+
+        # 1. Non-UI refactoring tasks must not false-match via 2-char words like "to"
+        for sw in ("to", "of", "remove", "extract", "dependency"):
+            self.assertIn(sw, QUERY_STOPWORDS)
+        score, matched, _ = _score(
+            "Refactor patcher.ts to remove HomotopyTelemetryRegistry cycle",
+            "p",
+            "Simulate critical thread anomalies to protect the host",
+            {},
+        )
+        self.assertEqual(score, 0)
+        self.assertEqual(matched, [])
+
+        # Short label distinction (e.g. "Sign in" vs "Sign up") remains intact
+        s_in, m_in, _ = _score("Sign in", "button", "Sign in", {})
+        s_up, _, _ = _score("Sign in", "button", "Sign up", {})
+        self.assertGreater(s_in, s_up)
+        self.assertIn("in", m_in)
+
+        # 2. Wildcard barrel re-export (`export * from './x'`) uses barrel_reexport
+        self.assertEqual(_extract_imported_symbols("*"), [])
+        barrel_path = str((self.proj / "src" / "app" / "index.ts").resolve())
+        leaf_path = str((self.proj / "src" / "app" / "leaf.ts").resolve())
+        consumer_path = str((self.proj / "src" / "app" / "consumer.ts").resolve())
+        fmap = {
+            barrel_path: "export * from './leaf';\n",
+            leaf_path: "export const LeafVal = 1;\n",
+            consumer_path: "import { LeafVal } from './leaf';\n",
+        }
+        info = _inspect_edge_import(barrel_path, leaf_path, fmap, {})
+        self.assertTrue(info["has_import"])
+        self.assertTrue(info["is_reexport"])
+        self.assertTrue(info["is_wildcard_reexport"])
+        self.assertEqual(info["symbols"], [])
+
+        fake_graph = {
+            "file_map": fmap,
+            "node_metadata": {
+                barrel_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+                leaf_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+                consumer_path: {"type": "Other", "fan_in": 1, "fan_out": 1},
+            },
+            "type_shapes": {},
+            "edge_natures": {},
+        }
+        barrel_cut = evaluate_edge_cut(barrel_path, leaf_path, fake_graph, cycle_overlap_count=1)
+        concrete_cut = evaluate_edge_cut(consumer_path, leaf_path, fake_graph, cycle_overlap_count=1)
+        self.assertEqual(barrel_cut["strategy"], "barrel_reexport")
+        self.assertEqual(barrel_cut["symbols_involved"], [])
+        self.assertTrue(barrel_cut["is_wildcard_reexport"])
+        self.assertGreater(barrel_cut["cut_cost"], concrete_cut["cut_cost"])
+
+        # 3. _top_check_findings strips bulky witness_edges & vertices from cycle_basis
+        findings, _ = hott_kernel._top_check_findings(
+            {
+                "results": {
+                    "hott.manifold": {
+                        "findings": [
+                            {
+                                "type": "independent_cycles",
+                                "severity": "medium",
+                                "cycle_basis": [
+                                    {
+                                        "basis_index": 1,
+                                        "closed_path": ["a.ts", "b.ts", "a.ts"],
+                                        "closing_edge": ["b.ts", "a.ts"],
+                                        "vertices": ["a.ts", "b.ts"],
+                                        "witness_edges": [{"edge": ["a.ts", "b.ts"]}],
+                                        "length": 2,
+                                        "orientation": "directed",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+        basis0 = findings[0]["cycle_basis"][0]
+        self.assertNotIn("witness_edges", basis0)
+        self.assertNotIn("vertices", basis0)
+        self.assertEqual(basis0["witness_edge_count"], 1)
+        self.assertEqual(basis0["closed_path"], ["a.ts", "b.ts", "a.ts"])
+
+        # 4. kernel_cycle_break preserves hidden dot-directory prefix on target
+        cb_hidden = hott_kernel.kernel_cycle_break(str(self.proj), target_file="./.hidden/ci.ts")
+        self.assertEqual(cb_hidden["target"], ".hidden/ci.ts")
+
+    def test_calibration_ux_v5_root_relative_target_and_cli_ergonomics(self) -> None:
+        from core.context_optimizer import _resolve_target
+        from codebase.topology_analyzers import _resolve_query_target
+        from codebase.cycle_break import _inspect_edge_import
+        import plw_cli
+
+        # 1. Exact root-relative target beats nested suffix duplicates
+        root_str = str(self.proj.resolve()).replace("\\", "/")
+        direct = f"{root_str}/src/app/dup.ts"
+        nested = f"{root_str}/sub/src/app/dup.ts"
+        vertices = {direct, nested}
+        res_ctx, amb_ctx = _resolve_target("src/app/dup.ts", vertices, scan_root=root_str)
+        self.assertEqual(res_ctx, direct)
+        self.assertEqual(amb_ctx, [])
+
+        res_q, amb_q, res_kind = _resolve_query_target("src/app/dup.ts", vertices, scan_root=root_str)
+        self.assertEqual(res_q, direct)
+        self.assertEqual(amb_q, [])
+        self.assertEqual(res_kind, "root_relative_exact")
+
+        # 2. frame_only=True stays compact (<15KB) even when kernel_work blocks on context error
+        blocked = hott_kernel.kernel_work(
+            str(self.proj),
+            "Inspect missing target",
+            target_files=["nonexistent/missing.ts"],
+            frame_only=True,
+        )
+        self.assertTrue(blocked["frame_only"])
+        self.assertEqual(blocked["work_status"], "blocked")
+        self.assertEqual(blocked["error_code"], "context_target_not_found")
+        self.assertNotIn("target_orientation", blocked)
+        self.assertLess(len(json.dumps(blocked)), 15 * 1024)
+
+        # 3. Directory barrel import ('./diagnostics' -> 'diagnostics/index.ts') matches and extracts symbols
+        caller = str((self.proj / "src" / "app" / "caller.ts").resolve())
+        idx_target = str((self.proj / "src" / "app" / "diagnostics" / "index.ts").resolve())
+        info = _inspect_edge_import(
+            caller,
+            idx_target,
+            {
+                caller: "import { resolveProfile } from './diagnostics';\n",
+                idx_target: "export * from './profiles';\n",
+            },
+            {},
+        )
+        self.assertTrue(info["has_import"])
+        self.assertEqual(info["symbols"], ["resolveProfile"])
+
+        # 4. Root-first normalization for brief/outline & --output/--detail on plw context
+        def _run_kernel(*args: str):
+            buf = io.StringIO()
+            exit_code = 0
+            with mock.patch.object(sys, "argv", ["hott_kernel.py", *args]), redirect_stdout(buf):
+                try:
+                    hott_kernel.main()
+                except SystemExit as exc:
+                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            return exit_code, json.loads(buf.getvalue())
+
+        b_code, b_payload = _run_kernel("brief", str(self.proj), "src/app/utils.py")
+        self.assertEqual(b_code, 0)
+        self.assertTrue(b_payload["exists"])
+
+        o_code, o_payload = _run_kernel("outline", str(self.proj), "src/app/utils.py")
+        self.assertEqual(o_code, 0)
+        self.assertTrue(o_payload["exists"])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctx_rc = plw_cli.cmd_context(
+                [str(self.proj), "Audit utils", "--detail", "outline", "--output", "summary", "--json"]
+            )
+        self.assertIn(ctx_rc, (0, 3))
+        ctx_payload = json.loads(buf.getvalue())
+        self.assertEqual(ctx_payload["output_mode"], "summary")
+        self.assertEqual(ctx_payload["query"], "Audit utils")
+
 
 if __name__ == "__main__":
     unittest.main()
