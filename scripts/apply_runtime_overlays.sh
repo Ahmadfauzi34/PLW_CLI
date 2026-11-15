@@ -358,6 +358,12 @@ grep -Fq 'PYTHON_SOURCE_EXTENSIONS' language_semantics.py
 grep -Fq '"python"' core/portable_agent.py
 grep -Fq '_inspect_python_edge_import' codebase/cycle_break.py
 grep -Fq 'imports-v2-python' core/graph_cache.py
+apply_reviewable_overlay "solid_architecture_v1"
+grep -Fq 'def _find_directed_cycles_from_graph(' codebase/cycle_break.py
+grep -Fq 'def generate_mermaid_diagram(' codebase/mermaid_graph.py
+grep -Fq 'def project_execution_backed_proof_obligations(' fullstack/execution_backed_proof_coverage.py
+grep -Fq 'OMITTED_IN_FRAME_ONLY' hott_kernel.py
+grep -Fq '_is_python_type_checking_guard' language_semantics.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
