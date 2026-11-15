@@ -1,0 +1,193 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -1991,6 +1991,7 @@
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
+     cache_mode: Optional[str] = None,
++    include_engine: bool = True,
+ ) -> Dict[str, Any]:
+     """Bounded first-contact topology orientation for an unfamiliar target repo."""
+     if not SHARED_GRAPH_AVAILABLE or not TARGET_TOPOLOGY_AVAILABLE:
+@@ -2009,11 +2010,15 @@
+         if cache_err:
+             return cache_err
+     graph = _build_kernel_graph(scan_root)
+-    engine_layer = _build_topology_engine_layer(
+-        scan_root,
+-        graph,
+-        full_engine=full_engine,
+-        full_engine_edges=full_engine_edges,
++    engine_layer = (
++        _build_topology_engine_layer(
++            scan_root,
++            graph,
++            full_engine=full_engine,
++            full_engine_edges=full_engine_edges,
++        )
++        if include_engine
++        else None
+     )
+     try:
+         orientation = build_target_topology_orientation(
+@@ -2531,16 +2536,20 @@
+             "recommended_cuts": recommended_cuts,
+         }
+ 
++    target_norm_out = os.path.normpath(target_file).replace("\\", "/").lstrip("./") if target_file else None
+     if output_mode == "summary":
+-        return {
++        out: Dict[str, Any] = {
+             "schema_version": CODEBASE_SCHEMA_VERSION,
+             "mode": "cycle_break",
+             "scan_root": scan_root,
+             "graph_cache": graph.get("cache", {}),
+             "summary": plan,
+         }
++        if target_norm_out is not None:
++            out["target"] = target_norm_out
++        return out
+ 
+-    return {
++    out = {
+         "schema_version": CODEBASE_SCHEMA_VERSION,
+         "mode": "cycle_break",
+         "scan_root": scan_root,
+@@ -2548,6 +2557,9 @@
+         "summary": plan,
+         "advisories": advisories,
+     }
++    if target_norm_out is not None:
++        out["target"] = target_norm_out
++    return out
+ 
+ 
+ def _memory_context_metadata(memory_context: Dict[str, Any]) -> Dict[str, Any]:
+@@ -4409,6 +4421,7 @@
+     ui_selector: Optional[str] = None,
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
++    frame_only: bool = False,
+ ) -> Dict[str, Any]:
+     """Execute the full task pipeline in-process with shared graph reuse and HMAC receipt chaining."""
+     root_error = _validate_scan_root(scan_root)
+@@ -4432,6 +4445,7 @@
+         ui_selector=ui_selector,
+         full_engine=full_engine,
+         full_engine_edges=full_engine_edges,
++        frame_only=frame_only,
+     )
+     if orient_raw.get("error"):
+         return orient_raw
+@@ -4538,6 +4552,61 @@
+         except Exception as exc:
+             cand_summary = {"error": f"candidate_provenance_failed:{type(exc).__name__}:{exc}"}
+ 
++    if frame_only:
++        tr = resolve_res.get("target_resolution") or {}
++        compact_tr = {
++            "status": tr.get("status"),
++            "reason": tr.get("reason"),
++            "targets": tr.get("targets"),
++            "explicit_targets": tr.get("explicit_targets"),
++        }
++        ev = evidence_res.get("evidence_need_derivation") or {}
++        compact_ev = {
++            "task_intent": ev.get("task_intent"),
++            "required_evidence": ev.get("required_evidence"),
++            "missing_evidence": ev.get("missing_evidence"),
++        }
++        cs = cap_res.get("capability_selection") or {}
++        compact_cs = {
++            "selected": cs.get("selected"),
++            "recommended_capabilities": cs.get("recommended_capabilities"),
++            "status": cs.get("status"),
++        }
++        return {
++            "schema_version": "plw-task-chain-v1",
++            "mode": "chain",
++            "frame_only": True,
++            "task": task,
++            "normalized_task": _normalize_receipt_task(task),
++            "scan_root": os.path.abspath(scan_root),
++            "graph_signature": graph_sig,
++            "stages_executed": stages_executed,
++            "orient": {
++                "portable_agent_state": orient_res.get("portable_agent_state"),
++                "portable_agent_reason": orient_res.get("portable_agent_reason"),
++                "agent_decision_frame": orient_res.get("agent_decision_frame"),
++                "readiness": orient_res.get("readiness"),
++            },
++            "target_resolution": compact_tr,
++            "evidence_need_derivation": compact_ev,
++            "capability_selection": compact_cs,
++            "receipt": final_receipt,
++            "next": final_next,
++            "detail_contract": {
++                "frame_only": True,
++                "omitted": ["receipt_chain", "orient.dynamic_context", "orient.skill_handoff", "orient.ui_source_handoff", "candidate_provenance"],
++                "full_output_hint": "omit --frame-only to retrieve full chain payload",
++            },
++            "authority": {
++                "read_only": True,
++                "single_process_receipt_chained": True,
++                "hmac_provenance_sealed": True,
++                "execute_runtime": False,
++                "mutate_source": False,
++                "commit_truth": False,
++            },
++        }
++
+     return {
+         "schema_version": "plw-task-chain-v1",
+         "mode": "chain",
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -4020,6 +4020,7 @@
+     parser.add_argument("--full-edges", action="store_true")
+     parser.add_argument("--full-engine", action="store_true")
+     parser.add_argument("--full-engine-edges", action="store_true")
++    parser.add_argument("--compact", "--no-engine", action="store_true", dest="no_engine")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+@@ -4030,6 +4031,7 @@
+         full_engine=opts.full_engine,
+         full_engine_edges=opts.full_engine_edges,
+         cache_mode=opts.cache_mode,
++        include_engine=not opts.no_engine,
+     )
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+@@ -4823,6 +4825,7 @@
+     parser.add_argument("--ui-selector", default=None)
+     parser.add_argument("--goal", default="auto")
+     parser.add_argument("--depth", default="auto")
++    parser.add_argument("--frame-only", action="store_true", dest="frame_only")
+     parser.add_argument("--full-engine", action="store_true")
+     parser.add_argument("--full-engine-edges", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+@@ -4848,6 +4851,7 @@
+         ui_selector=opts.ui_selector,
+         full_engine=opts.full_engine,
+         full_engine_edges=opts.full_engine_edges,
++        frame_only=opts.frame_only,
+     )
+     return _print_chain_result(result, as_json=opts.as_json)
+ 
+@@ -4892,6 +4896,7 @@
+             ui_selector=opts.ui_selector,
+             full_engine=opts.full_engine,
+             full_engine_edges=opts.full_engine_edges,
++            frame_only=opts.frame_only,
+         )
+         return _print_chain_result(result, as_json=opts.as_json)
+     result = hott_kernel.kernel_work(
+@@ -5171,7 +5176,7 @@
+   plw skill list [--json]
+   plw skill show <command-or-skill-path> [--json]
+       -> Lists or reads exact version-aligned embedded skill contracts
+-  plw topology [root] [--top N] [--cache-mode auto|refresh|off] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
++  plw topology [root] [--top N] [--cache-mode auto|refresh|off] [--compact|--no-engine] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
+       -> First-contact target-codebase map: file→import→file graph, hubs, entrypoints/tests, SCCs, unresolved/external imports
+   plw mermaid [root] [--depth 1|2|3|4] [--focus PATH] [--direction LR|TD] [--max-nodes N] [--include-tests] [--out FILE] [--json]
+       -> Multi-depth Mermaid architecture & dependency graph (L1 subsystems, L2 modules, L3 hubs/cycles, L4 file symbols+blast radius) with progressive zoom hints
