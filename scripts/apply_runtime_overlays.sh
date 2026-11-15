@@ -376,6 +376,10 @@ grep -Fq '"between"' codebase/static_ui_reference.py
 grep -Fq 'cycle_basis_omitted_count' hott_kernel.py
 grep -Fq '{"cycle-break": "cycle_break"}' hott_kernel.py
 grep -Fq 'Path(value).is_file()' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v4"
+grep -Fq 'include_engine: bool = True' hott_kernel.py
+grep -Fq 'out["target"] = target_norm_out' hott_kernel.py
+grep -Fq '"--compact", "--no-engine"' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

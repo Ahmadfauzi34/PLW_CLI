@@ -413,6 +413,25 @@ class ArchitectureBaselineTests(unittest.TestCase):
         loaded = plw_cli._load_receipt_arg(str(rcpt_file))
         self.assertEqual(loaded["schema_version"], "plw-task-receipt-v1")
 
+    def test_calibration_ux_v4_compact_topology_chain_and_cycle_target(self) -> None:
+        topo_compact = hott_kernel.kernel_topology(str(self.proj), include_engine=False)
+        self.assertEqual(topo_compact["mode"], "topology")
+        self.assertNotIn("engine", topo_compact["target_orientation"])
+
+        chain_frame = hott_kernel.kernel_task_chain(
+            str(self.proj),
+            "Audit utils cycle",
+            target_files=["src/app/utils.py"],
+            frame_only=True,
+        )
+        self.assertTrue(chain_frame["frame_only"])
+        self.assertIn("receipt", chain_frame)
+        self.assertNotIn("receipt_chain", chain_frame)
+        self.assertLess(len(json.dumps(chain_frame)), 15 * 1024)
+
+        cb = hott_kernel.kernel_cycle_break(str(self.proj), target_file="src/app/utils.py")
+        self.assertEqual(cb["target"], "src/app/utils.py")
+
 
 if __name__ == "__main__":
     unittest.main()
