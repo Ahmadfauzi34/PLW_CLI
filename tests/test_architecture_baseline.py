@@ -756,5 +756,153 @@ class ArchitectureBaselineTests(unittest.TestCase):
         )
 
 
+    def test_calibration_ux_v7_chain_frame_ui_handoff_cli_and_analyzers(self) -> None:
+        import plw_cli
+        from codebase.static_ui_reference import _score
+        from codebase.performance_analyzers import (
+            analyze_async_waterfall,
+            analyze_cache,
+            analyze_deopt,
+            analyze_gc_pressure,
+        )
+        from codebase.topology_analyzers import analyze_test_reachability
+
+        # 1. kernel_task_chain(frame_only=True) populates non-null target_resolution, evidence_need_derivation, capability_selection
+        chain_frame = hott_kernel.kernel_task_chain(
+            str(self.proj),
+            "Investigate utils in src/app/utils.py",
+            target_files=["src/app/utils.py"],
+            frame_only=True,
+        )
+        self.assertTrue(chain_frame["frame_only"])
+        self.assertEqual(chain_frame["target_resolution"]["status"], "RESOLVED")
+        self.assertEqual(chain_frame["target_resolution"]["targets"], ["src/app/utils.py"])
+        self.assertEqual(
+            chain_frame["target_resolution"]["resolution"]["selected_targets"],
+            ["src/app/utils.py"],
+        )
+        self.assertIsNotNone(chain_frame["evidence_need_derivation"]["task_intent"])
+        self.assertTrue(len(chain_frame["evidence_need_derivation"]["required_evidence"]) >= 1)
+        self.assertIsNotNone(chain_frame["capability_selection"]["selected"])
+        self.assertTrue(len(chain_frame["capability_selection"]["recommended_capabilities"]) >= 1)
+
+        # 2. CLI ergonomics: plw chain <root> --task ..., plw resolve-target <root> --task ..., and plw ast index warm <root>
+        buf_chain = io.StringIO()
+        with redirect_stdout(buf_chain):
+            rc_chain = plw_cli.cmd_chain(
+                [str(self.proj), "--task", "Audit utils", "--target", "src/app/utils.py", "--frame-only", "--json"]
+            )
+        self.assertEqual(rc_chain, 0)
+        chain_cli_payload = json.loads(buf_chain.getvalue())
+        self.assertEqual(chain_cli_payload["target_resolution"]["status"], "RESOLVED")
+
+        buf_rt = io.StringIO()
+        with redirect_stdout(buf_rt):
+            rc_rt = plw_cli.cmd_resolve_target(
+                [str(self.proj), "--task", "Audit utils", "--target", "src/app/utils.py", "--json"]
+            )
+        self.assertEqual(rc_rt, 0)
+        rt_payload = json.loads(buf_rt.getvalue())
+        self.assertEqual(
+            rt_payload["target_resolution"]["resolution"]["selected_targets"],
+            ["src/app/utils.py"],
+        )
+
+        root_a, op_a, err_a = plw_cli._resolve_ast_positionals("index", "warm", str(self.proj), None)
+        self.assertIsNone(err_a)
+        self.assertEqual(root_a, self.proj.resolve())
+        self.assertEqual(op_a, "warm")
+
+        root_b, op_b, err_b = plw_cli._resolve_ast_positionals("index", str(self.proj), "status", None)
+        self.assertIsNone(err_b)
+        self.assertEqual(root_b, self.proj.resolve())
+        self.assertEqual(op_b, "status")
+
+        # 3. static_ui_reference _score ignores file paths, snake_case identifiers, and standalone 2-char prepositions on multi-word labels
+        backend_query = "Investigate perf.gc json_in_loop in src/app/agent/agent-executor.ts"
+        score_sign_in, _, _ = _score(backend_query, "a", "Sign in", {"routerlink": "/login"})
+        self.assertEqual(score_sign_in, 0)
+        score_json_btn, _, _ = _score(backend_query, "button", "Export JSON (.json)", {})
+        self.assertEqual(score_json_btn, 0)
+        score_real_ui, matched_ui, _ = _score("Sign in navigation link", "a", "Sign in", {"routerlink": "/login"})
+        self.assertGreater(score_real_ui, 0)
+        self.assertEqual(matched_ui, ["in", "sign"])
+
+        # 4. Analyzer precision hardening (multiline template literals, WeakMap, Service Worker, Promise.all, tool config reachability)
+        embedded_py_ts = (
+            "export const PY_CODE = `\n"
+            "def eval(x):\n"
+            "    return eval(x)\n"
+            "`;\n"
+            "delete realObj.prop;\n"
+        )
+        deopt_res = analyze_deopt(
+            {
+                "file_map": {
+                    "src/bridge.ts": embedded_py_ts,
+                    "src/bridge.spec.ts": "const x = eval(\"1+1\");\n",
+                }
+            }
+        )
+        self.assertEqual(len(deopt_res["findings"]), 1)
+        self.assertEqual(deopt_res["findings"][0]["type"], "delete_operator")
+        self.assertEqual(deopt_res["findings"][0]["line"], 5)
+
+        weak_cache_ts = (
+            "const receiptCache = new WeakMap<object, string>();\n"
+            "export function mark(k: object) { receiptCache.set(k, \"ok\"); }\n"
+        )
+        cache_res = analyze_cache({"file_map": {"src/weak.ts": weak_cache_ts}})
+        self.assertEqual(cache_res["findings"], [])
+
+        sw_and_template_gc = {
+            "file_map": {
+                "public/service-worker.js": "self.addEventListener(\"install\", () => {});\n",
+                "src/worker-entry.ts": "self.addEventListener(\"message\", () => {});\n",
+                "src/canvas.ts": "const html = `\n<script>window.addEventListener(\"message\", fn);</script>\n`;\n",
+            }
+        }
+        gc_res = analyze_gc_pressure(sw_and_template_gc)
+        self.assertEqual(gc_res["findings"], [])
+
+        batch_async_ts = (
+            "async function runBatches(batches: any[][]) {\n"
+            "  for (const b of batches) {\n"
+            "    await Promise.all(b.map(x => x()));\n"
+            "  }\n"
+            "}\n"
+        )
+        spec_sync_io = "import { readFileSync } from \"fs\";\nreadFileSync(\"a.txt\");\n"
+        async_res = analyze_async_waterfall(
+            {
+                "file_map": {
+                    "src/batch.ts": batch_async_ts,
+                    "src/my.spec.ts": spec_sync_io,
+                },
+                "node_metadata": {"src/my.spec.ts": {"is_test": True}},
+            }
+        )
+        high_async = [f for f in async_res["findings"] if f["severity"] == "high"]
+        self.assertEqual(high_async, [])
+
+        topo_reach = analyze_test_reachability(
+            {
+                "vertices": ["eslint.config.js", "src/service.ts", "src/service.spec.ts"],
+                "edges": [["src/service.spec.ts", "src/service.ts"]],
+                "node_metadata": {
+                    "eslint.config.js": {"is_entrypoint": True, "fan_in": 0, "is_test": False},
+                    "src/service.ts": {"is_entrypoint": False, "fan_in": 3, "is_test": False},
+                    "src/service.spec.ts": {"is_entrypoint": False, "fan_in": 0, "is_test": True},
+                },
+            }
+        )
+        high_inf_files = [
+            f["file"]
+            for f in topo_reach["findings"]
+            if f["type"] == "high_influence_without_test_path"
+        ]
+        self.assertNotIn("eslint.config.js", high_inf_files)
+
+
 if __name__ == "__main__":
     unittest.main()
