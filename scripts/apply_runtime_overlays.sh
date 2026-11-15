@@ -391,6 +391,11 @@ grep -Fq '"target_resolution": target_res_frame' hott_kernel.py
 grep -Fq 'root_relative_exact' codebase/topology_analyzers.py
 grep -Fq 'scan_root: Optional[str] = None,' core/context_optimizer.py
 grep -Fq 'detail=detail,' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v6"
+grep -Fq '"cycle_break": "python3 hott_kernel.py cycle-break' hott_kernel.py
+grep -Fq '_CHECK_COMPACT_FINDINGS_LIMIT = 10' hott_kernel.py
+grep -Fq 'basis_cap = 2 if compact else 5' hott_kernel.py
+grep -Fq 'action="store_true", dest="compact"' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

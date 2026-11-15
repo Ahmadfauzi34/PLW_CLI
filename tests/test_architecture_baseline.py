@@ -605,5 +605,156 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(ctx_payload["query"], "Audit utils")
 
 
+    def test_calibration_ux_v6_cycle_break_help_and_check_compact(self) -> None:
+        import plw_cli
+
+        # 1. cycle-break --help / -h returns usage without running kernel_cycle_break
+        with mock.patch.object(
+            hott_kernel,
+            "kernel_cycle_break",
+            side_effect=AssertionError("cycle-break --help must not execute analysis"),
+        ):
+            for argv in (
+                ["hott_kernel.py", "cycle-break", "--help"],
+                ["hott_kernel.py", "cycle-break", "-h"],
+                ["hott_kernel.py", "cycle_break", "--help"],
+            ):
+                buf = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), redirect_stdout(buf):
+                    hott_kernel.main()
+                payload = json.loads(buf.getvalue())
+                self.assertEqual(payload["mode"], "cycle_break")
+                self.assertIn("cycle-break", payload["usage"])
+
+            buf_cli = io.StringIO()
+            with mock.patch.object(sys, "argv", ["plw", "cycle-break", "--help"]), redirect_stdout(buf_cli):
+                plw_cli.main()
+            cli_help_payload = json.loads(buf_cli.getvalue())
+            self.assertEqual(cli_help_payload["mode"], "cycle_break")
+            self.assertIn("cycle-break", cli_help_payload["usage"])
+
+        buf_main = io.StringIO()
+        with mock.patch.object(sys, "argv", ["hott_kernel.py", "--help"]), redirect_stdout(buf_main):
+            hott_kernel.main()
+        main_help = json.loads(buf_main.getvalue())
+        self.assertIn("cycle_break", main_help["usage"])
+
+        # 2. _top_check_findings caps cycle_basis at 2 when compact=True vs 5 by default
+        synthetic_basis = [
+            {
+                "basis_index": idx + 1,
+                "closed_path": [f"n{idx}.ts", f"m{idx}.ts", f"n{idx}.ts"],
+                "closing_edge": [f"m{idx}.ts", f"n{idx}.ts"],
+                "vertices": [f"n{idx}.ts", f"m{idx}.ts"],
+                "witness_edges": [{"edge": [f"n{idx}.ts", f"m{idx}.ts"]}],
+                "length": 2,
+                "orientation": "directed",
+            }
+            for idx in range(6)
+        ]
+        many_findings = [
+            {
+                "type": "async_waterfall",
+                "severity": "high",
+                "file": f"src/f{i:02d}.ts",
+                "observation": f"Synthetic high finding #{i} for envelope compaction test.",
+            }
+            for i in range(39)
+        ]
+        fake_analyzer_output = {
+            "results": {
+                "hott.manifold": {
+                    "findings": [
+                        {
+                            "type": "independent_cycles",
+                            "severity": "medium",
+                            "cycle_basis": synthetic_basis,
+                        }
+                    ]
+                },
+                "perf.async": {"findings": many_findings},
+            },
+            "errors": {},
+            "analyzers_run": ["hott.manifold", "perf.async"],
+            "analyzers_failed": 0,
+            "cache": {
+                "mode": "auto",
+                "status": "hit",
+                "cache_path": "/tmp/fake_analyzer_cache.json",
+                "source_cache_key": "abc123",
+                "graph_content_signature": "sha256:deadbeef",
+                "engine_signature": "sha256:cafebabe",
+                "analyzers_requested": ["hott.manifold", "perf.async"],
+                "analyzers_reused": ["hott.manifold", "perf.async"],
+                "analyzers_executed": [],
+            },
+        }
+        compact_top, _ = hott_kernel._top_check_findings(fake_analyzer_output, limit=10, compact=True)
+        basis_item_compact = [f for f in compact_top if f["type"] == "independent_cycles"][0]
+        self.assertEqual(len(basis_item_compact["cycle_basis"]), 2)
+        self.assertEqual(basis_item_compact["cycle_basis_omitted_count"], 4)
+        self.assertTrue(basis_item_compact["cycle_basis_truncated"])
+
+        default_top, _ = hott_kernel._top_check_findings(fake_analyzer_output, limit=100, compact=False)
+        basis_item_default = [f for f in default_top if f["type"] == "independent_cycles"][0]
+        self.assertEqual(len(basis_item_default["cycle_basis"]), 5)
+        self.assertEqual(basis_item_default["cycle_basis_omitted_count"], 1)
+
+        # 3. plw check --compact --json caps payload <15KB while preserving cache_path & limit precedence
+        with mock.patch.object(hott_kernel, "_run_kernel_analyzers", return_value=fake_analyzer_output):
+            buf_compact = io.StringIO()
+            with redirect_stdout(buf_compact):
+                rc_compact = plw_cli.cmd_check([str(self.proj), "--compact", "--json"])
+            self.assertEqual(rc_compact, 0)
+            raw_compact = buf_compact.getvalue()
+            compact_payload = json.loads(raw_compact)
+            self.assertTrue(compact_payload["compact"])
+            self.assertEqual(len(compact_payload["findings"]), 10)
+            self.assertTrue(compact_payload["findings_truncated"])
+            self.assertNotIn("stat_trust_boundary", compact_payload["graph_cache"])
+            self.assertNotIn("analyzers_requested", compact_payload["analyzer_cache"])
+            self.assertEqual(compact_payload["analyzer_cache"]["cache_path"], "/tmp/fake_analyzer_cache.json")
+            self.assertTrue(compact_payload["detail_contract"]["compact"])
+            self.assertLess(len(raw_compact.encode("utf-8")), 15 * 1024)
+
+            buf_limit = io.StringIO()
+            with redirect_stdout(buf_limit):
+                rc_limit = plw_cli.cmd_check([str(self.proj), "--compact", "--limit", "15", "--json"])
+            self.assertEqual(rc_limit, 0)
+            limit_payload = json.loads(buf_limit.getvalue())
+            self.assertTrue(limit_payload["compact"])
+            self.assertEqual(len(limit_payload["findings"]), 15)
+
+            buf_all = io.StringIO()
+            with redirect_stdout(buf_all):
+                rc_all = plw_cli.cmd_check([str(self.proj), "--compact", "--all", "--json"])
+            self.assertEqual(rc_all, 0)
+            all_payload = json.loads(buf_all.getvalue())
+            self.assertTrue(all_payload["compact"])
+            self.assertEqual(len(all_payload["findings"]), 40)
+            self.assertFalse(all_payload["findings_truncated"])
+
+            buf_normal = io.StringIO()
+            with redirect_stdout(buf_normal):
+                rc_normal = plw_cli.cmd_check([str(self.proj), "--json"])
+            self.assertEqual(rc_normal, 0)
+            normal_payload = json.loads(buf_normal.getvalue())
+            self.assertNotIn("compact", normal_payload)
+            self.assertEqual(len(normal_payload["findings"]), 40)
+            self.assertIn("stat_trust_boundary", normal_payload["graph_cache"])
+            self.assertIn("analyzers_requested", normal_payload["analyzer_cache"])
+
+        # 4. plw --help advertises --compact on check
+        buf_cli_help = io.StringIO()
+        with mock.patch.object(sys, "argv", ["plw", "--help"]), redirect_stdout(buf_cli_help):
+            with self.assertRaises(SystemExit) as exit_ctx:
+                plw_cli.main()
+        self.assertEqual(exit_ctx.exception.code, 0)
+        self.assertIn(
+            "plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]",
+            buf_cli_help.getvalue(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
