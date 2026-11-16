@@ -75,7 +75,7 @@
 +        if os.path.isdir(opts.task) and not os.path.isdir(opts.root):
 +            opts.root, opts.task = opts.task, opts.root
      opts.root = opts.root_flag if opts.root_flag is not None else opts.root
-+    if not opts.task:
++    if opts.task is None:
 +        parser.error("the following arguments are required: task")
      stage = "candidate-select" if opts.operation == "select" else "candidate-capability-match"
      rc = _check_receipt_arg(

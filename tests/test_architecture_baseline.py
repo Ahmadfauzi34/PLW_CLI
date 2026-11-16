@@ -931,6 +931,12 @@ class ArchitectureBaselineTests(unittest.TestCase):
         cand_payload = json.loads(buf_cand.getvalue())
         self.assertIn("candidate_selection", cand_payload)
 
+        buf_empty_cand = io.StringIO()
+        with redirect_stdout(buf_empty_cand):
+            rc_empty_cand = plw_cli.cmd_candidate(["select", "", str(self.proj), "--json"])
+        self.assertEqual(rc_empty_cand, 0)
+        self.assertEqual(json.loads(buf_empty_cand.getvalue())["candidate_selection"]["resolution"], "UNRESOLVED")
+
         buf_led = io.StringIO()
         with redirect_stdout(buf_led):
             rc_led = plw_cli.cmd_ledger(["status", str(self.proj), "--json"])
