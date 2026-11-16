@@ -402,6 +402,11 @@ grep -Fq 'if operation == "index" and pos1 in ("status", "warm", "clean"):' plw_
 grep -Fq 'def _query_ui_words(query: str) -> List[str]:' codebase/static_ui_reference.py
 grep -Fq 'def _blank_multiline_template_literals(content: str) -> str:' codebase/performance_analyzers.py
 grep -Fq 'if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:' codebase/topology_analyzers.py
+apply_reviewable_overlay "calibration_ux_v8"
+grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
+grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
+grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py
+grep -Fq 'new\s+\w*LRU\w*' codebase/performance_analyzers.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
