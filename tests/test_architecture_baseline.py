@@ -1428,5 +1428,128 @@ class ArchitectureBaselineTests(unittest.TestCase):
         )
 
 
+    def test_calibration_ux_v13_check_human_output_and_identifier_target_resolution(self) -> None:
+        import plw_cli
+        from core.target_resolution import build_target_resolution
+        from core.shared_graph import build_shared_graph
+
+        # 1. Human `plw check` output renders unified_summary.total_files + observation/cycle (never `?` or empty `()`)
+        buf_human = io.StringIO()
+        sample_result = {
+            "unified_summary": {
+                "total_files": 42,
+                "total_findings": 2,
+                "analyzers_failed": 0,
+            },
+            "findings": [
+                {
+                    "analyzer": "hott.sheaf",
+                    "severity": "high",
+                    "type": "circular_boundary",
+                    "observation": "Circular dependency across 2 boundaries: src/a -> src/b -> src/a",
+                    "cycle": ["src/a", "src/b", "src/a"],
+                },
+                {
+                    "analyzer": "hott.sheaf",
+                    "severity": "high",
+                    "type": "boundary_violation",
+                    "observation": "Import bypasses barrel of 'src/b'.",
+                    "file": "src/a/caller.ts",
+                },
+            ],
+        }
+        with redirect_stdout(buf_human):
+            plw_cli._format_check_output(sample_result, as_json=False)
+        human_out = buf_human.getvalue()
+        self.assertIn("Total Files: 42 | Findings: 2", human_out)
+        self.assertIn("Circular dependency across 2 boundaries", human_out)
+        self.assertIn("Import bypasses barrel of 'src/b'. (src/a/caller.ts)", human_out)
+        self.assertNotIn("Total Files: ?", human_out)
+        self.assertNotIn(":  ()", human_out)
+
+        # 2. target_resolution matches PascalCase/camelCase identifiers to kebab/snake/dotted stems across TS/Rust/Kotlin
+        poly_repo = self.proj.parent / "v13_poly_target"
+        (poly_repo / "src" / "shared").mkdir(parents=True, exist_ok=True)
+        (poly_repo / "rust" / "src").mkdir(parents=True, exist_ok=True)
+        (poly_repo / "kotlin" / "src" / "main" / "kotlin").mkdir(parents=True, exist_ok=True)
+        (poly_repo / "src" / "shared" / "custom-canvas.component.ts").write_text(
+            "export class CanvasWidget { render() { return 1; } }\n", encoding="utf-8"
+        )
+        (poly_repo / "src" / "app.ts").write_text(
+            "import { CanvasWidget } from './shared/custom-canvas.component';\n"
+            "export const CustomCanvasComponent = CanvasWidget;\n",
+            encoding="utf-8",
+        )
+        (poly_repo / "rust" / "src" / "user_profile_service.rs").write_text(
+            "pub struct AccountManager;\n", encoding="utf-8"
+        )
+        (poly_repo / "kotlin" / "src" / "main" / "kotlin" / "user_profile_screen.kt").write_text(
+            "fun renderProfile() {}\n", encoding="utf-8"
+        )
+        # Preserve generic lowercase falsifier: single file with lowercase words only stays AMBIGUOUS
+        (poly_repo / "src" / "plain_holder.ts").write_text(
+            "export const value = 1;\n", encoding="utf-8"
+        )
+        g = build_shared_graph(str(poly_repo))
+
+        res_ts = build_target_resolution(g, "CustomCanvasComponent")
+        self.assertEqual(res_ts["resolution"]["state"], "RESOLVED")
+        self.assertEqual(res_ts["resolution"]["selected_targets"], ["src/shared/custom-canvas.component.ts"])
+
+        res_rs = build_target_resolution(g, "UserProfileService")
+        self.assertEqual(res_rs["resolution"]["state"], "RESOLVED")
+        self.assertEqual(res_rs["resolution"]["selected_targets"], ["rust/src/user_profile_service.rs"])
+
+        res_kt = build_target_resolution(g, "UserProfileScreen")
+        self.assertEqual(res_kt["resolution"]["state"], "RESOLVED")
+        self.assertEqual(res_kt["resolution"]["selected_targets"], ["kotlin/src/main/kotlin/user_profile_screen.kt"])
+
+        res_lower_falsifier = build_target_resolution(g, "Find value export")
+        self.assertEqual(res_lower_falsifier["resolution"]["state"], "AMBIGUOUS")
+
+        # 3. _engine_answer_summary ranks exact symbol matches ahead of partial substring matches
+        #    and returns {} when unresolved with zero term hits
+        orient_mock = {
+            "engine": {
+                "symbol_nodes": [
+                    {"symbol": "PatcherTracePoint", "file": "a.ts", "line": 1, "kind": "body", "authority": "definition"},
+                    {"symbol": "buildChatHistory", "file": "b.ts", "line": 4, "kind": "sig", "authority": "definition"},
+                ],
+                "symbol_edges": [],
+            }
+        }
+        ranked = hott_kernel._engine_answer_summary(
+            orient_mock,
+            terms=["trace", "buildchathistory", "build", "chat", "history"],
+            target_resolved=False,
+        )
+        self.assertEqual(ranked["symbols"][0]["symbol"], "buildChatHistory")
+        no_hit = hott_kernel._engine_answer_summary(
+            orient_mock,
+            terms=["frobnicatorquuxbaz"],
+            target_resolved=False,
+        )
+        self.assertEqual(no_hit, {})
+
+        # 4. plw agent orient accepts positional <task> alongside --task and fails closed when missing
+        with mock.patch("hott_kernel.kernel_work", return_value={
+            "mode": "work",
+            "frame_only": True,
+            "agent_decision_frame": {"target": {"state": "RESOLVED"}, "action_readiness": "AGENT_DECISION_REQUIRED"},
+            "skill_handoff": {"skill_path": "skills/test.md"},
+        }) as kw_mock:
+            buf_orient = io.StringIO()
+            with redirect_stdout(buf_orient):
+                rc_orient = plw_cli.cmd_agent(["orient", "Trace buildChatHistory", str(poly_repo), "--frame-only"])
+            self.assertEqual(rc_orient, 0)
+            self.assertEqual(kw_mock.call_args.kwargs["task"], "Trace buildChatHistory")
+            self.assertEqual(kw_mock.call_args.kwargs["scan_root"], str(poly_repo))
+
+        buf_err = io.StringIO()
+        with redirect_stdout(buf_err), mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as sys_exit:
+                plw_cli.cmd_agent(["orient", str(poly_repo), "--json"])
+            self.assertEqual(sys_exit.exception.code, 2)
+
 if __name__ == "__main__":
     unittest.main()

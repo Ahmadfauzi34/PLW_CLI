@@ -412,6 +412,10 @@ grep -Fq 'Test.kt", "Tests.kt", "Spec.kt", "_test.rs' core/shared_graph.py
 apply_reviewable_overlay "calibration_ux_v12"
 grep -Fq 'def get_structural_analyzers()' core/analyzer_registry.py
 grep -Fq 'include_perf: bool = False' hott_kernel.py
+apply_reviewable_overlay "calibration_ux_v13"
+grep -Fq 'def _split_camel_parts(token: str) -> List[str]:' core/target_resolution.py
+grep -Fq 'seed_terms: Optional[Sequence[str]] = None,' core/topology_engine.py
+grep -Fq 'target_resolved: bool = True,' hott_kernel.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
