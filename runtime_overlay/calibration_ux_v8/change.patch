@@ -1,0 +1,271 @@
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -5213,8 +5213,9 @@
+             _cli_flag_value(argv, "--tags"),
+         ))
+         return True
+-    if op == "recall":
+-        query = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++    if op in ("recall", "list", "search"):
++        raw_q = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++        query = None if (raw_q is not None and op == "list" and os.path.isdir(raw_q)) else raw_q
+         _emit_cli_result(kernel_memory_recall(
+             query,
+             _cli_flag_value(argv, "--type"),
+@@ -5231,7 +5232,7 @@
+             include_provenance="--include-provenance" in argv,
+         ))
+         return True
+-    if op == "stats":
++    if op in ("stats", "status"):
+         _emit_cli_result(kernel_memory_stats())
+         return True
+     if op == "associate":
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -1474,6 +1474,8 @@
+     """Inspect procedural transition-outcome memory; never use it as truth evidence."""
+     # Track 3: argparse via the shared wrapper (was a for-loop over args).
+     parser = _PlwArgumentParser(prog="plw transition-memory")
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     as_json = opts.as_json
+@@ -4084,6 +4086,7 @@
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--depth", type=int, default=1)
+     parser.add_argument("--focus", default=None)
++    parser.add_argument("--target", "--file", default=None, dest="target_focus")
+     parser.add_argument("--direction", default="LR")
+     parser.add_argument("--max-nodes", type=int, default=24, dest="max_nodes")
+     parser.add_argument("--include-tests", action="store_true", dest="include_tests")
+@@ -4091,6 +4094,7 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    opts.focus = opts.focus if opts.focus is not None else opts.target_focus
+ 
+     result = hott_kernel.kernel_mermaid(
+         opts.root,
+@@ -4474,15 +4478,29 @@
+     """Select a discovery candidate and optionally match its internal contract."""
+     import argparse
+     parser = _PlwArgumentParser(prog="plw candidate")
+-    parser.add_argument("operation", choices=("select", "capability-match"))
+-    parser.add_argument("task")
++    parser.add_argument("operation", choices=("select", "list", "capability-match", "match"))
++    parser.add_argument("task", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--task", default=None, dest="task_flag")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--receipt", default=None)
+     parser.add_argument("--strict-chain", action="store_true", dest="strict_chain")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.operation == "list":
++        opts.operation = "select"
++    elif opts.operation == "match":
++        opts.operation = "capability-match"
++    if opts.task_flag is not None:
++        if opts.task is not None and opts.root == "." and opts.root_flag is None:
++            opts.root = opts.task
++        opts.task = opts.task_flag
++    elif opts.root != "." and opts.root_flag is None and opts.task is not None:
++        if os.path.isdir(opts.task) and not os.path.isdir(opts.root):
++            opts.root, opts.task = opts.task, opts.root
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    if opts.task is None:
++        parser.error("the following arguments are required: task")
+     stage = "candidate-select" if opts.operation == "select" else "candidate-capability-match"
+     rc = _check_receipt_arg(
+         opts.receipt, stage, opts.task, opts.root,
+@@ -5076,7 +5094,7 @@
+                "  reconcile -> plw reconcile-outcomes\n"
+                "Additive aliases; canonical names unchanged.")
+     parser.add_argument("operation", choices=(
+-        "lineage", "accountability", "chain", "memory", "model", "reconcile"))
++        "lineage", "accountability", "chain", "memory", "status", "model", "reconcile"))
+     parser.add_argument("rest", nargs=argparse.REMAINDER)
+     opts = _parse_cli_args(parser, args)
+     if opts.operation == "lineage":
+@@ -5085,7 +5103,7 @@
+         return cmd_accountability(opts.rest)
+     if opts.operation == "chain":
+         return cmd_accountability_chain(opts.rest)
+-    if opts.operation == "memory":
++    if opts.operation in ("memory", "status"):
+         return cmd_transition_memory(opts.rest)
+     if opts.operation == "model":
+         return cmd_transition_model(opts.rest)
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -259,6 +259,23 @@
+     file_to_boundary = shared_graph.get("file_to_boundary", {})
+     resolved_imports = shared_graph.get("resolved_imports", {})
+     edge_natures = shared_graph.get("edge_natures", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
++    test_re = re.compile(
++        r"(?:^|/)(?:tests?|__tests__|spec)/|"
++        r"(?:\.(?:spec|test)\.[A-Za-z0-9]+$)|"
++        r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$",
++        re.IGNORECASE,
++    )
++
++    def _is_sheaf_test_file(fpath: str) -> bool:
++        if bool((node_metadata.get(fpath) or {}).get("is_test")):
++            return True
++        return bool(test_re.search(str(fpath).replace("\\", "/")))
++
++    def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:
++        na = str(b_a).replace("\\", "/").rstrip("/")
++        nb = str(b_b).replace("\\", "/").rstrip("/")
++        return na.startswith(nb + "/") or nb.startswith(na + "/")
+ 
+     # Build set of barrel files untuk quick lookup
+     barrel_files: Set[str] = set()
+@@ -271,6 +288,8 @@
+ 
+     # --- Deteksi boundary_violation dan kumpulkan cross-boundary info ---
+     for src_file, targets in sorted(resolved_imports.items()):
++        if _is_sheaf_test_file(src_file) or src_file in barrel_files:
++            continue
+         src_boundary = file_to_boundary.get(src_file)
+         if not src_boundary:
+             continue
+@@ -281,6 +300,8 @@
+             tgt_boundary = file_to_boundary.get(tgt_file)
+             if not tgt_boundary or tgt_boundary == src_boundary:
+                 continue
++            if _is_nested_boundary_pair(src_boundary, tgt_boundary):
++                continue
+ 
+             # Cross-boundary import terdeteksi
+             if tgt_boundary not in cross_boundary_targets:
+@@ -330,6 +351,8 @@
+     # Build boundary-level adjacency
+     boundary_graph: Dict[str, Set[str]] = {}
+     for src_file, targets in resolved_imports.items():
++        if _is_sheaf_test_file(src_file):
++            continue
+         src_boundary = file_to_boundary.get(src_file)
+         if not src_boundary:
+             continue
+@@ -337,7 +360,7 @@
+             if edge_natures.get(f"{src_file} -> {tgt_file}", "runtime") == "same_package":
+                 continue
+             tgt_boundary = file_to_boundary.get(tgt_file)
+-            if tgt_boundary and tgt_boundary != src_boundary:
++            if tgt_boundary and tgt_boundary != src_boundary and not _is_nested_boundary_pair(src_boundary, tgt_boundary):
+                 if src_boundary not in boundary_graph:
+                     boundary_graph[src_boundary] = set()
+                 boundary_graph[src_boundary].add(tgt_boundary)
+--- a/codebase/performance_analyzers.py
++++ b/codebase/performance_analyzers.py
+@@ -368,11 +368,18 @@
+ 
+ 
+ def _has_cache_eviction_guard(content: str, var_name: str, is_member: bool) -> bool:
+-    """Return True when *content* bounds *var_name* by size and deletes/clears entries."""
++    """Return True when *content* bounds *var_name* by size and deletes/clears entries or uses an LRU container."""
+     target_pat = rf"(?:this\.)?{re.escape(var_name)}" if is_member else re.escape(var_name)
++    if re.search(
++        rf"\b{re.escape(var_name)}\b\s*(?::[^=;\n]+)?=\s*new\s+\w*LRU\w*\s*(?:<[^>]*>)?\s*\(",
++        content,
++        re.IGNORECASE,
++    ):
++        return True
+     has_size_bound = bool(re.search(
+         rf"\b{target_pat}\s*\.\s*size\s*(?:>=|>|<=|<|===?|!==?)\s*[\w$.]+|"
+-        rf"[\w$.]+\s*(?:<=|<|>=|>)\s*{target_pat}\s*\.\s*size\b",
++        rf"[\w$.]+\s*(?:<=|<|>=|>)\s*{target_pat}\s*\.\s*size\b|"
++        rf"\b{target_pat}\s*\.\s*forEach\s*\([\s\S]{{0,240}}?\b{target_pat}\s*\.\s*delete\s*\(",
+         content,
+     ))
+     if not has_size_bound:
+@@ -415,11 +422,12 @@
+         content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+         node_meta = node_metadata.get(file_path) or {}
++        is_test = _is_test_file(file_path) or bool(node_meta.get("is_test"))
+         is_cli_context = _is_cli_or_tooling_context(file_path, raw_content, node_meta)
+ 
+         # --- sequential_await (with dependency check) ---
+         await_lines = []
+-        for i, line in enumerate(lines):
++        for i, line in enumerate([] if is_test else lines):
+             match = SEQUENTIAL_AWAIT_REGEX.match(line)
+             if match:
+                 await_lines.append({
+@@ -471,7 +479,7 @@
+                 })
+ 
+         # --- await_in_loop ---
+-        for i, line in enumerate(lines):
++        for i, line in enumerate([] if is_test else lines):
+             stripped = line.strip()
+             match = AWAIT_INSIDE_REGEX.search(line)
+             if not match:
+@@ -689,8 +697,13 @@
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
++        node_meta = node_metadata.get(file_path) or {}
++        if _is_test_file(file_path) or bool(node_meta.get("is_test")):
++            continue
++        is_cli_context = _is_cli_or_tooling_context(file_path, raw_content, node_meta)
+         content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+ 
+@@ -710,14 +723,25 @@
+ 
+             if json_parse or json_stringify:
+                 method = "JSON.parse" if json_parse else "JSON.stringify"
+-                findings.append({
+-                    "type": "json_in_loop",
+-                    "severity": "high",
+-                    "file": file_path,
+-                    "line": i + 1,
+-                    "content": stripped,
+-                    "observation": f"{method} inside loop at line {i + 1}.",
+-                })
++                if is_cli_context:
++                    findings.append({
++                        "type": "json_in_loop",
++                        "severity": "info",
++                        "execution_context": "cli_or_tooling_script",
++                        "file": file_path,
++                        "line": i + 1,
++                        "content": stripped,
++                        "observation": f"{method} inside loop at line {i + 1} in CLI/tooling script context.",
++                    })
++                else:
++                    findings.append({
++                        "type": "json_in_loop",
++                        "severity": "high",
++                        "file": file_path,
++                        "line": i + 1,
++                        "content": stripped,
++                        "observation": f"{method} inside loop at line {i + 1}.",
++                    })
+ 
+             if allocation:
+                 findings.append({
+@@ -864,9 +888,13 @@
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
+-        content = _strip_comments(raw_content)
++        node_meta = node_metadata.get(file_path) or {}
++        if _is_test_file(file_path) or bool(node_meta.get("is_test")):
++            continue
++        content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+ 
+         # Skip file yang tidak punya cache context

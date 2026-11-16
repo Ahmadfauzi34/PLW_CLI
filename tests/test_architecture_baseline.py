@@ -904,5 +904,146 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertNotIn("eslint.config.js", high_inf_files)
 
 
+    def test_calibration_ux_v8_cli_submodes_sheaf_and_lru_cache(self) -> None:
+        import plw_cli
+        from codebase.hott_analyzers import analyze_sheaf
+        from codebase.performance_analyzers import (
+            analyze_async_waterfall,
+            analyze_cache,
+            analyze_gc_pressure,
+        )
+
+        # 1. plw mermaid --target alias for --focus
+        buf_mmd = io.StringIO()
+        with redirect_stdout(buf_mmd):
+            rc_mmd = plw_cli.cmd_mermaid([str(self.proj), "--target", "src/app/utils.py", "--json"])
+        self.assertEqual(rc_mmd, 0)
+        mmd_payload = json.loads(buf_mmd.getvalue())
+        self.assertEqual(mmd_payload["focus"], "src/app/utils.py")
+
+        # 2. plw candidate list <root> --task ... and plw ledger status <root> --json
+        buf_cand = io.StringIO()
+        with redirect_stdout(buf_cand):
+            rc_cand = plw_cli.cmd_candidate(
+                ["list", str(self.proj), "--task", "Inspect utils", "--json"]
+            )
+        self.assertEqual(rc_cand, 0)
+        cand_payload = json.loads(buf_cand.getvalue())
+        self.assertIn("candidate_selection", cand_payload)
+
+        buf_empty_cand = io.StringIO()
+        with redirect_stdout(buf_empty_cand):
+            rc_empty_cand = plw_cli.cmd_candidate(["select", "", str(self.proj), "--json"])
+        self.assertEqual(rc_empty_cand, 0)
+        self.assertEqual(json.loads(buf_empty_cand.getvalue())["candidate_selection"]["resolution"], "UNRESOLVED")
+
+        buf_led = io.StringIO()
+        with redirect_stdout(buf_led):
+            rc_led = plw_cli.cmd_ledger(["status", str(self.proj), "--json"])
+        self.assertEqual(rc_led, 0)
+        led_payload = json.loads(buf_led.getvalue())
+        self.assertIn("outcome_count", led_payload)
+
+        # 3. hott_kernel memory status & memory list <root>
+        buf_mem = io.StringIO()
+        with mock.patch.object(sys, "argv", ["hott_kernel.py", "memory", "status"]), redirect_stdout(buf_mem):
+            hott_kernel.main()
+        mem_payload = json.loads(buf_mem.getvalue())
+        self.assertIn("total_memories", mem_payload)
+
+        buf_mem_list = io.StringIO()
+        with mock.patch.object(sys, "argv", ["hott_kernel.py", "memory", "list", str(self.proj)]), redirect_stdout(buf_mem_list):
+            hott_kernel.main()
+        mem_list_payload = json.loads(buf_mem_list.getvalue())
+        self.assertIsNone(mem_list_payload.get("query"))
+
+        # 4. analyze_sheaf skips test files, barrel self-reexports, and nested parent/child boundaries
+        sheaf_res = analyze_sheaf(
+            {
+                "boundaries": {
+                    "/repo/pkg": {"barrel": "/repo/pkg/index.ts"},
+                    "/repo/pkg/sub": {"barrel": "/repo/pkg/sub/index.ts"},
+                    "/repo/other": {"barrel": "/repo/other/index.ts"},
+                },
+                "file_to_boundary": {
+                    "/repo/pkg/index.ts": "/repo/pkg",
+                    "/repo/pkg/core.ts": "/repo/pkg",
+                    "/repo/pkg/sub/helper.ts": "/repo/pkg/sub",
+                    "/repo/other/feature.spec.ts": "/repo/other",
+                    "/repo/other/prod.ts": "/repo/other",
+                },
+                "resolved_imports": {
+                    "/repo/pkg/index.ts": ["/repo/pkg/sub/helper.ts"],
+                    "/repo/pkg/sub/helper.ts": ["/repo/pkg/core.ts"],
+                    "/repo/other/feature.spec.ts": ["/repo/pkg/core.ts"],
+                    "/repo/other/prod.ts": ["/repo/pkg/core.ts"],
+                },
+                "edge_natures": {},
+                "node_metadata": {
+                    "/repo/other/feature.spec.ts": {"is_test": True},
+                },
+            }
+        )
+        bv = [f for f in sheaf_res["findings"] if f["type"] == "boundary_violation"]
+        cb = [f for f in sheaf_res["findings"] if f["type"] == "circular_boundary"]
+        self.assertEqual(len(bv), 1)
+        self.assertEqual(bv[0]["file"], "/repo/other/prod.ts")
+        self.assertEqual(cb, [])
+
+        # 5. perf.cache recognizes LRUCache & forEach(.delete), and perf.gc/perf.async skip test files
+        lru_worker_ts = (
+            "class LRUCache<K, V> { set(k: K, v: V) {} }\n"
+            "const resultCache = new LRUCache<string, any>(50);\n"
+            "export function save(k: string, v: any) { resultCache.set(k, v); }\n"
+        )
+        foreach_evict_ts = (
+            "export class Canvas {\n"
+            "  private panelCache = new Map<number, string>();\n"
+            "  sync(n: number) {\n"
+            "    this.panelCache.set(0, \"a\");\n"
+            "    this.panelCache.forEach((_, idx) => { if (idx >= n) this.panelCache.delete(idx); });\n"
+            "  }\n"
+            "}\n"
+        )
+        cache_res = analyze_cache(
+            {
+                "file_map": {
+                    "src/worker.ts": lru_worker_ts,
+                    "src/canvas.ts": foreach_evict_ts,
+                    "src/cache.spec.ts": "const cCache = new Map(); cCache.set(\"a\", 1);\n",
+                }
+            }
+        )
+        unbounded = [f for f in cache_res["findings"] if f["type"] == "unbounded_cache"]
+        self.assertEqual(unbounded, [])
+
+        gc_res = analyze_gc_pressure(
+            {
+                "file_map": {
+                    "src/test.spec.ts": "for (const x of items) { JSON.stringify(x); }\n",
+                    "scripts/check.js": "for (const x of items) { JSON.stringify(x); }\n",
+                }
+            }
+        )
+        self.assertEqual(len(gc_res["findings"]), 1)
+        self.assertEqual(gc_res["findings"][0]["file"], "scripts/check.js")
+        self.assertEqual(gc_res["findings"][0]["severity"], "info")
+
+        async_res = analyze_async_waterfall(
+            {
+                "file_map": {
+                    "src/ops.spec.ts": (
+                        "async function testIt() {\n"
+                        "  const a = await stepOne();\n"
+                        "  const b = await stepTwo();\n"
+                        "  for (const x of items) { await run(x); }\n"
+                        "}\n"
+                    )
+                }
+            }
+        )
+        self.assertEqual(async_res["findings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
