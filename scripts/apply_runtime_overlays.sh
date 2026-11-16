@@ -409,6 +409,10 @@ apply_reviewable_overlay "calibration_ux_v11"
 grep -Fq '_JS_TS_EXTENSIONS = frozenset({' codebase/performance_analyzers.py
 grep -Fq 'if b_files and not any(' codebase/hott_analyzers.py
 grep -Fq 'Test.kt", "Tests.kt", "Spec.kt", "_test.rs' core/shared_graph.py
+apply_reviewable_overlay "calibration_ux_v12"
+grep -Fq 'def get_structural_analyzers()' core/analyzer_registry.py
+grep -Fq 'include_perf: bool = False' hott_kernel.py
+grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
 grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py

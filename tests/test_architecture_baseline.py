@@ -1359,5 +1359,74 @@ class ArchitectureBaselineTests(unittest.TestCase):
         )
 
 
+    def test_calibration_ux_v12_perf_opt_in_default_structural_check(self) -> None:
+        import plw_cli
+        from core.adaptive_work import _GOAL_ANALYZERS
+        from core.analyzer_registry import get_available_analyzers, get_structural_analyzers
+
+        all_analyzers = get_available_analyzers()
+        structural_analyzers = get_structural_analyzers()
+        self.assertTrue(any(a.startswith("perf.") for a in all_analyzers))
+        self.assertFalse(any(a.startswith("perf.") for a in structural_analyzers))
+        self.assertTrue(any(a.startswith("topo.") for a in structural_analyzers))
+        self.assertTrue(any(a.startswith("hott.") for a in structural_analyzers))
+        self.assertFalse(any(a.startswith("perf.") for a in _GOAL_ANALYZERS["change"]))
+        self.assertTrue(any(a.startswith("perf.") for a in _GOAL_ANALYZERS["performance"]))
+
+        ts_repo = self._tmp / "perf_opt_in_ts"
+        (ts_repo / "src").mkdir(parents=True)
+        (ts_repo / "src" / "store.ts").write_text(
+            "export const tokenCache = new Map<string, string>();\n"
+            "export function put(k: string, v: string) { tokenCache.set(k, v); }\n"
+            "export function run(x: string) { return eval(x); }\n",
+            encoding="utf-8",
+        )
+
+        # Default `plw check` runs structural analyzers only (no perf.* heuristics)
+        buf_def = io.StringIO()
+        with redirect_stdout(buf_def):
+            rc_def = plw_cli.cmd_check([str(ts_repo), "--cache-mode", "off", "--json"])
+        self.assertEqual(rc_def, 0)
+        def_payload = json.loads(buf_def.getvalue())
+        self.assertFalse(
+            any(str(f.get("analyzer", "")).startswith("perf.") for f in def_payload.get("findings", []))
+        )
+
+        # Opt-in via `--include-perf` runs perf.* heuristics
+        buf_perf = io.StringIO()
+        with redirect_stdout(buf_perf):
+            rc_perf = plw_cli.cmd_check([str(ts_repo), "--include-perf", "--cache-mode", "off", "--json"])
+        self.assertEqual(rc_perf, 0)
+        perf_payload = json.loads(buf_perf.getvalue())
+        perf_analyzers_found = {
+            f.get("analyzer") for f in perf_payload.get("findings", []) if str(f.get("analyzer", "")).startswith("perf.")
+        }
+        self.assertIn("perf.cache", perf_analyzers_found)
+        self.assertIn("perf.deopt", perf_analyzers_found)
+
+        # Explicit `--analyzers perf.cache` works without --include-perf
+        buf_exp = io.StringIO()
+        with redirect_stdout(buf_exp):
+            rc_exp = plw_cli.cmd_check([str(ts_repo), "--analyzers", "perf.cache", "--cache-mode", "off", "--json"])
+        self.assertEqual(rc_exp, 0)
+        exp_payload = json.loads(buf_exp.getvalue())
+        self.assertEqual(
+            {f.get("analyzer") for f in exp_payload.get("findings", [])},
+            {"perf.cache"},
+        )
+
+        # `hott_kernel analyzers` advertises default_check_analyzers vs opt_in_analyzers
+        buf_list = io.StringIO()
+        with mock.patch.object(sys, "argv", ["hott_kernel.py", "analyzers"]), redirect_stdout(buf_list):
+            hott_kernel.main()
+        list_payload = json.loads(buf_list.getvalue())
+        self.assertEqual(list_payload["available_analyzers"], all_analyzers)
+        self.assertEqual(list_payload["default_check_analyzers"], structural_analyzers)
+        self.assertEqual(
+            set(list_payload["opt_in_analyzers"]),
+            {"perf.async", "perf.deopt", "perf.gc", "perf.cache"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
