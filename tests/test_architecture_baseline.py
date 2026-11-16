@@ -1120,5 +1120,86 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(gc_res["findings"][0]["severity"], "info")
 
 
+
+    def test_calibration_ux_v10_cli_ergonomics_and_stream_state_analyzers(self) -> None:
+        import plw_cli
+        from codebase.performance_analyzers import (
+            analyze_async_waterfall,
+            analyze_gc_pressure,
+        )
+
+        # 1. plw context <root> single-positional & --query flag
+        buf_ctx = io.StringIO()
+        with redirect_stdout(buf_ctx):
+            rc_ctx = plw_cli.cmd_context([str(self.proj), "--output", "summary", "--json"])
+        self.assertIn(rc_ctx, (0, 3))
+        ctx_payload = json.loads(buf_ctx.getvalue())
+        self.assertEqual(os.path.abspath(ctx_payload["scan_root"]), os.path.abspath(str(self.proj)))
+
+        # 2. plw semantic <root>, plw semantic <cmd>, and plw semantic route <root> <task>
+        buf_sem1 = io.StringIO()
+        with redirect_stdout(buf_sem1):
+            self.assertEqual(plw_cli.cmd_semantic([str(self.proj), "--json"]), 0)
+        self.assertEqual(json.loads(buf_sem1.getvalue())["command"], "check")
+
+        buf_sem2 = io.StringIO()
+        with redirect_stdout(buf_sem2):
+            self.assertEqual(
+                plw_cli.cmd_semantic(["route", str(self.proj), "Inspect utils", "--json"]),
+                0,
+            )
+        self.assertTrue(json.loads(buf_sem2.getvalue())["route_found"])
+
+        # 3. plw operation-plan <root> <task> & plw reconcile-outcomes <root>
+        buf_op = io.StringIO()
+        with redirect_stdout(buf_op):
+            self.assertEqual(
+                plw_cli.cmd_operation_plan([str(self.proj), "Select isOne in utils.py", "--json"]),
+                0,
+            )
+        self.assertEqual(json.loads(buf_op.getvalue())["status"], "RESOLVED")
+
+        buf_rec = io.StringIO()
+        with redirect_stdout(buf_rec):
+            self.assertEqual(plw_cli.cmd_reconcile_outcomes([str(self.proj), "--json"]), 0)
+        self.assertIn("outcome_count", json.loads(buf_rec.getvalue()))
+
+        # 4. plw fiber <root> --json & plw fiber list <root> --json
+        for argv_f, expected_mode in (
+            (["hott_kernel.py", "fiber", str(self.proj), "--json"], "fiber_status"),
+            (["hott_kernel.py", "fiber", "list", str(self.proj), "--json"], "fiber_list_archives"),
+            (["hott_kernel.py", "fiber", "section-status", str(self.proj), "--json"], "fiber_section_status"),
+        ):
+            buf_f = io.StringIO()
+            with mock.patch.object(sys, "argv", argv_f), redirect_stdout(buf_f):
+                hott_kernel.main()
+            self.assertEqual(json.loads(buf_f.getvalue())["mode"], expected_mode)
+
+        # 5. perf.async & perf.gc stream/state loop precision
+        stream_and_turn_ts = (
+            "async function consumeStream(reader: any, session: any) {\n"
+            "  while (true) {\n"
+            "    const { done, value } = await reader.read();\n"
+            "    if (done) break;\n"
+            "    const lines = decoder.decode(value).split(\"\\n\");\n"
+            "    for (const line of lines) {\n"
+            "      try { const chunk = JSON.parse(line); } catch {}\n"
+            "    }\n"
+            "  }\n"
+            "  while (!isDone) {\n"
+            "    if (this.toolLoopCount >= this.maxToolLoops) break;\n"
+            "    const s = await session.sendMessageStream(nextInput);\n"
+            "  }\n"
+            "}\n"
+        )
+        async_res = analyze_async_waterfall({"file_map": {"src/stream.ts": stream_and_turn_ts}})
+        high_async = [f for f in async_res["findings"] if f["severity"] == "high"]
+        self.assertEqual(high_async, [])
+
+        gc_res = analyze_gc_pressure({"file_map": {"src/stream.ts": stream_and_turn_ts}})
+        high_gc = [f for f in gc_res["findings"] if f["severity"] == "high"]
+        self.assertEqual(high_gc, [])
+
+
 if __name__ == "__main__":
     unittest.main()
