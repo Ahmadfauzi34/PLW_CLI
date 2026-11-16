@@ -1045,5 +1045,80 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(async_res["findings"], [])
 
 
+    def test_calibration_ux_v9_memory_transitions_steer_and_async_precision(self) -> None:
+        import plw_cli
+        import hott_kernel
+        from codebase.performance_analyzers import analyze_async_waterfall, analyze_gc_pressure
+
+        # 1. plw memory store <content> --type architectural & plw memory bridge-candidates
+        buf_mem = io.StringIO()
+        with redirect_stdout(buf_mem):
+            handled = hott_kernel._cli_memory_operation(
+                "store",
+                ["hott_kernel.py", "memory", "store", "Sample arch note", "--type", "architectural", "--tags", "arch"],
+                arg_offset=3,
+            )
+        self.assertTrue(handled)
+        mem_payload = json.loads(buf_mem.getvalue())
+        self.assertNotIn("error", mem_payload)
+
+        # 2. plw transitions <root> <query> & plw steer <goal> <root>
+        buf_tr = io.StringIO()
+        with redirect_stdout(buf_tr):
+            rc_tr = plw_cli.cmd_transitions([str(self.proj), "Inspect utils", "--target", "src/app/utils.py", "--json"])
+        self.assertEqual(rc_tr, 0)
+
+        buf_st = io.StringIO()
+        with redirect_stdout(buf_st):
+            rc_st = plw_cli.cmd_steer(["Inspect utils", str(self.proj), "--json"])
+        self.assertEqual(rc_st, 0)
+
+        # 3. perf.async sequential_await does not cross if/else or callback scopes, and .map(async) is not await_in_loop
+        async_res = analyze_async_waterfall(
+            {
+                "file_map": {
+                    "src/service.ts": (
+                        "async function run(flag, items) {\n"
+                        "  if (flag) {\n"
+                        "    const res = await stepOne();\n"
+                        "    return res;\n"
+                        "  } else {\n"
+                        "    const res = await stepTwo();\n"
+                        "    return res;\n"
+                        "  }\n"
+                        "  for (let i = 0; i < items.length; i += 4) {\n"
+                        "    const batch = items.slice(i, i + 4);\n"
+                        "    const jobs = batch.map(async (x) => {\n"
+                        "      const out = await work(x);\n"
+                        "      return JSON.stringify(out);\n"
+                        "    });\n"
+                        "    await Promise.all(jobs);\n"
+                        "  }\n"
+                        "}\n"
+                    )
+                }
+            }
+        )
+        self.assertEqual(async_res["findings"], [])
+
+        # 4. perf.gc json_in_loop skips return JSON.stringify and downgrades camelCase maxRetries retry loop to info
+        gc_res = analyze_gc_pressure(
+            {
+                "file_map": {
+                    "src/retry.ts": (
+                        "function retryWork(maxRetries) {\n"
+                        "  for (let attempt = 0; attempt <= maxRetries; attempt++) {\n"
+                        "    const payload = JSON.stringify({ attempt });\n"
+                        "    if (attempt === maxRetries) return JSON.stringify({ error: payload });\n"
+                        "  }\n"
+                        "}\n"
+                    )
+                }
+            }
+        )
+        self.assertEqual(len(gc_res["findings"]), 1)
+        self.assertEqual(gc_res["findings"][0]["severity"], "info")
+
+
 if __name__ == "__main__":
     unittest.main()

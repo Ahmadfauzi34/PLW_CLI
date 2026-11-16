@@ -403,6 +403,7 @@ grep -Fq 'def _query_ui_words(query: str) -> List[str]:' codebase/static_ui_refe
 grep -Fq 'def _blank_multiline_template_literals(content: str) -> str:' codebase/performance_analyzers.py
 grep -Fq 'if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:' codebase/topology_analyzers.py
 apply_reviewable_overlay "calibration_ux_v8"
+apply_reviewable_overlay "calibration_ux_v9"
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
 grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py
