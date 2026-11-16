@@ -1201,5 +1201,163 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(high_gc, [])
 
 
+    def test_calibration_ux_v11_cross_language_drift_guards(self) -> None:
+        from codebase.hott_analyzers import analyze_homotopy, analyze_sheaf
+        from codebase.performance_analyzers import (
+            _is_test_file as perf_is_test_file,
+            analyze_async_waterfall,
+            analyze_cache,
+            analyze_deopt,
+            analyze_gc_pressure,
+        )
+        from core.shared_graph import _is_test_file as graph_is_test_file
+
+        # 1. Performance analyzers gate JS/V8/DOM heuristics strictly to JS/TS files
+        poly_file_map = {
+            "src/main/kotlin/com/app/ApiClient.kt": (
+                "package com.app\n"
+                "class ApiClient(private val cache: MemoryCache) {\n"
+                "  suspend fun run(ids: List<String>) {\n"
+                "    for (id in ids) {\n"
+                "      cache.set(id, id)\n"
+                "      window.addEventListener(\"click\", cb)\n"
+                "    }\n"
+                "  }\n"
+                "  fun clean(f: File) { f.delete() }\n"
+                "}\n"
+            ),
+            "src/net/client.rs": (
+                "pub async fn sync_all(items: &[String]) {\n"
+                "  let cache = HashMap::new();\n"
+                "  for item in items {\n"
+                "    cache.set(item, item);\n"
+                "    let _ = JSON.parse(item);\n"
+                "  }\n"
+                "}\n"
+            ),
+            "app/worker.py": (
+                "async def run(items):\n"
+                "  for item in items:\n"
+                "    await fetch(item)\n"
+                "    cache.set(item, item)\n"
+            ),
+        }
+        self.assertEqual(analyze_async_waterfall({"file_map": poly_file_map})["findings"], [])
+        self.assertEqual(analyze_deopt({"file_map": poly_file_map})["findings"], [])
+        self.assertEqual(analyze_gc_pressure({"file_map": poly_file_map})["findings"], [])
+        self.assertEqual(analyze_cache({"file_map": poly_file_map})["findings"], [])
+
+        # JS/TS negative control: real JS/TS issue still flags
+        ts_cache_res = analyze_cache(
+            {
+                "file_map": {
+                    "src/store.ts": (
+                        "export const tokenCache = new Map<string, string>();\n"
+                        "export function put(k: string, v: string) { tokenCache.set(k, v); }\n"
+                    )
+                }
+            }
+        )
+        self.assertTrue(any(f["type"] == "unbounded_cache" for f in ts_cache_res["findings"]))
+
+        # 2. Test-file convention recognition without false-matching e.g. Contest.kt
+        for test_path in (
+            "src/main/kotlin/com/app/ScreenTest.kt",
+            "src/main/kotlin/com/app/ApiTests.kt",
+            "src/androidTest/kotlin/com/app/Flow.kt",
+            "src/cache/store_test.rs",
+            "tests/integration.rs",
+            "tests/test_helper.py",
+        ):
+            self.assertTrue(perf_is_test_file(test_path), f"perf missed test: {test_path}")
+            self.assertTrue(graph_is_test_file(test_path), f"graph missed test: {test_path}")
+
+        for prod_path in (
+            "src/main/kotlin/com/app/Contest.kt",
+            "src/main/kotlin/com/app/Latest.kt",
+            "src/net/request.rs",
+        ):
+            self.assertFalse(perf_is_test_file(prod_path), f"false test: {prod_path}")
+            self.assertFalse(graph_is_test_file(prod_path), f"false test: {prod_path}")
+
+        # 3. hott.sheaf skips boundary_without_public_api for Kotlin/Rust boundaries, preserves JS/TS
+        sheaf_res = analyze_sheaf(
+            {
+                "boundaries": {
+                    "/repo/kt/ui": {"barrel": None, "files": ["/repo/kt/ui/Screen.kt"]},
+                    "/repo/kt/data": {"barrel": None, "files": ["/repo/kt/data/Repo.kt"]},
+                    "/repo/rs/cache": {"barrel": None, "files": ["/repo/rs/cache/store.rs"]},
+                    "/repo/rs/net": {"barrel": None, "files": ["/repo/rs/net/client.rs"]},
+                    "/repo/ts/core": {"barrel": None, "files": ["/repo/ts/core/svc.ts"]},
+                    "/repo/ts/web": {"barrel": None, "files": ["/repo/ts/web/page.ts"]},
+                },
+                "file_to_boundary": {
+                    "/repo/kt/ui/Screen.kt": "/repo/kt/ui",
+                    "/repo/kt/data/Repo.kt": "/repo/kt/data",
+                    "/repo/kt/data/RepoTest.kt": "/repo/kt/data",
+                    "/repo/rs/cache/store.rs": "/repo/rs/cache",
+                    "/repo/rs/net/client.rs": "/repo/rs/net",
+                    "/repo/rs/net/client_test.rs": "/repo/rs/net",
+                    "/repo/ts/core/svc.ts": "/repo/ts/core",
+                    "/repo/ts/web/page.ts": "/repo/ts/web",
+                },
+                "resolved_imports": {
+                    "/repo/kt/ui/Screen.kt": ["/repo/kt/data/Repo.kt"],
+                    "/repo/kt/data/RepoTest.kt": ["/repo/kt/ui/Screen.kt"],
+                    "/repo/rs/net/client.rs": ["/repo/rs/cache/store.rs"],
+                    "/repo/rs/net/client_test.rs": ["/repo/rs/cache/store.rs"],
+                    "/repo/ts/web/page.ts": ["/repo/ts/core/svc.ts"],
+                },
+                "edge_natures": {},
+            }
+        )
+        no_api_boundaries = [
+            f["boundary"]
+            for f in sheaf_res["findings"]
+            if f["type"] == "boundary_without_public_api"
+        ]
+        self.assertEqual(no_api_boundaries, ["/repo/ts/core"])
+        self.assertEqual(
+            [f for f in sheaf_res["findings"] if f["type"] == "circular_boundary"],
+            [],
+        )
+
+        # 4. hott.homotopy ignores Rust/Kotlin test files & Rust mod.rs/lib.rs barrels as diamond sources
+        homotopy_res = analyze_homotopy(
+            {
+                "vertices": [
+                    "src/lib.rs",
+                    "src/a.rs",
+                    "src/b.rs",
+                    "src/leaf.rs",
+                    "src/leaf_test.rs",
+                    "ScreenTest.kt",
+                ],
+                "edges": [
+                    ["src/lib.rs", "src/a.rs"],
+                    ["src/lib.rs", "src/b.rs"],
+                    ["src/a.rs", "src/leaf.rs"],
+                    ["src/b.rs", "src/leaf.rs"],
+                    ["src/leaf_test.rs", "src/a.rs"],
+                    ["src/leaf_test.rs", "src/b.rs"],
+                    ["ScreenTest.kt", "src/a.rs"],
+                    ["ScreenTest.kt", "src/b.rs"],
+                ],
+                "file_map": {
+                    "src/lib.rs": "pub mod a; pub mod b;",
+                    "src/a.rs": "",
+                    "src/b.rs": "",
+                    "src/leaf.rs": "",
+                    "src/leaf_test.rs": "",
+                    "ScreenTest.kt": "",
+                },
+            }
+        )
+        self.assertEqual(
+            [f for f in homotopy_res["findings"] if f["type"] == "diamond_dependency"],
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
