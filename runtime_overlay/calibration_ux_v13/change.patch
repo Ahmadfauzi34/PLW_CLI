@@ -1,0 +1,330 @@
+--- a/core/target_resolution.py
++++ b/core/target_resolution.py
+@@ -45,6 +45,14 @@
+     return value[len(prefix):] if root and value.startswith(prefix) else value
+ 
+ 
++def _split_camel_parts(token: str) -> List[str]:
++    if not any(ch.isupper() for ch in token) or not any(ch.islower() for ch in token):
++        return []
++    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", token)
++    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
++    return [part.lower() for part in spaced.split() if len(part) >= 3]
++
++
+ def _task_terms(task: str) -> Tuple[List[str], List[str]]:
+     raw = [_norm(token).lower() for token in _TOKEN_RE.findall(task)]
+     path_hints = [token for token in raw if "/" in token or "." in os.path.basename(token)]
+@@ -59,6 +67,9 @@
+         lowered = token.lower()
+         if lowered not in _STOP and len(lowered) >= 3 and lowered not in identifiers:
+             identifiers.append(lowered)
++        for camel_part in _split_camel_parts(token):
++            if camel_part not in _STOP and camel_part not in terms:
++                terms.append(camel_part)
+     return terms[:24], path_hints[:8] + [x for x in identifiers[:12] if x not in path_hints]
+ 
+ 
+@@ -232,6 +243,7 @@
+         if vertex in resolved_explicit:
+             seed_score += 100
+             evidence.append({"kind": "explicit_target", "weight": 100})
++        stem_collapsed = re.sub(r"[._-]+", "", stem)
+         for hint in hints:
+             h = hint.lower().replace("\\", "/")
+             if h == display_lower or display_lower.endswith("/" + h):
+@@ -242,8 +254,12 @@
+                 seed_score += 24
+                 evidence.append({"kind": "task_basename_match", "value": hint, "weight": 24})
+                 break
++            if "/" not in h and "." not in h and len(h) >= 4 and ("." in stem or "_" in stem or "-" in stem) and stem_collapsed == re.sub(r"[._-]+", "", h):
++                seed_score += 24
++                evidence.append({"kind": "task_basename_match", "value": hint, "weight": 24})
++                break
+ 
+-        stem_tokens = {part for part in re.split(r"[_-]+", stem) if len(part) >= 3}
++        stem_tokens = {part for part in re.split(r"[._-]+", stem) if len(part) >= 3}
+         stem_overlap = sorted(stem_tokens & set(terms))
+         if stem_overlap:
+             weight = min(18, 9 * len(stem_overlap))
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -46,7 +46,7 @@
+ import re
+ import tempfile
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+ 
+ from core.codesearch_engine import (
+     AUTHORITY_NOTE,
+@@ -370,6 +370,7 @@
+     internal_defined: Set[str],
+     import_counts: Dict[str, int],
+     type_shape_names: Set[str],
++    seed_terms: Sequence[str] = (),
+ ) -> int:
+     score = 0
+     if symbol in engine_defined or symbol in scoped_defined:
+@@ -383,6 +384,12 @@
+         score += 2
+     if len(symbol) <= 3 and symbol.islower():
+         score -= 2
++    if seed_terms:
++        sym_l = symbol.lower()
++        if sym_l in seed_terms:
++            score += 24
++        elif any(len(term) >= 4 and term in sym_l for term in seed_terms):
++            score += 12
+     return score
+ 
+ 
+@@ -400,6 +407,7 @@
+     effective_max_symbols: Optional[int],
+     full_engine: bool,
+     full_engine_edges: bool,
++    seed_terms: Sequence[str] = (),
+ ) -> str:
+     graph_sig = ""
+     if graph is not None:
+@@ -431,6 +439,7 @@
+         "full_engine": bool(full_engine),
+         "full_engine_edges": bool(full_engine_edges),
+         "noise_cap": HIGH_CALLER_NOISE_CAP,
++        **({"seed_terms": list(seed_terms)} if seed_terms else {}),
+     }
+     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(encoded).hexdigest()[:24]
+@@ -498,6 +507,7 @@
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
+     cache_mode: str = "auto",
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     """Build the engine symbol layer for a target root. Never raises.
+ 
+@@ -519,6 +529,7 @@
+             max_symbols=max_symbols, timeout_s=timeout_s, binary=binary,
+             full_engine=full_engine, full_engine_edges=full_engine_edges,
+             cache_mode=cache_mode,
++            seed_terms=seed_terms,
+         )
+     except Exception as exc:  # never break topology for the engine layer
+         layer = unavailable_layer(
+@@ -540,6 +551,7 @@
+     full_engine: bool,
+     full_engine_edges: bool,
+     cache_mode: str,
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     root_path = Path(root)
+     root_abs = _normalize_path(os.path.abspath(root))
+@@ -591,6 +603,9 @@
+ 
+     cache_mode_norm = str(cache_mode or "auto").strip().lower()
+     cache_key: Optional[str] = None
++    seed_terms_norm = sorted({
++        str(t).strip().lower() for t in (seed_terms or ()) if len(str(t).strip()) >= 3
++    })
+     if cache_mode_norm in ("auto", "refresh"):
+         cache_key = _engine_cache_key(
+             root_abs=root_abs,
+@@ -601,6 +616,7 @@
+             effective_max_symbols=effective_max_symbols,
+             full_engine=full_engine,
+             full_engine_edges=full_engine_edges,
++            seed_terms=seed_terms_norm,
+         )
+         if cache_mode_norm == "auto":
+             cached = _load_engine_cache(cache_key, engine_block)
+@@ -664,6 +680,7 @@
+                     internal_defined=internal_defined,
+                     import_counts=import_counts,
+                     type_shape_names=type_shape_names,
++                    seed_terms=seed_terms_norm,
+                 ),
+                 sym,
+             ),
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -16,7 +16,7 @@
+ import json
+ import hashlib
+ import datetime
+-from typing import Any, Callable, Dict, List, Optional
++from typing import Any, Callable, Dict, List, Optional, Sequence
+ 
+ # Import kernel components
+ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+@@ -663,6 +663,7 @@
+     max_symbols: Optional[int] = None,
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     """Best-effort engine symbol layer for topology/impact. Never raises.
+ 
+@@ -686,6 +687,7 @@
+             full_engine=full_engine,
+             full_engine_edges=full_engine_edges,
+             cache_mode=_ACTIVE_GRAPH_CACHE_MODE,
++            seed_terms=seed_terms,
+         )
+     except Exception as exc:
+         return _topology_engine_unavailable(
+@@ -3409,7 +3411,12 @@
+     }
+ 
+ 
+-def _engine_answer_summary(target_orientation: Dict[str, Any], terms: Any = None) -> Dict[str, Any]:
++def _engine_answer_summary(
++    target_orientation: Dict[str, Any],
++    terms: Any = None,
++    *,
++    target_resolved: bool = True,
++) -> Dict[str, Any]:
+     """Summarize engine-located symbols for the agent decision frame.
+ 
+     The topology target may stay unresolved (or ambiguous) while the
+@@ -3439,16 +3446,21 @@
+             return {}
+         terms_l = [str(t).lower() for t in (terms or []) if str(t).strip()]
+ 
+-        def _term_hits(name: str) -> int:
++        def _term_score(name: str) -> tuple:
+             lowered = (name or "").lower()
+-            return sum(1 for t in terms_l if t and t in lowered)
++            parts = lowered.split()
++            exact = sum(1 for t in terms_l if t and (lowered == t or t in parts))
++            long_hits = sum(1 for t in terms_l if len(t) >= 4 and t in lowered)
++            all_hits = sum(1 for t in terms_l if t and t in lowered)
++            best_len = max((len(t) for t in terms_l if t and t in lowered), default=0)
++            return (exact, long_hits, best_len, all_hits)
+ 
+         def _ranked(rows, key):
+             if not terms_l:
+                 return rows
+             scored = sorted(
+                 enumerate(rows),
+-                key=lambda pair: (-_term_hits(key(pair[1])), pair[0]),
++                key=lambda pair: (tuple(-v for v in _term_score(key(pair[1]))), pair[0]),
+             )
+             return [row for _, row in scored]
+ 
+@@ -3459,6 +3471,14 @@
+ 
+         nodes = _ranked(nodes, lambda n: str(n.get("symbol") or ""))
+         edges = _ranked(edges, _call_name)
++        if not target_resolved and terms_l:
++            has_match = any(
++                _term_score(str(n.get("symbol") or "")) > (0, 0, 0, 0) for n in nodes
++            ) or any(
++                _term_score(_call_name(e)) > (0, 0, 0, 0) for e in edges
++            )
++            if not has_match:
++                return {}
+         return {
+             "symbols": [
+                 {
+@@ -3654,12 +3674,18 @@
+         target_resolution=target_resolution,
+         full_engine=full_engine,
+     )
++    task_seed_block = (target_resolution or {}).get("task_seed") or {}
++    work_seed_terms = (
++        list(task_seed_block.get("terms") or [])
++        + list(task_seed_block.get("path_or_identifier_hints") or [])
++    ) if engine_targets is None else None
+     engine_layer = _build_topology_engine_layer(
+         scan_root,
+         graph,
+         target_files=engine_targets,
+         full_engine=full_engine,
+         full_engine_edges=full_engine_edges,
++        seed_terms=work_seed_terms,
+     )
+     target_orientation = (
+         build_target_topology_orientation(graph, top_n=8, include_edges=False, engine_layer=engine_layer)
+@@ -3907,7 +3933,13 @@
+             skill_handoff=normalized_handoff,
+             engine_answer=_engine_answer_summary(
+                 target_orientation,
+-                terms=(target_resolution.get("task_seed") or {}).get("terms") or [],
++                terms=(
++                    list((target_resolution.get("task_seed") or {}).get("terms") or [])
++                    + list((target_resolution.get("task_seed") or {}).get("path_or_identifier_hints") or [])
++                ),
++                target_resolved=str(
++                    (target_resolution.get("resolution") or {}).get("state") or ""
++                ) in ("RESOLVED", "MULTI_TARGET_RESOLVED"),
+             ),
+         )
+     else:
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -507,8 +507,9 @@
+     failed = summary.get("analyzers_failed", 0)
+     total = summary.get("total_findings", len(findings))
+ 
++    total_files = summary.get("total_files", result.get("total_files", "?"))
+     print(f"# [PLW Architecture & Boundary Check]")
+-    print(f"# Total Files: {result.get('total_files', '?')} | Findings: {total}")
++    print(f"# Total Files: {total_files} | Findings: {total}")
+     print("-" * 60)
+ 
+     critical_findings = [f for f in findings if f.get("severity") in ("critical", "high", "error")]
+@@ -522,7 +523,25 @@
+     else:
+         print(f"✗ ISSUES FOUND: {len(critical_findings)} critical/high severity findings:")
+         for f in critical_findings[:10]:
+-            print(f"  - [{f.get('severity', '').upper()}] {f.get('analyzer', '')}: {f.get('message', '')} ({f.get('file', '')})")
++            sev = str(f.get("severity") or "").upper()
++            analyzer = str(f.get("analyzer") or "")
++            msg = str(
++                f.get("message")
++                or f.get("observation")
++                or f.get("invariant")
++                or f.get("description")
++                or f.get("type")
++                or ""
++            ).strip()
++            loc = str(f.get("file") or "").strip()
++            if not loc:
++                seq = f.get("cycle") if isinstance(f.get("cycle"), list) else f.get("files")
++                if isinstance(seq, list) and seq:
++                    loc = " -> ".join(str(item) for item in seq[:4])
++            if loc and loc not in msg:
++                print(f"  - [{sev}] {analyzer}: {msg} ({loc})")
++            else:
++                print(f"  - [{sev}] {analyzer}: {msg}")
+         if len(critical_findings) > 10:
+             print(f"  ... and {len(critical_findings) - 10} more.")
+ 
+@@ -5013,8 +5032,9 @@
+     parser = _PlwArgumentParser(prog="plw agent")
+     parser.add_argument("operation", choices=("orient", "chain"))
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("task_pos", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+-    parser.add_argument("--task", required=True)
++    parser.add_argument("--task", default=None)
+     parser.add_argument("--target", action="append", default=[])
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+@@ -5028,6 +5048,16 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--receipt", default=None)
+     opts = _parse_cli_args(parser, args)
++    if opts.task is None:
++        if opts.task_pos is not None:
++            if opts.root_flag is None and not os.path.isdir(opts.root) and os.path.isdir(opts.task_pos):
++                opts.task, opts.root = opts.root, opts.task_pos
++            else:
++                opts.task = opts.task_pos
++        elif opts.root != "." and opts.root_flag is None and not os.path.isdir(opts.root):
++            opts.task, opts.root = opts.root, "."
++    if not opts.task:
++        parser.error("the following arguments are required: --task")
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     opts.target = [p.strip() for item in (opts.target or []) for p in str(item).split(",") if p.strip()]
+     if opts.receipt is not None:
