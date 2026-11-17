@@ -1551,5 +1551,91 @@ class ArchitectureBaselineTests(unittest.TestCase):
                 plw_cli.cmd_agent(["orient", str(poly_repo), "--json"])
             self.assertEqual(sys_exit.exception.code, 2)
 
+
+    def test_calibration_ux_v14_context_budget_ui_static_describe_and_help(self) -> None:
+        import json
+        import plw_cli
+        from core.context_optimizer import build_context_pack
+        from core.shared_graph import build_shared_graph
+
+        # 1. Context optimizer keeps within_budget honest against adaptive token estimates
+        ctx_repo = self.proj.parent / "v14_ctx_repo"
+        (ctx_repo / "src").mkdir(parents=True, exist_ok=True)
+        for idx in range(5):
+            body = "\n".join(f"export const sym{idx}_{j} = {j}; // dense_code_line_{j}" for j in range(45))
+            (ctx_repo / "src" / f"mod_{idx}.ts").write_text(body + "\n", encoding="utf-8")
+        g_ctx = build_shared_graph(str(ctx_repo))
+        pack = build_context_pack(
+            g_ctx,
+            query="dense_code_line mod_0 mod_1 mod_2 mod_3",
+            budget_tokens=400,
+            memory_context=None,
+        )
+        budget = pack["budget"]
+        self.assertEqual(
+            budget["within_budget"],
+            budget["used_chars"] <= budget["char_budget"]
+            and budget["estimated_tokens"] <= budget["requested_estimated_tokens"],
+        )
+
+        # 2. plw ui static human output renders @decl:<line> and attribute hint instead of :None ''
+        ui_repo = self.proj.parent / "v14_ui_repo"
+        (ui_repo / "src").mkdir(parents=True, exist_ok=True)
+        (ui_repo / "src" / "composer.component.ts").write_text(
+            "import { Component } from '@angular/core';\n"
+            "@Component({\n"
+            "  selector: 'app-composer',\n"
+            "  standalone: true,\n"
+            "  template: `\n"
+            "    <button type=\"submit\" class=\"btn-send\" aria-label=\"Send prompt\"></button>\n"
+            "  `\n"
+            "})\n"
+            "export class ComposerComponent {}\n",
+            encoding="utf-8",
+        )
+        buf_ui_human = io.StringIO()
+        with redirect_stdout(buf_ui_human):
+            rc_ui = plw_cli.cmd_ui_static(["Send", str(ui_repo)])
+        self.assertEqual(rc_ui, 0)
+        ui_human = buf_ui_human.getvalue()
+        self.assertIn("@decl:2", ui_human)
+        self.assertIn("btn-send", ui_human)
+        self.assertNotIn(":None", ui_human)
+        buf_ui_json = io.StringIO()
+        with redirect_stdout(buf_ui_json):
+            rc_ui_j = plw_cli.cmd_ui_static(["Send", str(ui_repo), "--json"])
+        self.assertEqual(rc_ui_j, 0)
+        self.assertIsNone(json.loads(buf_ui_json.getvalue())["decision"]["selected"]["template_line"])
+
+        # 3. plw describe surfaces hint/alias_of/available_commands & handles command names matching CWD dirs
+        desc_cwd = self.proj.parent / "v14_desc_cwd"
+        (desc_cwd / "ui").mkdir(parents=True, exist_ok=True)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(str(desc_cwd))
+            buf_desc_ui = io.StringIO()
+            with redirect_stdout(buf_desc_ui):
+                rc_du = plw_cli.cmd_semantic(["describe", "ui", "static"])
+            self.assertEqual(rc_du, 3)
+            self.assertIn("# Command: ui static", buf_desc_ui.getvalue())
+            self.assertIn("# Hint:", buf_desc_ui.getvalue())
+            self.assertIn("plw ui --help", buf_desc_ui.getvalue())
+
+            buf_desc_pack = io.StringIO()
+            with redirect_stdout(buf_desc_pack):
+                rc_dp = plw_cli.cmd_semantic(["describe", "pack"])
+            self.assertEqual(rc_dp, 3)
+            self.assertIn("# Alias of: context", buf_desc_pack.getvalue())
+            self.assertIn("# Hint:", buf_desc_pack.getvalue())
+        finally:
+            os.chdir(old_cwd)
+
+        # 4. plw impact --help rewrites kernel usage prefix to `plw ` without altering hott_kernel itself
+        buf_help = io.StringIO()
+        with mock.patch.object(sys, "argv", ["plw", "impact", "--help"]), redirect_stdout(buf_help):
+            plw_cli.main()
+        self.assertIn('"plw impact <file>', buf_help.getvalue())
+        self.assertNotIn("python3 hott_kernel.py", buf_help.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

@@ -416,6 +416,12 @@ apply_reviewable_overlay "calibration_ux_v13"
 grep -Fq 'def _split_camel_parts(token: str) -> List[str]:' core/target_resolution.py
 grep -Fq 'seed_terms: Optional[Sequence[str]] = None,' core/topology_engine.py
 grep -Fq 'target_resolved: bool = True,' hott_kernel.py
+apply_reviewable_overlay "calibration_ux_v14"
+grep -Fq 'def _estimate_tokens(' core/context_optimizer.py
+grep -Fq 'used_chars <= char_budget and estimated_tokens <= budget_tokens' core/context_optimizer.py
+grep -Fq '"plw": "plw --help",' core/semantic_affordance.py
+grep -Fq '@decl:{d_line}' plw_cli.py
+grep -Fq '# Alias of: ' plw_cli.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
