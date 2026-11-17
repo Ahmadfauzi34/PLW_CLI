@@ -422,6 +422,12 @@ grep -Fq 'used_chars <= char_budget and estimated_tokens <= budget_tokens' core/
 grep -Fq '"plw": "plw --help",' core/semantic_affordance.py
 grep -Fq '@decl:{d_line}' plw_cli.py
 grep -Fq '# Alias of: ' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v15"
+grep -Fq '"unique_stem_match"' codebase/topology_analyzers.py
+grep -Fq 'parse_rust_imports,' codebase/topology_analyzers.py
+grep -Fq 'summary_payload["error"] = result["error"]' hott_kernel.py
+grep -Fq 'iso_examples = sorted(m["file"] for m in isomorphs[:2])' memory/kan_extension.py
+grep -Fq 'Status: no_match — ' plw_cli.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py

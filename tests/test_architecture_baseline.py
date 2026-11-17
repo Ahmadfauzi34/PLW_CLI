@@ -1637,5 +1637,102 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertIn('"plw impact <file>', buf_help.getvalue())
         self.assertNotIn("python3 hott_kernel.py", buf_help.getvalue())
 
+    def test_calibration_ux_v15_polyglot_outline_stem_impact_kan_and_steer(self) -> None:
+        import plw_cli
+
+        poly_root = self.proj.parent / "v15_poly_repo"
+        (poly_root / "src" / "services").mkdir(parents=True, exist_ok=True)
+        (poly_root / "src" / "services" / "pyodide-client.ts").write_text(
+            "export class PyodideClient { run(): number { return 1; } }\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "services" / "file_scanner.py").write_text(
+            "import os\n\n@staticmethod\ndef scan_directory(root: str) -> list[str]:\n    return os.listdir(root)\n\ndef _private_helper() -> None:\n    pass\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "services" / "lib.rs").write_text(
+            "use std::collections::HashMap;\npub mod engine;\n#[derive(Debug)]\npub struct KernelState { pub count: usize }\npub fn run_kernel() -> usize { 42 }\nfn internal_fn() {}\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "services" / "engine.rs").write_text(
+            "use crate::KernelState;\npub fn step(_s: &KernelState) {}\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "services" / "SyncEngine.kt").write_text(
+            "package com.example.app\nimport kotlin.math.max\n@Singleton\nclass SyncEngine {}\nfun runSync(): Int = max(1, 2)\nprivate fun secret(): Int = 0\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "models").mkdir(parents=True, exist_ok=True)
+        (poly_root / "src" / "models" / "alpha.types.ts").write_text(
+            "export interface AlphaModel { id: string; }\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "models" / "beta.types.ts").write_text(
+            "export interface BetaModel { id: string; }\n",
+            encoding="utf-8",
+        )
+        (poly_root / "src" / "models" / "gamma.types.ts").write_text(
+            "export interface GammaModel { id: string; }\n",
+            encoding="utf-8",
+        )
+
+        # 1. Polyglot query_outline for Python, Rust, and Kotlin
+        out_py = hott_kernel.kernel_outline(str(poly_root), "src/services/file_scanner.py")
+        self.assertTrue(out_py["exists"])
+        self.assertIn("scan_directory", out_py["exports"])
+        self.assertNotIn("_private_helper", out_py["exports"])
+        self.assertEqual(out_py["stats"]["outline_entries"], 2)
+        self.assertIn("os", out_py["imports"])
+
+        out_rs = hott_kernel.kernel_outline(str(poly_root), "src/services/lib.rs")
+        self.assertTrue(out_rs["exists"])
+        self.assertEqual(out_rs["exports"], ["engine", "KernelState", "run_kernel"])
+        self.assertIn("derive", out_rs["decorators"])
+        self.assertEqual(out_rs["stats"]["outline_entries"], 4)
+
+        out_kt = hott_kernel.kernel_outline(str(poly_root), "src/services/SyncEngine.kt")
+        self.assertTrue(out_kt["exists"])
+        self.assertEqual(out_kt["exports"], ["SyncEngine", "runSync"])
+        self.assertIn("Singleton", out_kt["decorators"])
+
+        # 2. Stem and PascalCase target resolution on impact/brief/outline/context
+        imp_stem = hott_kernel.kernel_impact(str(poly_root), "PyodideClient")
+        self.assertTrue(imp_stem["exists"])
+        self.assertEqual(imp_stem["target_resolution"], "unique_stem_match")
+        self.assertTrue(imp_stem["target"].endswith("src/services/pyodide-client.ts"))
+
+        ctx_stem = hott_kernel.kernel_context(str(poly_root), "Audit PyodideClient", target_files=["PyodideClient"])
+        self.assertNotIn("error", ctx_stem)
+        self.assertTrue(any(p.endswith("src/services/pyodide-client.ts") for p in ctx_stem["selection"]["resolved_targets"]))
+
+        # 3. Summary mode on kernel_impact and kernel_brief preserves error on missing targets
+        imp_miss = hott_kernel.kernel_impact(str(poly_root), "NonExistentTarget", output_mode="summary")
+        self.assertFalse(imp_miss["exists"])
+        self.assertEqual(imp_miss["error"], "file_not_found_in_graph")
+        brf_miss = hott_kernel.kernel_brief(str(poly_root), "NonExistentTarget", output_mode="summary")
+        self.assertFalse(brf_miss["exists"])
+        self.assertEqual(brf_miss["error"], "file_not_found_in_graph")
+
+        # 4. plw kan supports <root> <stem> auto-swap, root-relative resolution, and clean no_match human text
+        buf_kan = io.StringIO()
+        with redirect_stdout(buf_kan):
+            rc_kan = plw_cli.cmd_kan([str(poly_root), "PyodideClient", "--json"])
+        self.assertEqual(rc_kan, 0)
+        kan_payload = json.loads(buf_kan.getvalue())
+        self.assertTrue(kan_payload["target_file"].endswith("src/services/pyodide-client.ts"))
+
+        buf_nomatch = io.StringIO()
+        with redirect_stdout(buf_nomatch):
+            rc_nm = plw_cli.cmd_kan(["nonexistent_memory_concept_v15_xyz"])
+        self.assertEqual(rc_nm, 0)
+        self.assertIn("Status: no_match", buf_nomatch.getvalue())
+        self.assertNotIn('"schema_version"', buf_nomatch.getvalue())
+
+        # 5. plw steer deduplicates swapped isomorphic module pair hints
+        steer_res = hott_kernel.kernel_steer(str(poly_root), "Audit models")
+        hints = steer_res.get("kan_guidance", {}).get("guided_hints", [])
+        iso_hints = [h for h in hints if h.startswith("Rujuk pola implementasi modul isomorphic:")]
+        self.assertEqual(len(iso_hints), len(set(iso_hints)))
+
 if __name__ == "__main__":
     unittest.main()
