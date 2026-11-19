@@ -1,0 +1,3972 @@
+--- a/codebase/angular_semantics.py
++++ b/codebase/angular_semantics.py
+@@ -877,20 +877,58 @@
+     file_map = shared_graph.get("file_map", {}) if isinstance(shared_graph, dict) else {}
+     vertices = set(shared_graph.get("vertices", [])) if isinstance(shared_graph, dict) else set()
+     normalized_file_filter = normalize_path(file_filter) if file_filter else None
++    resolved_filter_target: Optional[str] = None
++    if normalized_file_filter:
++        candidate_pool = vertices if vertices else set(file_map)
++        has_direct = any(
++            normalize_path(fp) == normalized_file_filter
++            or normalize_path(fp).endswith("/" + normalized_file_filter)
++            for fp in candidate_pool
++        )
++        if not has_direct:
++            try:
++                from codebase.topology_analyzers import _resolve_query_target
++                resolved_filter_target, _, _ = _resolve_query_target(
++                    normalized_file_filter,
++                    {normalize_path(fp) for fp in candidate_pool},
++                    scan_root=shared_graph.get("scan_root"),
++                )
++            except Exception:
++                resolved_filter_target = None
+     components: List[Dict[str, Any]] = []
++    all_extracted: List[Dict[str, Any]] = []
+     files_considered = 0
+     for file_path in sorted(file_map):
+         if vertices and file_path not in vertices:
+             continue
+-        if normalized_file_filter and normalize_path(file_path) != normalized_file_filter:
+-            # Also allow caller-relative suffix to avoid forcing absolute roots.
+-            if not normalize_path(file_path).endswith("/" + normalized_file_filter) and normalize_path(file_path) != normalized_file_filter:
+-                continue
++        norm_fp = normalize_path(file_path)
+         content = file_map.get(file_path)
+         if not isinstance(content, str):
+             continue
++        if normalized_file_filter:
++            target_cmp = resolved_filter_target or normalized_file_filter
++            if norm_fp != target_cmp and not norm_fp.endswith("/" + target_cmp):
++                if resolved_filter_target is None and "/" not in normalized_file_filter:
++                    all_extracted.extend(
++                        extract_angular_components(
++                            file_path, content, read_resources=read_resources, resource_root=shared_graph.get("scan_root"),
++                        )
++                    )
++                continue
+         files_considered += 1
+         components.extend(extract_angular_components(file_path, content, read_resources=read_resources, resource_root=shared_graph.get("scan_root")))
++    if normalized_file_filter and not components and all_extracted:
++        flt_collapsed = re.sub(r"[._-]+", "", normalized_file_filter.lower())
++        matched_rows = [
++            row for row in all_extracted
++            if str(row.get("class_name", "")).lower() == normalized_file_filter.lower()
++            or re.sub(r"[._-]+", "", str(row.get("class_name", "")).lower()) == flt_collapsed
++            or re.sub(r"[._-]+", "", str(row.get("class_name", "")).lower()).removesuffix("component") == flt_collapsed.removesuffix("component")
++            or str(row.get("selector", {}).get("value", "")).lower() == normalized_file_filter.lower()
++        ]
++        if matched_rows:
++            components = matched_rows
++            files_considered = len({row.get("file") for row in matched_rows})
+     if selector_filter is not None:
+         components = [row for row in components if row.get("selector", {}).get("value") == selector_filter]
+ 
+--- a/codebase/cycle_break.py
++++ b/codebase/cycle_break.py
+@@ -31,7 +31,7 @@
+ }
+ 
+ IMPORT_REGEX = re.compile(
+-    r"""(?:import\s+(?P<type_kw>type\s+)?(?:(?P<clause>[^"';\n]+?)\s+from\s+)?|export\s+(?P<export_type>type\s+)?(?:(?P<export_clause>[^"';\n]+?)\s+from\s+)?|import\s*\(\s*)["'](?P<path>[^"']+)["']""",
++    r"""(?:import\s+(?P<type_kw>type\s+)?(?:(?P<clause>[^"';]+?)\s+from\s+)?|export\s+(?P<export_type>type\s+)?(?:(?P<export_clause>[^"';]+?)\s+from\s+)?|import\s*\(\s*)["'](?P<path>[^"']+)["']""",
+     re.MULTILINE,
+ )
+ 
+@@ -60,11 +60,13 @@
+             if cleaned:
+                 symbols.append(cleaned)
+     else:
+-        # Default or namespace import (e.g. `import Foo` or `import * as Foo`)
++        # Default, namespace, or wildcard import/re-export (e.g. `import Foo`, `import * as Foo`, `export *`)
+         default_name = clause.split(",")[0].strip()
++        if default_name == "*":
++            return []
+         if default_name.startswith("* as "):
+             default_name = default_name[5:].strip()
+-        if default_name:
++        if default_name and default_name != "*":
+             symbols.append(default_name)
+     return symbols
+ 
+@@ -219,6 +221,8 @@
+         "has_import": False,
+         "is_type_only": False,
+         "is_dynamic": False,
++        "is_reexport": False,
++        "is_wildcard_reexport": False,
+         "symbols": [],
+         "raw_statement": "",
+     }
+@@ -251,18 +255,31 @@
+ 
+         resolved_base = os.path.splitext(resolved)[0]
+ 
+-        # Check if this import matches target
++        # Check if this import matches target (including directory barrel `./dir` -> `./dir/index.ts`)
++        target_parent = os.path.dirname(target_norm)
++        is_index_barrel = target_filebase == "index" and bool(target_parent) and (
++            resolved == target_parent or resolved_base == target_parent
++        )
+         is_match = (
+             resolved == target_norm
+             or resolved_base == target_base
+             or resolved.endswith("/" + target_filename)
+             or resolved.endswith("/" + target_filebase)
++            or is_index_barrel
+         )
+ 
+         if is_match:
+             clause = match.group("clause") or match.group("export_clause") or ""
+             is_type_kw = bool(match.group("type_kw") or match.group("export_type"))
+-            symbols = _extract_imported_symbols(clause)
++            is_reexport = bool(
++                match.group("export_clause") is not None
++                or match.group(0).lstrip().startswith("export")
++            )
++            clause_stripped = clause.strip()
++            is_wildcard_reexport = is_reexport and (
++                clause_stripped == "*" or clause_stripped.startswith("* as ")
++            )
++            symbols = [] if is_wildcard_reexport else _extract_imported_symbols(clause)
+             raw_stmt = match.group(0)
+ 
+             # Detect dynamic import: e.g. import(...) or await import(...)
+@@ -281,6 +298,8 @@
+                 "has_import": True,
+                 "is_type_only": is_type_only,
+                 "is_dynamic": is_dynamic,
++                "is_reexport": is_reexport,
++                "is_wildcard_reexport": is_wildcard_reexport,
+                 "symbols": symbols,
+                 "raw_statement": raw_stmt,
+             }
+@@ -364,6 +383,7 @@
+     else:
+         is_type_only = import_info.get("is_type_only", False)
+     is_dynamic = import_info.get("is_dynamic", False)
++    is_wildcard_reexport = bool(import_info.get("is_wildcard_reexport", False))
+     symbols = import_info.get("symbols", [])
+ 
+     # Base cost calibration
+@@ -375,9 +395,9 @@
+ 
+     # Fan-in adjustment: lower target fan-in = more isolated = easier to refactor
+     # Only discount if this is a static import with concrete symbols or type-only.
+-    # A dynamic import with empty symbols should not receive a fan-in discount.
++    # Dynamic imports and wildcard barrel re-exports must not receive a fan-in discount.
+     if target_fan_in <= 1:
+-        if not is_dynamic and (symbols or is_type_only):
++        if not is_dynamic and not is_wildcard_reexport and (symbols or is_type_only):
+             cost -= 15
+         elif is_dynamic:
+             cost += 25
+@@ -386,7 +406,7 @@
+ 
+     # Concrete symbols discount: having specific identified symbols to extract
+     # makes extract_shared_module concrete, targeted, and lower risk.
+-    if symbols and not is_dynamic:
++    if symbols and not is_dynamic and not is_wildcard_reexport:
+         cost -= 15
+ 
+     # Strategy determination
+@@ -439,6 +459,20 @@
+             f"Pass '{target}' instance or factory into '{source}' at initialization rather than using inline dynamic import.",
+             f"Alternatively, check if '{target}' statically imports definitions from '{source}' and extract those into a shared leaf module.",
+         ]
++    elif is_wildcard_reexport:
++        # Barrel wildcard re-export (`export * from './target'`) — cannot extract `*`
++        strategy = "barrel_reexport"
++        estimated_effort = "medium"
++        cost += 15
++        rationale = (
++            f"Module '{source}' is a barrel wildcard re-export ('export *') of '{target}'. "
++            f"Internal modules importing from barrel '{source}' pull in '{target}' and create "
++            f"a cycle when '{target}' depends back on those modules."
++        )
++        actionable_steps = [
++            f"Update internal callers that import from barrel '{source}' to import directly from the specific submodule they need (or from '{target}').",
++            f"Alternatively, replace 'export *' in '{source}' or extract the reverse-imported symbols out of '{target}' into a leaf module.",
++        ]
+     elif u_rank < v_rank:
+         # Layer violation: lower layer imports higher layer (e.g. Helper -> Service or Service -> Component)
+         strategy = "architectural_inversion"
+@@ -494,6 +528,7 @@
+         "symbols_involved": symbols,
+         "is_type_only": is_type_only,
+         "is_dynamic": is_dynamic,
++        "is_wildcard_reexport": is_wildcard_reexport,
+         "target_fan_in": target_fan_in,
+         "source_fan_out": source_fan_out,
+         "suggested_leaf": suggested_leaf,
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -11,6 +11,7 @@
+ Semua analyzer mengonsumsi SharedGraph. Tidak ada os.walk() di sini.
+ """
+ 
++import os
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+@@ -259,6 +260,29 @@
+     file_to_boundary = shared_graph.get("file_to_boundary", {})
+     resolved_imports = shared_graph.get("resolved_imports", {})
+     edge_natures = shared_graph.get("edge_natures", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
++    _JS_TS_EXTENSIONS = frozenset({
++        ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts",
++    })
++    test_re = re.compile(
++        r"(?:^|/)(?:tests?|__tests__|spec)/|"
++        r"(?:^|/)src/(?:test|androidTest)/|"
++        r"(?:\.(?:spec|test)\.[A-Za-z0-9]+$)|"
++        r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$",
++        re.IGNORECASE,
++    )
++    test_case_re = re.compile(r"(?:(?:Test|Tests|Spec)\.kt|_test\.rs)$")
++
++    def _is_sheaf_test_file(fpath: str) -> bool:
++        if bool((node_metadata.get(fpath) or {}).get("is_test")):
++            return True
++        norm = str(fpath).replace("\\", "/")
++        return bool(test_re.search(norm) or test_case_re.search(os.path.basename(norm)))
++
++    def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:
++        na = str(b_a).replace("\\", "/").rstrip("/")
++        nb = str(b_b).replace("\\", "/").rstrip("/")
++        return na.startswith(nb + "/") or nb.startswith(na + "/")
+ 
+     # Build set of barrel files untuk quick lookup
+     barrel_files: Set[str] = set()
+@@ -271,6 +295,8 @@
+ 
+     # --- Deteksi boundary_violation dan kumpulkan cross-boundary info ---
+     for src_file, targets in sorted(resolved_imports.items()):
++        if _is_sheaf_test_file(src_file) or src_file in barrel_files:
++            continue
+         src_boundary = file_to_boundary.get(src_file)
+         if not src_boundary:
+             continue
+@@ -281,6 +307,8 @@
+             tgt_boundary = file_to_boundary.get(tgt_file)
+             if not tgt_boundary or tgt_boundary == src_boundary:
+                 continue
++            if _is_nested_boundary_pair(src_boundary, tgt_boundary):
++                continue
+ 
+             # Cross-boundary import terdeteksi
+             if tgt_boundary not in cross_boundary_targets:
+@@ -312,8 +340,18 @@
+                     })
+ 
+     # --- Deteksi boundary_without_public_api ---
++    # JS/TS barrel files (index.ts / public-api.ts) do not exist in Kotlin and
++    # are optional in Rust 2018+/Python namespace packages. Only emit
++    # boundary_without_public_api when the boundary contains JS/TS files (or
++    # has an empty/synthetic file list without language metadata).
+     for tgt_boundary, src_boundaries in sorted(cross_boundary_targets.items()):
+-        tgt_barrel = boundaries.get(tgt_boundary, {}).get("barrel")
++        b_meta = boundaries.get(tgt_boundary, {})
++        tgt_barrel = b_meta.get("barrel")
++        b_files = b_meta.get("files") or []
++        if b_files and not any(
++            os.path.splitext(p)[1].lower() in _JS_TS_EXTENSIONS for p in b_files
++        ):
++            continue
+         if not tgt_barrel:
+             findings.append({
+                 "type": "boundary_without_public_api",
+@@ -330,6 +368,8 @@
+     # Build boundary-level adjacency
+     boundary_graph: Dict[str, Set[str]] = {}
+     for src_file, targets in resolved_imports.items():
++        if _is_sheaf_test_file(src_file):
++            continue
+         src_boundary = file_to_boundary.get(src_file)
+         if not src_boundary:
+             continue
+@@ -337,7 +377,7 @@
+             if edge_natures.get(f"{src_file} -> {tgt_file}", "runtime") == "same_package":
+                 continue
+             tgt_boundary = file_to_boundary.get(tgt_file)
+-            if tgt_boundary and tgt_boundary != src_boundary:
++            if tgt_boundary and tgt_boundary != src_boundary and not _is_nested_boundary_pair(src_boundary, tgt_boundary):
+                 if src_boundary not in boundary_graph:
+                     boundary_graph[src_boundary] = set()
+                 boundary_graph[src_boundary].add(tgt_boundary)
+@@ -484,9 +524,26 @@
+         r"\bas\s+const\b|\bObject\.freeze\s*\(|:\s*(?:readonly\b|Readonly(?:Array)?\s*<)"
+     )
+ 
++    node_metadata = shared_graph.get("node_metadata") or {}
++
+     def _is_barrel_or_test(path: str) -> bool:
+-        base = path.rsplit("/", 1)[-1]
+-        return base in _BARREL_BASENAMES or ".spec." in base or ".test." in base
++        if bool((node_metadata.get(path) or {}).get("is_test")):
++            return True
++        norm = path.replace("\\", "/")
++        base = norm.rsplit("/", 1)[-1]
++        if base in _BARREL_BASENAMES or base in ("mod.rs", "lib.rs"):
++            return True
++        if ".spec." in base or ".test." in base:
++            return True
++        if base.endswith(("Test.kt", "Tests.kt", "Spec.kt", "_test.rs")):
++            return True
++        wrapped = "/" + norm.lstrip("/")
++        return (
++            "/tests/" in wrapped
++            or "/__tests__/" in wrapped
++            or "/src/test/" in wrapped
++            or "/src/androidTest/" in wrapped
++        )
+ 
+     def _convergence_has_mutable_state(path: str) -> bool:
+         content = _strip_comments(file_map.get(path, ""))
+--- a/codebase/mermaid_graph.py
++++ b/codebase/mermaid_graph.py
+@@ -1229,6 +1229,18 @@
+             cyclic_files.add(str(member).replace("\\", "/"))
+ 
+     focus_norm = str(focus or "").strip().replace("\\", "/").strip("/")
++    if focus_norm and not any(focus_norm.lower() in r.lower() for r in rel_by_abs.values()):
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved_rel, _, _ = _resolve_query_target(
++                focus_norm,
++                set(rel_by_abs.values()),
++                scan_root=None,
++            )
++            if resolved_rel:
++                focus_norm = resolved_rel
++        except Exception:
++            pass
+     root_arg = scan_root if scan_root != "." else "."
+ 
+     if depth == 1:
+--- a/codebase/performance_analyzers.py
++++ b/codebase/performance_analyzers.py
+@@ -22,6 +22,27 @@
+     strip_js_comments as _strip_comments,
+ )
+ 
++_TEST_FILE_RE = re.compile(
++    r"(?:^|/)(?:tests?|__tests__|spec)/|"
++    r"(?:^|/)src/(?:test|androidTest)/|"
++    r"(?:\.(?:spec|test)\.[A-Za-z0-9]+$)|"
++    r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$",
++    re.IGNORECASE,
++)
++
++# Case-sensitive suffix patterns so Kotlin identifiers like `Contest.kt` are not
++# misclassified as tests while `*Test.kt` / `*Tests.kt` / `*Spec.kt` and Rust
++# `*_test.rs` are recognized accurately.
++_TEST_BASENAME_CASE_RE = re.compile(
++    r"(?:(?:Test|Tests|Spec)\.kt|_test\.rs)$"
++)
++
++
++def _is_test_file(file_path: str) -> bool:
++    norm = _normalize_path(file_path)
++    base = os.path.basename(norm)
++    return bool(_TEST_FILE_RE.search(norm) or _TEST_BASENAME_CASE_RE.search(base))
++
+ 
+ # ============================================================
+ # Shared Helpers
+@@ -33,6 +54,49 @@
+     return re.sub(r"`[^`]*`", "``", content)
+ 
+ 
++def _blank_multiline_template_literals(content: str) -> str:
++    """Blank contents of multi-line JS/TS backtick template literals while preserving newlines and single-line quote safety."""
++    if "`" not in content:
++        return content
++    out: List[str] = []
++    n = len(content)
++    i = 0
++    while i < n:
++        ch = content[i]
++        if ch in ('"', "'"):
++            quote = ch
++            out.append(ch)
++            i += 1
++            while i < n:
++                c = content[i]
++                out.append(c)
++                i += 1
++                if c == "\\" and i < n:
++                    out.append(content[i])
++                    i += 1
++                elif c == quote or c == "\n":
++                    break
++        elif ch == "`":
++            start = i
++            i += 1
++            while i < n:
++                c = content[i]
++                i += 1
++                if c == "\\" and i < n:
++                    i += 1
++                elif c == "`":
++                    break
++            segment = content[start:i]
++            if "\n" in segment:
++                out.append("`" + ("\n" * segment.count("\n")) + "`")
++            else:
++                out.append(segment)
++        else:
++            out.append(ch)
++            i += 1
++    return "".join(out)
++
++
+ LOOP_HEADER_REGEX = re.compile(
+     r"^\s*(?:for\s*(?:await\s*)?\(|"
+     r"for\s+(?:const|let|var)\s+\w+\s+(?:of|in)|while\s*\()"
+@@ -79,6 +143,8 @@
+             elif token == "{":
+                 if unmatched_closing_braces:
+                     unmatched_closing_braces -= 1
++                elif re.search(r"\.\s*map\s*\(\s*async\b", line[:column]):
++                    return None
+                 elif LOOP_HEADER_REGEX.match(line[:column]):
+                     depth = 0
+                     for j in range(i, len(lines)):
+@@ -103,8 +169,11 @@
+ def _is_small_retry_bound(limit_token: str) -> bool:
+     if limit_token.isdigit():
+         return int(limit_token) <= 10
+-    # Uppercase constant such as ATTEMPTS / MAX_RETRIES
+-    return bool(re.match(r"^[A-Z][A-Z0-9_]+$", limit_token))
++    # Uppercase constant such as ATTEMPTS / MAX_RETRIES or camelCase retry bound like maxRetries
++    return bool(
++        re.match(r"^[A-Z][A-Z0-9_]+$", limit_token)
++        or re.search(r"(?:retry|retries|attempt|attempts|limit|bound)", limit_token, re.IGNORECASE)
++    )
+ 
+ 
+ def _is_bounded_retry_loop(lines: List[str], header_idx: int, end_idx: int) -> bool:
+@@ -131,8 +200,8 @@
+                 if ".length" in cond_clean:
+                     return False
+                 bound_match = re.search(
+-                    rf"\b{re.escape(counter_name)}\b\s*(<=?|>=?|!==?)\s*(\d+|[A-Z][A-Z0-9_]+)\b|"
+-                    rf"\b(\d+|[A-Z][A-Z0-9_]+)\s*(<=?|>=?)\s*\b{re.escape(counter_name)}\b",
++                    rf"\b{re.escape(counter_name)}\b\s*(<=?|>=?|!==?)\s*(\d+|[A-Za-z_$][\w$]*)\b|"
++                    rf"\b(\d+|[A-Za-z_$][\w$]*)\s*(<=?|>=?)\s*\b{re.escape(counter_name)}\b",
+                     cond_clean,
+                 )
+                 if bound_match:
+@@ -142,7 +211,7 @@
+             else:
+                 # Pattern: `for (let attempt = 0; ; attempt++) { ... if (... || attempt === 2) throw ...; }`
+                 body_bound = re.search(
+-                    rf"\b{re.escape(counter_name)}\b\s*(===?|>=?|<=|<)\s*(\d+|[A-Z][A-Z0-9_]+)\b",
++                    rf"\b{re.escape(counter_name)}\b\s*(===?|>=?|<=|<)\s*(\d+|[A-Za-z_$][\w$]*)\b",
+                     block_clean,
+                 )
+                 has_exit = bool(re.search(r"\b(?:break|throw|return)\b", block_clean))
+@@ -166,14 +235,29 @@
+                 return True
+         return False
+ 
++    if re.match(r"^\s*for\s+await\s*\(", header_clean):
++        return True
++    if re.search(
++        r"\b(?:maxToolLoops|maxTurns|maxSteps|maxIterations|maxRetries|maxAttempts)\b",
++        block_clean,
++    ) and re.search(r"\b(?:break|return|throw)\b", block_clean):
++        return True
+     while_match = _WHILE_CLAUSE_REGEX.match(header_clean)
+     if while_match:
+         cond_clean = while_match.group(1)
++        if re.search(r"\.length\s*>\s*0\b", cond_clean) and re.search(
++            r"\.(?:shift|pop)\s*\(", block_clean
++        ):
++            return True
++        if re.search(r"\breader\.read\s*\(", block_clean) and re.search(
++            r"\bif\s*\(\s*done\s*\)\s*break\b", block_clean
++        ):
++            return True
+         counter_match = _RETRY_COUNTER_NAME_REGEX.search(cond_clean)
+         if counter_match and ".length" not in cond_clean:
+             counter_name = counter_match.group(0)
+             bound_match = re.search(
+-                rf"\b{re.escape(counter_name)}\b\s*(?:<=?|>=?)\s*(\d+|[A-Z][A-Z0-9_]+)\b",
++                rf"\b{re.escape(counter_name)}\b\s*(?:<=?|>=?)\s*(\d+|[A-Za-z_$][\w$]*)\b",
+                 cond_clean,
+             )
+             if bound_match and _is_small_retry_bound(bound_match.group(1)):
+@@ -181,6 +265,31 @@
+     return False
+ 
+ 
++def _is_sequential_or_stream_await(
++    lines: List[str], header_idx: int, end_idx: int, line_idx: int, line: str
++) -> bool:
++    """Return True when an await inside a loop is inherently sequential (stream read, serial executor, or state reducer)."""
++    if re.search(r"\bawait\s+[\w$.]+\.(?:read|next|shift)\s*\(", line):
++        return True
++    if re.search(r"\bexecuteToolsSerial\b|\bexecutePhase\b", line):
++        return True
++    header_clean = _strip_strings(lines[header_idx]).strip()
++    block_clean = _strip_strings("\n".join(lines[header_idx : end_idx + 1]))
++    # Enclosing function explicitly named *Serial / *Sequential
++    fn_window = "\n".join(lines[max(0, header_idx - 8) : header_idx + 1])
++    if re.search(r"\basync\s+\w*(?:Serial|Sequential)\w*\s*\(", fn_window):
++        return True
++    # State-threading pipeline loop: `for (const step of this.steps) { const res = await step(current); ... current = res.value; }`
++    m_call = re.search(r"\bawait\s+[\w$.]+\(\s*([A-Za-z_$][\w$]*)\s*[,)]", line)
++    if m_call:
++        state_var = m_call.group(1)
++        if re.search(rf"\b{re.escape(state_var)}\s*=", block_clean):
++            return True
++    if re.search(r"\bfor\s+await\s*\(", "\n".join(lines[max(0, line_idx - 40) : line_idx + 1])):
++        return True
++    return False
++
++
+ def _is_cli_or_tooling_context(
+     file_path: str,
+     raw_content: str,
+@@ -194,6 +303,8 @@
+         return True
+     if _is_tool_config_file(file_path):
+         return True
++    if _is_test_file(file_path) or bool(node_meta.get("is_test")):
++        return True
+     norm = _normalize_path(file_path).lower()
+     wrapped = f"/{norm.lstrip('/')}"
+     if "/scripts/" in wrapped or "/bin/" in wrapped:
+@@ -312,11 +423,18 @@
+ 
+ 
+ def _has_cache_eviction_guard(content: str, var_name: str, is_member: bool) -> bool:
+-    """Return True when *content* bounds *var_name* by size and deletes/clears entries."""
++    """Return True when *content* bounds *var_name* by size and deletes/clears entries or uses an LRU container."""
+     target_pat = rf"(?:this\.)?{re.escape(var_name)}" if is_member else re.escape(var_name)
++    if re.search(
++        rf"\b{re.escape(var_name)}\b\s*(?::[^=;\n]+)?=\s*new\s+\w*LRU\w*\s*(?:<[^>]*>)?\s*\(",
++        content,
++        re.IGNORECASE,
++    ):
++        return True
+     has_size_bound = bool(re.search(
+         rf"\b{target_pat}\s*\.\s*size\s*(?:>=|>|<=|<|===?|!==?)\s*[\w$.]+|"
+-        rf"[\w$.]+\s*(?:<=|<|>=|>)\s*{target_pat}\s*\.\s*size\b",
++        rf"[\w$.]+\s*(?:<=|<|>=|>)\s*{target_pat}\s*\.\s*size\b|"
++        rf"\b{target_pat}\s*\.\s*forEach\s*\([\s\S]{{0,240}}?\b{target_pat}\s*\.\s*delete\s*\(",
+         content,
+     ))
+     if not has_size_bound:
+@@ -356,14 +474,17 @@
+     node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
+-        content = _strip_comments(raw_content)
++        if os.path.splitext(file_path)[1].lower() not in _JS_TS_EXTENSIONS:
++            continue
++        content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+         node_meta = node_metadata.get(file_path) or {}
++        is_test = _is_test_file(file_path) or bool(node_meta.get("is_test"))
+         is_cli_context = _is_cli_or_tooling_context(file_path, raw_content, node_meta)
+ 
+         # --- sequential_await (with dependency check) ---
+         await_lines = []
+-        for i, line in enumerate(lines):
++        for i, line in enumerate([] if is_test else lines):
+             match = SEQUENTIAL_AWAIT_REGEX.match(line)
+             if match:
+                 await_lines.append({
+@@ -387,8 +508,17 @@
+                     rf"(?:const|let|var)\s+{re.escape(curr['variable'])}\s*=\s*await\s+.*\b{re.escape(prev_var)}\b"
+                 )
+                 is_dependent = dep_pattern.search(curr["content"])
++                intervening = lines[prev["line"] - 1 : curr["line"] - 1]
++                has_scope_or_branch = (
++                    curr["variable"] == prev["variable"]
++                    or any(
++                        "{" in ln or "}" in ln or "=>" in ln
++                        or re.search(r"\b(?:if|else|return|throw|for|while|switch|try|catch)\b", ln)
++                        for ln in intervening
++                    )
++                )
+ 
+-                if curr["line"] - prev["line"] <= 3 and not is_dependent:
++                if curr["line"] - prev["line"] <= 3 and not is_dependent and not has_scope_or_branch:
+                     current_group.append(curr)
+                 else:
+                     if len(current_group) >= 2:
+@@ -415,16 +545,20 @@
+                 })
+ 
+         # --- await_in_loop ---
+-        for i, line in enumerate(lines):
++        for i, line in enumerate([] if is_test else lines):
+             stripped = line.strip()
+             match = AWAIT_INSIDE_REGEX.search(line)
+             if not match:
+                 continue
++            if re.search(r"\bawait\s+Promise\.(?:all|allSettled)\s*\(", line):
++                continue
+             loop_span = _find_enclosing_loop(lines, i, match.start())
+             if loop_span is None:
+                 continue
+             header_idx, end_idx = loop_span
+-            if _is_bounded_retry_loop(lines, header_idx, end_idx):
++            if _is_bounded_retry_loop(lines, header_idx, end_idx) or _is_sequential_or_stream_await(
++                lines, header_idx, end_idx, i, line
++            ):
+                 findings.append({
+                     "type": "await_in_loop",
+                     "severity": "info",
+@@ -504,7 +638,7 @@
+ # ============================================================
+ 
+ DELETE_REGEX = re.compile(r"\bdelete\s+[\w.$\[\]'\"]+")
+-EVAL_REGEX = re.compile(r"\beval\s*\(")
++EVAL_REGEX = re.compile(r"(?<![.\w$])(?<!def\s)(?<!function\s)\beval\s*\(")
+ NEW_FUNC_REGEX = re.compile(r"\bnew\s+Function\s*\(")
+ 
+ # perf.deopt patterns are V8/JavaScript constructs (G4): the `delete`
+@@ -513,9 +647,14 @@
+ # Kotlin `file.delete()` call — and the English word "delete" inside a
+ # string literal on the same line — was reported as a V8 deoptimization
+ # (HelperPairing.kt, oopbot-trial audit).
+-_DEOPT_JS_TS_EXTENSIONS = frozenset({
++# Performance analyzers (perf.async, perf.deopt, perf.gc, perf.cache) encode
++# V8 / DOM / JS-TS patterns (const/let/var, Promise.all, delete, eval,
++# JSON.parse, addEventListener, new Map/WeakMap). Gate all four analyzers to
++# JS/TS files so Rust/Kotlin/Python codebases never receive JS-biased drift.
++_JS_TS_EXTENSIONS = frozenset({
+     ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts",
+ })
++_DEOPT_JS_TS_EXTENSIONS = _JS_TS_EXTENSIONS
+ 
+ 
+ def analyze_deopt(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+@@ -536,7 +675,9 @@
+     for file_path, raw_content in sorted(file_map.items()):
+         if os.path.splitext(file_path)[1].lower() not in _DEOPT_JS_TS_EXTENSIONS:
+             continue
+-        content = _strip_comments(raw_content)
++        if _is_test_file(file_path):
++            continue
++        content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+ 
+         for i, line in enumerate(lines):
+@@ -629,9 +770,16 @@
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
+-        content = _strip_comments(raw_content)
++        if os.path.splitext(file_path)[1].lower() not in _JS_TS_EXTENSIONS:
++            continue
++        node_meta = node_metadata.get(file_path) or {}
++        if _is_test_file(file_path) or bool(node_meta.get("is_test")):
++            continue
++        is_cli_context = _is_cli_or_tooling_context(file_path, raw_content, node_meta)
++        content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+ 
+         # --- json_in_loop & allocation_in_loop ---
+@@ -645,19 +793,48 @@
+                 key=lambda match: match.start(),
+                 default=None,
+             )
+-            if first_match is None or not _is_in_loop(lines, i, first_match.start()):
++            if first_match is None:
+                 continue
++            loop_span = _find_enclosing_loop(lines, i, first_match.start())
++            if loop_span is None:
++                continue
++            header_idx, end_idx = loop_span
++            is_retry_loop = _is_bounded_retry_loop(lines, header_idx, end_idx)
+ 
+             if json_parse or json_stringify:
++                if re.search(r"\b(?:return|throw)\s+.*\bJSON\.(?:parse|stringify)\b", line):
++                    continue
+                 method = "JSON.parse" if json_parse else "JSON.stringify"
+-                findings.append({
+-                    "type": "json_in_loop",
+-                    "severity": "high",
+-                    "file": file_path,
+-                    "line": i + 1,
+-                    "content": stripped,
+-                    "observation": f"{method} inside loop at line {i + 1}.",
+-                })
++                near_window = "\n".join(lines[max(0, header_idx - 6) : min(len(lines), end_idx + 2)])
++                is_stream_or_try_json = bool(
++                    re.search(
++                        r"\bdecoder\.decode\b|\.split\(\s*['\"]\\n['\"]\s*\)|\bfor\s+await\s*\(|\.write\s*\(\s*JSON\.stringify",
++                        near_window,
++                    )
++                    or (
++                        json_parse is not None
++                        and re.search(r"\btry\s*\{", "\n".join(lines[max(0, i - 6) : i + 1]))
++                    )
++                )
++                if is_cli_context or is_retry_loop or is_stream_or_try_json:
++                    findings.append({
++                        "type": "json_in_loop",
++                        "severity": "info",
++                        "execution_context": "cli_or_tooling_script",
++                        "file": file_path,
++                        "line": i + 1,
++                        "content": stripped,
++                        "observation": f"{method} inside loop at line {i + 1} in CLI/tooling script context.",
++                    })
++                else:
++                    findings.append({
++                        "type": "json_in_loop",
++                        "severity": "high",
++                        "file": file_path,
++                        "line": i + 1,
++                        "content": stripped,
++                        "observation": f"{method} inside loop at line {i + 1}.",
++                    })
+ 
+             if allocation:
+                 findings.append({
+@@ -724,9 +901,20 @@
+                     })
+ 
+         # --- unclosed_event_listener ---
+-        if ADD_EVENT_LISTENER_REGEX.search(content) and not REMOVE_EVENT_LISTENER_REGEX.search(content):
++        norm_gc_path = _normalize_path(file_path).lower()
++        is_sw_file = bool(re.search(r"(?:^|/)(?:sw|service-worker|ngsw-worker)\.[jt]s$", norm_gc_path))
++        if not is_sw_file and ADD_EVENT_LISTENER_REGEX.search(content) and not REMOVE_EVENT_LISTENER_REGEX.search(content):
+             for match in ADD_EVENT_LISTENER_REGEX.finditer(content):
+                 _, call_args = _extract_paren_call_and_args(content, match.end() - 1)
++                if (
++                    len(call_args) >= 1
++                    and content[max(0, match.start() - 4) : match.start()] == "self"
++                    and re.match(
++                        r"^['\"](?:install|activate|fetch|message|push|sync|notificationclick)['\"]$",
++                        call_args[0].strip(),
++                    )
++                ):
++                    continue
+                 if len(call_args) >= 3:
+                     opts_arg = _strip_strings(call_args[2])
+                     if _LISTENER_AUTO_CLEANUP_REGEX.search(opts_arg):
+@@ -793,9 +981,15 @@
+     """
+     findings: List[Dict[str, Any]] = []
+     file_map = shared_graph.get("file_map", {})
++    node_metadata = shared_graph.get("node_metadata") or {}
+ 
+     for file_path, raw_content in sorted(file_map.items()):
+-        content = _strip_comments(raw_content)
++        if os.path.splitext(file_path)[1].lower() not in _JS_TS_EXTENSIONS:
++            continue
++        node_meta = node_metadata.get(file_path) or {}
++        if _is_test_file(file_path) or bool(node_meta.get("is_test")):
++            continue
++        content = _blank_multiline_template_literals(_strip_comments(raw_content))
+         lines = content.split("\n")
+ 
+         # Skip file yang tidak punya cache context
+@@ -847,6 +1041,11 @@
+                 var_name = cache_match.group(1)
+                 prefix = stripped[: cache_match.start()]
+                 is_member = prefix.endswith(".")
++                if re.search(
++                    rf"\b{re.escape(var_name)}\b\s*(?::[^=;\n]+)?=\s*new\s+Weak(?:Map|Set)\b",
++                    content,
++                ):
++                    continue
+                 key = (var_name, is_member)
+                 if key not in local_cache:
+                     local_cache[key] = _is_non_escaping_local_container(
+--- a/codebase/static_ui_reference.py
++++ b/codebase/static_ui_reference.py
+@@ -22,10 +22,40 @@
+ INTERACTIVE_TAGS = {"a", "button", "input", "label", "select", "textarea"}
+ VISIBLE_ATTRIBUTES = {"href", "routerlink", "[routerlink]", "type", "name",
+                       "formcontrolname", "aria-label", "placeholder", "id", "class"}
+-QUERY_STOPWORDS = {"the", "for", "and", "with", "from", "where", "which", "what",
+-                   "find", "locate", "check", "assess", "ui", "page", "link",
+-                   "button", "component", "mobile", "responsive", "overlap", "layout",
+-                   "navigation", "element", "tautan", "tombol", "yang", "dan"}
++QUERY_STOPWORDS = {
++    "the", "for", "and", "with", "from", "where", "which", "what",
++    "this", "that", "these", "those", "between", "into", "onto", "about",
++    "above", "below", "under", "over", "after", "before", "through", "during",
++    "without", "within", "across", "against", "among", "around", "behind",
++    "beside", "beyond", "near", "since", "until", "upon", "via", "are", "was",
++    "were", "been", "being", "have", "has", "had", "does", "did", "will",
++    "would", "should", "could", "can", "may", "might", "must", "shall", "not",
++    "but", "all", "any", "each", "every", "some", "such", "only", "own",
++    "same", "than", "too", "very", "just", "also", "now", "here", "there",
++    "when", "why", "how", "who", "whom", "whose", "its", "our", "your",
++    "their", "his", "her",
++    "to", "of", "is", "be", "by", "as", "at", "or", "an", "if", "it",
++    "no", "so", "we", "he", "me", "my", "us", "do", "go", "am",
++    "ts", "js", "py", "kt", "rs",
++    "find", "locate", "check", "assess", "audit", "refactor", "fix", "break",
++    "debug", "test", "tests", "repo", "repository", "codebase", "project",
++    "file", "files", "module", "modules", "cycle", "cycles", "architecture",
++    "remove", "extract", "split", "cleanup", "dependency", "dependencies",
++    "circular", "circularity", "coupling", "scc", "sccs", "function",
++    "functions", "class", "classes", "method", "methods", "symbol", "symbols",
++    "import", "imports", "export", "exports", "tsconfig", "schema", "cache",
++    "receipt", "topology", "mermaid", "graph",
++    "investigate", "inspect", "analyze", "analyzer", "analyzers",
++    "src", "app", "core", "services", "service", "tools", "tool",
++    "implementations", "agent", "agents", "executor", "worker",
++    "sandbox", "pyodide", "perf", "gc", "async", "deopt", "loop",
++    "unbounded", "memory", "leak", "error", "errors", "line", "lines",
++    "json", "html", "css", "scss", "mjs", "cjs", "tsx", "jsx",
++    "angular", "ui", "page", "link", "button", "component", "mobile",
++    "responsive", "overlap", "layout", "navigation", "element",
++    "tautan", "tombol", "yang", "dan", "di", "ke", "ya", "ini", "itu",
++    "atau", "dari", "untuk", "pada", "dengan",
++}
+ 
+ 
+ def _sha(data: bytes) -> str:
+@@ -137,12 +167,26 @@
+     return None, None, "TEMPLATE_NOT_STATIC"
+ 
+ 
++def _query_ui_words(query: str) -> List[str]:
++    cleaned = re.sub(
++        r"\b(?:\S*[\\/]\S+|\w+_\w+|\w+\.(?:ts|js|mjs|cjs|py|kt|rs|go|java|cpp|c|h|sh|md|yml|yaml|toml|lock)\b)",
++        " ",
++        query,
++        flags=re.IGNORECASE,
++    )
++    words = _words(cleaned)
++    return words if words else _words(query)
++
++
+ def _score(query: str, tag: str, label: str, attrs: Dict[str, str]) -> tuple[int, List[str], Dict[str, Any]]:
+-    tokens = {word for word in _words(query) if len(word) >= 2 and word not in QUERY_STOPWORDS}
++    ui_words = _query_ui_words(query)
++    tokens = {word for word in ui_words if len(word) >= 2 and word not in QUERY_STOPWORDS}
+     label_words = _words(label)
+     label_matches = sorted(tokens.intersection(label_words))
+-    # Short words may distinguish labels such as "Sign in" and "Sign up", but
+-    # matching one in a long placeholder is weak evidence of control identity.
++    # Short words may distinguish short labels such as "Sign in" and "Sign up", but
++    # a 2-char token alone on a multi-word label (without a >=3-char match) is weak evidence.
++    if len(label_words) > 1 and not any(len(word) >= 3 for word in label_matches):
++        label_matches = []
+     attribute_tokens = {word for word in tokens if len(word) >= 3}
+     attribute_matches = {name: sorted(attribute_tokens.intersection(_words(value)))
+                          for name, value in sorted(attrs.items())}
+--- a/codebase/topology_analyzers.py
++++ b/codebase/topology_analyzers.py
+@@ -16,7 +16,7 @@
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+-from language_semantics import normalize_path as _normalize_path, strip_js_comments as _strip_comments
++from language_semantics import is_tool_config_file as _is_tool_config_file, normalize_path as _normalize_path, strip_js_comments as _strip_comments
+ 
+ 
+ # ============================================================
+@@ -345,6 +345,8 @@
+ 
+     for source_file in unreachable_sources:
+         meta = metadata.get(source_file, {})
++        if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:
++            continue
+         if meta.get("is_entrypoint") or meta.get("fan_in", 0) >= 2:
+             reasons = []
+             if meta.get("is_entrypoint"):
+@@ -465,14 +467,16 @@
+ def _resolve_query_target(
+     target_file: str,
+     candidate_paths: Set[str],
++    scan_root: Optional[str] = None,
+ ) -> Tuple[Optional[str], List[str], str]:
+     """Resolve a targeted-query path without guessing between duplicate suffixes.
+ 
+     SharedGraph preserves the caller's root representation, so an absolute scan
+     root produces absolute vertices even when an agent naturally supplies a
+-    root-relative target such as ``src/app.ts``. Exact identity remains first;
+-    one unique suffix is a valid representation bridge; multiple suffix matches
+-    are returned as explicit ambiguity evidence.
++    root-relative target such as ``src/app.ts``. Exact identity remains first,
++    including exact root-relative resolution against ``scan_root``; one unique
++    suffix is a valid representation bridge; multiple suffix matches are
++    returned as explicit ambiguity evidence.
+     """
+     requested = _normalize_path(str(target_file))
+     candidates = {_normalize_path(str(path)) for path in candidate_paths}
+@@ -480,11 +484,43 @@
+         return requested, [], "exact"
+     if os.path.isabs(requested):
+         return None, [], "unresolved"
++    if scan_root:
++        rooted = _normalize_path(os.path.join(str(scan_root), requested))
++        if rooted in candidates:
++            return rooted, [], "root_relative_exact"
+ 
+     suffix = "/" + requested.lstrip("/")
+     matches = sorted(path for path in candidates if path.endswith(suffix))
+     if len(matches) == 1:
+         return matches[0], [], "unique_root_relative_suffix"
++    if not matches and os.path.splitext(os.path.basename(requested))[1] == "":
++        if "/" in requested:
++            stem_matches = sorted(
++                path for path in candidates
++                if os.path.splitext(path)[0].endswith(suffix) or path.endswith(suffix)
++            )
++        elif len(requested) >= 2:
++            req_l = requested.lower()
++            req_collapsed = re.sub(r"[._-]+", "", req_l)
++            exact_stem = sorted(
++                path for path in candidates
++                if os.path.splitext(os.path.basename(path))[0].lower() == req_l
++            )
++            if exact_stem:
++                stem_matches = exact_stem
++            elif len(req_collapsed) >= 4:
++                stem_matches = sorted(
++                    path for path in candidates
++                    if re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(path))[0].lower()) == req_collapsed
++                )
++            else:
++                stem_matches = []
++        else:
++            stem_matches = []
++        if len(stem_matches) == 1:
++            return stem_matches[0], [], "unique_stem_match"
++        if len(stem_matches) > 1:
++            return None, stem_matches, "ambiguous"
+     return None, matches, "ambiguous" if matches else "unresolved"
+ 
+ 
+@@ -516,6 +552,7 @@
+     target, candidates, resolution = _resolve_query_target(
+         requested_target,
+         set(vertices),
++        scan_root=shared_graph.get("scan_root"),
+     )
+ 
+     if target is None:
+@@ -679,6 +716,7 @@
+         target, candidates, resolution = _resolve_query_target(
+             requested_target,
+             set(file_map),
++            scan_root=shared_graph.get("scan_root"),
+         )
+ 
+     if target is None:
+@@ -687,81 +725,259 @@
+         )
+ 
+     content = file_map[target]
+-    stripped = _strip_comments(content)
+     lines = content.splitlines()
+-    stripped_lines = stripped.split("\n")
+-    line_starts = [0]
+-    for ln in stripped_lines[:-1]:
+-        line_starts.append(line_starts[-1] + len(ln) + 1)
+-    n_stripped_lines = len(stripped_lines)
+-
+-    # Extract imports
+     imports: List[str] = []
+     internal_imports: List[str] = []
+     external_imports: List[str] = []
+-
+-    for match in _IMPORT_RE.finditer(stripped):
+-        import_path = match.group(2)
+-        if import_path:
+-            imports.append(import_path)
+-            if import_path.startswith("."):
+-                internal_imports.append(import_path)
+-            else:
+-                external_imports.append(import_path)
+-
+-    # Extract declarations
+     declarations: List[Dict[str, Any]] = []
++    decorators: List[str] = []
++    exports: List[str] = []
+ 
+-    decl_patterns = [
+-        ("interface", _EXPORT_INTERFACE_RE),
+-        ("type", _EXPORT_TYPE_RE),
+-        ("class", _EXPORT_CLASS_RE),
+-        ("function", _EXPORT_FUNCTION_RE),
+-        ("const", _EXPORT_CONST_RE),
+-        ("enum", _EXPORT_ENUM_RE),
+-    ]
+-
+-    for kind, pattern in decl_patterns:
+-        for match in pattern.finditer(stripped):
+-            name = match.group(1)
+-            line_no = bisect.bisect_right(line_starts, match.start())
+-            match_line = stripped_lines[line_no - 1].strip() if line_no <= n_stripped_lines else ""
+-            is_exported = match_line.startswith("export")
++    from language_semantics import (
++        source_language,
++        parse_rust_imports,
++        parse_kotlin_imports,
++        kotlin_strip_comments_and_strings,
++        kotlin_package_of,
++        _KOTLIN_SAME_PKG_DECL_REGEX,
++    )
++    lang = source_language(target)
+ 
++    if lang == "python":
++        import ast as _py_ast
++        try:
++            tree = _py_ast.parse(content)
++        except (SyntaxError, ValueError):
++            tree = None
++        if tree is not None:
++            explicit_all: Optional[Set[str]] = None
++            for node in tree.body:
++                if isinstance(node, (_py_ast.Assign, _py_ast.AnnAssign)):
++                    targets = node.targets if isinstance(node, _py_ast.Assign) else [node.target]
++                    val = getattr(node, "value", None)
++                    for t in targets:
++                        if isinstance(t, _py_ast.Name) and t.id == "__all__" and isinstance(val, (_py_ast.List, _py_ast.Tuple, _py_ast.Set)):
++                            explicit_all = {
++                                elt.value for elt in val.elts
++                                if isinstance(elt, _py_ast.Constant) and isinstance(elt.value, str)
++                            }
++            for node in _py_ast.walk(tree):
++                if isinstance(node, _py_ast.Import):
++                    for alias in node.names:
++                        mod_name = alias.name
++                        imports.append(mod_name)
++                        rel_py = mod_name.replace(".", "/") + ".py"
++                        if any(k == rel_py or k.endswith("/" + rel_py) for k in file_map):
++                            internal_imports.append(mod_name)
++                        else:
++                            external_imports.append(mod_name)
++                elif isinstance(node, _py_ast.ImportFrom):
++                    mod_base = ("." * (node.level or 0)) + (node.module or "")
++                    if not mod_base and node.names:
++                        mod_base = "." + node.names[0].name
++                    if mod_base:
++                        imports.append(mod_base)
++                        if (node.level or 0) > 0:
++                            internal_imports.append(mod_base)
++                        else:
++                            rel_py = (node.module or "").replace(".", "/") + ".py"
++                            if any(k == rel_py or k.endswith("/" + rel_py) for k in file_map):
++                                internal_imports.append(mod_base)
++                            else:
++                                external_imports.append(mod_base)
++            for node in tree.body:
++                if isinstance(node, (_py_ast.FunctionDef, _py_ast.AsyncFunctionDef, _py_ast.ClassDef)):
++                    kind = "class" if isinstance(node, _py_ast.ClassDef) else "function"
++                    name = node.name
++                    line_no = getattr(node, "lineno", 1)
++                    sig_line = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else f"{kind} {name}"
++                    is_exported = (name in explicit_all) if explicit_all is not None else (not name.startswith("_"))
++                    declarations.append({
++                        "line": line_no,
++                        "kind": kind,
++                        "name": name,
++                        "exported": is_exported,
++                        "signature": sig_line[:220],
++                    })
++                    for dec in getattr(node, "decorator_list", []):
++                        dec_name = None
++                        if isinstance(dec, _py_ast.Name):
++                            dec_name = dec.id
++                        elif isinstance(dec, _py_ast.Attribute):
++                            dec_name = dec.attr
++                        elif isinstance(dec, _py_ast.Call):
++                            func = dec.func
++                            if isinstance(func, _py_ast.Name):
++                                dec_name = func.id
++                            elif isinstance(func, _py_ast.Attribute):
++                                dec_name = func.attr
++                        if dec_name and dec_name not in decorators:
++                            decorators.append(dec_name)
++                elif isinstance(node, (_py_ast.Assign, _py_ast.AnnAssign)):
++                    targets = node.targets if isinstance(node, _py_ast.Assign) else [node.target]
++                    line_no = getattr(node, "lineno", 1)
++                    sig_line = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else ""
++                    for t in targets:
++                        if isinstance(t, _py_ast.Name) and t.id != "__all__" and t.id[:1].isupper():
++                            is_exported = (t.id in explicit_all) if explicit_all is not None else (not t.id.startswith("_"))
++                            declarations.append({
++                                "line": line_no,
++                                "kind": "const",
++                                "name": t.id,
++                                "exported": is_exported,
++                                "signature": sig_line[:220],
++                            })
++            for decl in declarations:
++                if decl["exported"] and decl["name"] not in exports:
++                    exports.append(decl["name"])
++            if explicit_all:
++                for item in sorted(explicit_all):
++                    if item not in exports:
++                        exports.append(item)
++    elif lang == "rust":
++        stripped = _strip_comments(content)
++        stripped_lines = stripped.split("\n")
++        line_starts = [0]
++        for ln in stripped_lines[:-1]:
++            line_starts.append(line_starts[-1] + len(ln) + 1)
++        for imp in parse_rust_imports(content):
++            raw = imp.get("raw_import", "")
++            if raw:
++                imports.append(raw)
++                if imp.get("rust_mod") or raw.startswith(("crate::", "self::", "super::")):
++                    internal_imports.append(raw)
++                else:
++                    external_imports.append(raw)
++        rust_decl_re = re.compile(
++            r"^(?:(?P<macro>macro_rules!)\s+(?P<mname>[A-Za-z_][\w]*)|"
++            r"(?:(?P<pub>pub(?:\([^)]*\))?)\s+)?"
++            r'(?:async\s+|unsafe\s+|const\s+|extern\s+"[^"]*"\s+|default\s+)*'
++            r"(?P<kw>fn|struct|enum|union|trait|type|const|static|mod)\s+(?P<name>[A-Za-z_][\w]*))",
++            re.MULTILINE,
++        )
++        for match in rust_decl_re.finditer(stripped):
++            line_no = bisect.bisect_right(line_starts, match.start())
++            sig_line = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else ""
++            if match.group("macro"):
++                kind = "macro"
++                name = match.group("mname")
++                is_exported = True
++            else:
++                kw = match.group("kw")
++                kind = "function" if kw == "fn" else kw
++                name = match.group("name")
++                is_exported = bool(match.group("pub"))
+             declarations.append({
+                 "line": line_no,
+                 "kind": kind,
+                 "name": name,
+                 "exported": is_exported,
+-                "signature": match_line[:220],
++                "signature": sig_line[:220],
+             })
++            if is_exported and name not in exports:
++                exports.append(name)
++        for attr_m in re.finditer(r"#\[([A-Za-z_][\w:]*)", stripped):
++            attr_name = attr_m.group(1)
++            if attr_name not in decorators:
++                decorators.append(attr_name)
++    elif lang == "kotlin":
++        clean = kotlin_strip_comments_and_strings(content)
++        clean_lines = clean.split("\n")
++        line_starts = [0]
++        for ln in clean_lines[:-1]:
++            line_starts.append(line_starts[-1] + len(ln) + 1)
++        pkg = kotlin_package_of(content)
++        pkg_root = ".".join(pkg.split(".")[:2]) if pkg else ""
++        for imp in parse_kotlin_imports(content):
++            raw = imp.get("raw_import", "")
++            if raw:
++                imports.append(raw)
++                if pkg_root and raw.startswith(pkg_root + "."):
++                    internal_imports.append(raw)
++                else:
++                    external_imports.append(raw)
++        for match in _KOTLIN_SAME_PKG_DECL_REGEX.finditer(clean):
++            mods = set((match.group("mods") or "").split())
++            kw = match.group("kw")
++            kind = "function" if kw == "fun" else ("const" if kw in ("val", "var") else kw)
++            name = match.group("name")
++            line_no = bisect.bisect_right(line_starts, match.start())
++            sig_line = lines[line_no - 1].strip() if 1 <= line_no <= len(lines) else ""
++            is_exported = "private" not in mods
++            declarations.append({
++                "line": line_no,
++                "kind": kind,
++                "name": name,
++                "exported": is_exported,
++                "signature": sig_line[:220],
++            })
++            if is_exported and name not in exports:
++                exports.append(name)
++        for dec_m in _DECORATOR_RE.finditer(_strip_comments(content)):
++            dec_name = dec_m.group(1)
++            if dec_name not in decorators:
++                decorators.append(dec_name)
++    else:
++        stripped = _strip_comments(content)
++        stripped_lines = stripped.split("\n")
++        line_starts = [0]
++        for ln in stripped_lines[:-1]:
++            line_starts.append(line_starts[-1] + len(ln) + 1)
++        n_stripped_lines = len(stripped_lines)
++
++        for match in _IMPORT_RE.finditer(stripped):
++            import_path = match.group(2)
++            if import_path:
++                imports.append(import_path)
++                if import_path.startswith("."):
++                    internal_imports.append(import_path)
++                else:
++                    external_imports.append(import_path)
++
++        decl_patterns = [
++            ("interface", _EXPORT_INTERFACE_RE),
++            ("type", _EXPORT_TYPE_RE),
++            ("class", _EXPORT_CLASS_RE),
++            ("function", _EXPORT_FUNCTION_RE),
++            ("const", _EXPORT_CONST_RE),
++            ("enum", _EXPORT_ENUM_RE),
++        ]
+ 
+-    # Extract decorators
+-    decorators: List[str] = []
+-    for match in _DECORATOR_RE.finditer(stripped):
+-        dec_name = match.group(1)
+-        if dec_name not in decorators:
+-            decorators.append(dec_name)
+-
+-    # Extract named exports
+-    exports: List[str] = []
+-    for decl in declarations:
+-        if decl["exported"] and decl["name"] not in exports:
+-            exports.append(decl["name"])
+-
+-    # Check export default
+-    if _EXPORT_DEFAULT_RE.search(stripped):
+-        if "default" not in exports:
+-            exports.append("default")
+-
+-    # Check export { ... }
+-    for match in _EXPORT_NAMED_RE.finditer(stripped):
+-        for item in match.group(1).split(","):
+-            item = item.strip()
+-            if " as " in item:
+-                item = item.split(" as ")[-1].strip()
+-            if item and item not in exports:
+-                exports.append(item)
++        for kind, pattern in decl_patterns:
++            for match in pattern.finditer(stripped):
++                name = match.group(1)
++                line_no = bisect.bisect_right(line_starts, match.start())
++                match_line = stripped_lines[line_no - 1].strip() if line_no <= n_stripped_lines else ""
++                is_exported = match_line.startswith("export")
++
++                declarations.append({
++                    "line": line_no,
++                    "kind": kind,
++                    "name": name,
++                    "exported": is_exported,
++                    "signature": match_line[:220],
++                })
++
++        for match in _DECORATOR_RE.finditer(stripped):
++            dec_name = match.group(1)
++            if dec_name not in decorators:
++                decorators.append(dec_name)
++
++        for decl in declarations:
++            if decl["exported"] and decl["name"] not in exports:
++                exports.append(decl["name"])
++
++        if _EXPORT_DEFAULT_RE.search(stripped):
++            if "default" not in exports:
++                exports.append("default")
++
++        for match in _EXPORT_NAMED_RE.finditer(stripped):
++            for item in match.group(1).split(","):
++                item = item.strip()
++                if " as " in item:
++                    item = item.split(" as ")[-1].strip()
++                if item and item not in exports:
++                    exports.append(item)
+ 
+     declarations.sort(key=lambda d: d["line"])
+ 
+--- a/core/adaptive_work.py
++++ b/core/adaptive_work.py
+@@ -88,10 +88,7 @@
+         "topo.risk",
+         "topo.circular",
+         "topo.test_reachability",
+-        "perf.async",
+-        "perf.deopt",
+-        "perf.gc",
+-        "perf.cache",
++        "hott.sheaf",
+     ),
+     "architecture": (
+         "topo.orphan",
+--- a/core/analyzer_registry.py
++++ b/core/analyzer_registry.py
+@@ -183,6 +183,15 @@
+     return [k for k, v in ANALYZER_REGISTRY.items() if v.get("available", True)]
+ 
+ 
++def get_structural_analyzers() -> List[str]:
++    """Return objective structural/topological analyzers (excludes opt-in perf.* coding heuristics)."""
++    return [
++        k
++        for k, v in ANALYZER_REGISTRY.items()
++        if v.get("available", True) and v.get("category") != "performance"
++    ]
++
++
+ def get_analyzer_engine_signature(
+     analyzer_names: Optional[List[str]] = None,
+ ) -> str:
+--- a/core/context_optimizer.py
++++ b/core/context_optimizer.py
+@@ -163,14 +163,32 @@
+     )
+ 
+ 
+-def _resolve_target(target: str, vertices: Set[str]) -> Tuple[Optional[str], List[str]]:
++def _resolve_target(
++    target: str,
++    vertices: Set[str],
++    scan_root: Optional[str] = None,
++) -> Tuple[Optional[str], List[str]]:
+     normalized = _normalize_path(target)
+     if normalized in vertices:
+         return normalized, []
++    if scan_root and not os.path.isabs(normalized):
++        rooted = _normalize_path(os.path.join(str(scan_root), normalized))
++        if rooted in vertices:
++            return rooted, []
+     suffix = f"/{normalized}"
+     matches = sorted(path for path in vertices if path.endswith(suffix))
+     if len(matches) == 1:
+         return matches[0], []
++    if not matches and not os.path.isabs(normalized) and os.path.splitext(os.path.basename(normalized))[1] == "":
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved, amb, _ = _resolve_query_target(normalized, vertices, scan_root=scan_root)
++            if resolved:
++                return resolved, []
++            if amb:
++                return None, amb
++        except Exception:
++            pass
+     return None, matches
+ 
+ 
+@@ -671,10 +689,11 @@
+             from analyzer_registry import run_analyzers
+         analyzer_output = run_analyzers(shared_graph)
+ 
++    scan_root = shared_graph.get("scan_root")
+     resolved_targets: List[str] = []
+     unresolved_targets: List[Dict[str, Any]] = []
+     for requested in requested_targets:
+-        resolved, ambiguous = _resolve_target(requested, vertex_set)
++        resolved, ambiguous = _resolve_target(requested, vertex_set, scan_root=scan_root)
+         if resolved:
+             resolved_targets.append(resolved)
+         else:
+@@ -690,12 +709,12 @@
+     resolved_user_targets: Set[str] = set()
+     role_user_targets = requested_targets if user_target_files is None else user_target_files
+     for requested in (role_user_targets or []):
+-        resolved, _ = _resolve_target(requested, vertex_set)
++        resolved, _ = _resolve_target(requested, vertex_set, scan_root=scan_root)
+         if resolved:
+             resolved_user_targets.add(resolved)
+     resolved_due_sources: Set[str] = set()
+     for requested in (due_source_files or []):
+-        resolved, _ = _resolve_target(requested, vertex_set)
++        resolved, _ = _resolve_target(requested, vertex_set, scan_root=scan_root)
+         if resolved:
+             resolved_due_sources.add(resolved)
+ 
+@@ -994,28 +1013,43 @@
+         "RECOVER=plw brief|impact|context --target; "
+         "omission_is_not_irrelevance.\n"
+     )
++    def _estimate_tokens(block_text: str, cards: List[str]) -> int:
++        if not block_text:
++            return 0
++        c_chars = sum(
++            len(line)
++            for card in cards
++            for line in card.splitlines()
++            if line.startswith("  L")
++        )
++        n_chars = max(0, len(block_text) - c_chars)
++        return math.ceil((c_chars / CHARS_PER_TOKEN_CODE) + (n_chars / CHARS_PER_TOKEN_NARRATIVE))
++
++    def _over_budget(block_text: str, cards: List[str]) -> bool:
++        return len(block_text) > char_budget or _estimate_tokens(block_text, cards) > budget_tokens
++
+     context_block = "\n".join(parts) + footer
+     # All renderers are budget-aware and `footer_reserve` is larger than the
+     # footer above. Do not hide an invariant failure with character slicing.
+-    if len(context_block) > char_budget:
++    if _over_budget(context_block, rendered_cards):
+         # Prefer dropping advisory/non-source blocks as whole units. Current
+         # source evidence is the grounding floor and is never character-cut.
+         if kan_block and kan_block in parts:
+             parts.remove(kan_block)
+             kan_block = ""
+         context_block = "\n".join(parts) + footer
+-    if len(context_block) > char_budget and workflow_block and workflow_block in parts:
++    if _over_budget(context_block, rendered_cards) and workflow_block and workflow_block in parts:
+         parts.remove(workflow_block)
+         workflow_block = ""
+         if workflow_info:
+             workflow_info.update({"included": False, "reason": "budget_omitted"})
+         context_block = "\n".join(parts) + footer
+-    if len(context_block) > char_budget and memory_block and memory_block in parts:
++    if _over_budget(context_block, rendered_cards) and memory_block and memory_block in parts:
+         parts.remove(memory_block)
+         memory_block = ""
+         included_memories = []
+         context_block = "\n".join(parts) + footer
+-    while len(context_block) > char_budget and len(rendered_cards) > 1:
++    while _over_budget(context_block, rendered_cards) and len(rendered_cards) > 1:
+         dropped = rendered_cards.pop()
+         if dropped in parts:
+             parts.remove(dropped)
+@@ -1257,7 +1291,7 @@
+         metadata={
+             "decision_type": "budgeted_context_projection",
+             "evidence_debt_present": any(int(v or 0) > 0 for v in evidence_debt.values()),
+-            "within_budget": used_chars <= char_budget,
++            "within_budget": used_chars <= char_budget and estimated_tokens <= budget_tokens,
+             "estimated_tokens": int(estimated_tokens),
+             "requested_budget_tokens": int(budget_tokens),
+         },
+@@ -1321,7 +1355,7 @@
+             "narrative_chars": narrative_chars,
+             "estimated_tokens": estimated_tokens,
+             "utilization": round(used_chars / char_budget, 4) if char_budget else 0.0,
+-            "within_budget": used_chars <= char_budget,
++            "within_budget": used_chars <= char_budget and estimated_tokens <= budget_tokens,
+             "token_count_is_estimate": True,
+             "adaptive_token_estimation": True,
+             "allocation": {
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -69,6 +69,18 @@
+         ["runtime behavior", "semantic ownership", "correctness", "postcondition", "truth"],
+         "skills/target-codebase-topology-workflow.md",
+     ),
++    "cycle-break": _contract(
++        "Prescriptive Cycle-Break Advisory & Feedback Arc Set Cut Plan",
++        ["circular dependency detection", "strongly connected components", "feedback arc set", "cycle-breaking cut plan"],
++        ["dependency cycle analyzer", "import cycle breaker", "SCC cut planner"],
++        ["runtime call trace", "automatic refactoring", "source mutation", "execution authority"],
++        "A repository or target module contains circular dependencies and the engineer needs minimal structural cut points to break cycles safely.",
++        "Detected strongly connected components / import cycles, ranked Feedback Arc Set edge cuts, and prescriptive refactoring options without mutating source files.",
++        ["detected import cycles", "strongly connected components", "ranked cut edges", "refactoring options"],
++        ["CYCLES_FOUND", "ACYCLIC", "TARGET_NOT_FOUND"],
++        ["runtime behavior", "behavioral equivalence", "source correctness", "postcondition", "truth"],
++        "skills/target-codebase-topology-workflow.md",
++    ),
+     "resolve-target": _contract(
+         "Target Resolution and Structural Relevance",
+         ["entity resolution", "information retrieval", "dependency graph neighborhood", "reverse dependency reachability", "test/entrypoint reachability"],
+@@ -878,6 +890,8 @@
+     ("skills/scenario-validation-planning-workflow.md", "validation-plan", ("validation scenario", "scenario plan", "targeted validation")),
+     ("skills/geometric-impact-projection-workflow.md", "geometric-impact", ("overlap", "containment", "alignment", "layout bug", "visual bug", "geometric impact", "geometry constraint")),
+     ("skills/geometry-correspondence-workflow.md", "ui-reference", ("ui code", "ui↔code", "ui-code", "geometry snapshot", "rendered geometry", "correspondence")),
++    ("skills/target-codebase-topology-workflow.md", "cycle-break", ("circular dependency", "circular dependencies", "dependency cycle", "cycle break", "break cycle", "feedback arc", "siklus dependensi")),
++    ("skills/target-codebase-topology-workflow.md", "mermaid", ("architecture diagram", "mermaid", "dependency diagram", "visualize graph", "diagram arsitektur")),
+     ("skills/angular-semantic-ownership-workflow.md", "angular-anchors", ("angular selector", "template binding", "component owner", "angular ownership")),
+     ("skills/external-corpus-audit-workflow.md", "work", ("external repository", "external repo", "corpus audit")),
+     ("skills/code-change-and-session-workflow.md", "impact", ("refactor", "change impact", "edit", "modify", "patch", "perbaiki", "ubah")),
+@@ -913,6 +927,7 @@
+     "codebase-topology": "topology",
+     "command-telemetry": "output-telemetry",
+     "context-accountability": "accountability",
++    "cycle-breaker": "cycle-break",
+     "decision-lineage": "lineage",
+     "delayed-cost": "reconcile-outcomes",
+     "diagram": "mermaid",
+@@ -972,6 +987,7 @@
+     "ast": "plw ast --help",
+     "capability": "plw capability --help",
+     "doctor": "plw doctor --help",
++    "plw": "plw --help",
+     "skill": "plw skill --help",
+     "ui": "plw ui --help",
+ }
+@@ -1005,6 +1021,22 @@
+                     "not a registered capability; "
+                     f"see {help_cmd}."
+                 )
++            else:
++                head_tok = name.replace("-", " ").split()[0] if name.strip() else ""
++                if head_tok and head_tok in ALIAS_TO_CANONICAL:
++                    canon = ALIAS_TO_CANONICAL[head_tok]
++                    result["alias_of"] = canon
++                    result["hint"] = (
++                        f"{name} routes through {canon} (alias of {head_tok}); "
++                        "describe the canonical name."
++                    )
++                elif head_tok and head_tok in FIRST_CONTACT_HELP:
++                    help_cmd = FIRST_CONTACT_HELP[head_tok]
++                    result["hint"] = (
++                        f"{name} is a subcommand of first-contact command '{head_tok}', "
++                        "not a registered capability; "
++                        f"see {help_cmd}."
++                    )
+         return result
+     return {
+         "schema_version": SCHEMA_VERSION,
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -241,7 +241,7 @@
+ ]
+ 
+ TEST_FILE_REGEX = re.compile(
+-    r"\.(spec|test)\.(ts|tsx|js|jsx)$"
++    r"\.(spec|test)\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$"
+ )
+ 
+ INTERFACE_REGEX = re.compile(
+@@ -256,17 +256,21 @@
+ 
+ 
+ def _is_test_file(file_path: str) -> bool:
+-    # K6: Kotlin tests are `*Test.kt`, or live under a `src/test` source set.
+-    # Takes the full path now (was basename-only); TEST_FILE_REGEX still
+-    # anchors at the end, so passing a full path is safe for TS/JS too.
++    # K6/R1: Recognize JS/TS (`*.spec.*`/`*.test.*`), Kotlin (`*Test.kt`,
++    # `*Tests.kt`, `*Spec.kt`, `src/test/`, `src/androidTest/`), Rust
++    # (`tests/`, `*_test.rs`), and Python (`test_*.py`, `*_test.py`).
+     if TEST_FILE_REGEX.search(file_path):
+         return True
+-    if os.path.basename(file_path).endswith("Test.kt"):
++    base = os.path.basename(file_path)
++    if base.endswith(("Test.kt", "Tests.kt", "Spec.kt", "_test.rs")):
+         return True
+-    if "/src/test/" in file_path.replace("\\", "/"):
++    if base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py")):
++        return True
++    norm = "/" + file_path.replace("\\", "/").lstrip("/")
++    if "/src/test/" in norm or "/src/androidTest/" in norm:
+         return True
+     # R1: Rust integration tests live under a `tests/` directory.
+-    return "/tests/" in file_path.replace("\\", "/")
++    return "/tests/" in norm or "/__tests__/" in norm
+ 
+ 
+ def _read_file(path: str) -> Optional[str]:
+--- a/core/target_resolution.py
++++ b/core/target_resolution.py
+@@ -45,6 +45,14 @@
+     return value[len(prefix):] if root and value.startswith(prefix) else value
+ 
+ 
++def _split_camel_parts(token: str) -> List[str]:
++    if not any(ch.isupper() for ch in token) or not any(ch.islower() for ch in token):
++        return []
++    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", token)
++    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
++    return [part.lower() for part in spaced.split() if len(part) >= 3]
++
++
+ def _task_terms(task: str) -> Tuple[List[str], List[str]]:
+     raw = [_norm(token).lower() for token in _TOKEN_RE.findall(task)]
+     path_hints = [token for token in raw if "/" in token or "." in os.path.basename(token)]
+@@ -59,6 +67,9 @@
+         lowered = token.lower()
+         if lowered not in _STOP and len(lowered) >= 3 and lowered not in identifiers:
+             identifiers.append(lowered)
++        for camel_part in _split_camel_parts(token):
++            if camel_part not in _STOP and camel_part not in terms:
++                terms.append(camel_part)
+     return terms[:24], path_hints[:8] + [x for x in identifiers[:12] if x not in path_hints]
+ 
+ 
+@@ -102,6 +113,34 @@
+             return matches[0], [], "unique_suffix"
+         if len(matches) > 1:
+             return None, matches, "ambiguous"
++        if os.path.splitext(os.path.basename(requested))[1] == "":
++            if "/" in requested:
++                stem_matches = sorted(
++                    original for normed, original in vertex_norm.items()
++                    if os.path.splitext(normed)[0].endswith(suffix)
++                )
++            elif len(requested) >= 2:
++                req_l = requested.lower()
++                req_collapsed = re.sub(r"[._-]+", "", req_l)
++                exact_stem = sorted(
++                    original for normed, original in vertex_norm.items()
++                    if os.path.splitext(os.path.basename(normed))[0].lower() == req_l
++                )
++                if exact_stem:
++                    stem_matches = exact_stem
++                elif len(req_collapsed) >= 4:
++                    stem_matches = sorted(
++                        original for normed, original in vertex_norm.items()
++                        if re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(normed))[0].lower()) == req_collapsed
++                    )
++                else:
++                    stem_matches = []
++            else:
++                stem_matches = []
++            if len(stem_matches) == 1:
++                return stem_matches[0], [], "unique_stem"
++            if len(stem_matches) > 1:
++                return None, stem_matches, "ambiguous"
+     return None, [], "unresolved"
+ 
+ 
+@@ -232,6 +271,7 @@
+         if vertex in resolved_explicit:
+             seed_score += 100
+             evidence.append({"kind": "explicit_target", "weight": 100})
++        stem_collapsed = re.sub(r"[._-]+", "", stem)
+         for hint in hints:
+             h = hint.lower().replace("\\", "/")
+             if h == display_lower or display_lower.endswith("/" + h):
+@@ -242,8 +282,12 @@
+                 seed_score += 24
+                 evidence.append({"kind": "task_basename_match", "value": hint, "weight": 24})
+                 break
++            if "/" not in h and "." not in h and len(h) >= 4 and ("." in stem or "_" in stem or "-" in stem) and stem_collapsed == re.sub(r"[._-]+", "", h):
++                seed_score += 24
++                evidence.append({"kind": "task_basename_match", "value": hint, "weight": 24})
++                break
+ 
+-        stem_tokens = {part for part in re.split(r"[_-]+", stem) if len(part) >= 3}
++        stem_tokens = {part for part in re.split(r"[._-]+", stem) if len(part) >= 3}
+         stem_overlap = sorted(stem_tokens & set(terms))
+         if stem_overlap:
+             weight = min(18, 9 * len(stem_overlap))
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -46,7 +46,7 @@
+ import re
+ import tempfile
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+ 
+ from core.codesearch_engine import (
+     AUTHORITY_NOTE,
+@@ -370,6 +370,7 @@
+     internal_defined: Set[str],
+     import_counts: Dict[str, int],
+     type_shape_names: Set[str],
++    seed_terms: Sequence[str] = (),
+ ) -> int:
+     score = 0
+     if symbol in engine_defined or symbol in scoped_defined:
+@@ -383,6 +384,12 @@
+         score += 2
+     if len(symbol) <= 3 and symbol.islower():
+         score -= 2
++    if seed_terms:
++        sym_l = symbol.lower()
++        if sym_l in seed_terms:
++            score += 24
++        elif any(len(term) >= 4 and term in sym_l for term in seed_terms):
++            score += 12
+     return score
+ 
+ 
+@@ -400,6 +407,7 @@
+     effective_max_symbols: Optional[int],
+     full_engine: bool,
+     full_engine_edges: bool,
++    seed_terms: Sequence[str] = (),
+ ) -> str:
+     graph_sig = ""
+     if graph is not None:
+@@ -431,6 +439,7 @@
+         "full_engine": bool(full_engine),
+         "full_engine_edges": bool(full_engine_edges),
+         "noise_cap": HIGH_CALLER_NOISE_CAP,
++        **({"seed_terms": list(seed_terms)} if seed_terms else {}),
+     }
+     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     return hashlib.sha256(encoded).hexdigest()[:24]
+@@ -498,6 +507,7 @@
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
+     cache_mode: str = "auto",
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     """Build the engine symbol layer for a target root. Never raises.
+ 
+@@ -519,6 +529,7 @@
+             max_symbols=max_symbols, timeout_s=timeout_s, binary=binary,
+             full_engine=full_engine, full_engine_edges=full_engine_edges,
+             cache_mode=cache_mode,
++            seed_terms=seed_terms,
+         )
+     except Exception as exc:  # never break topology for the engine layer
+         layer = unavailable_layer(
+@@ -540,6 +551,7 @@
+     full_engine: bool,
+     full_engine_edges: bool,
+     cache_mode: str,
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     root_path = Path(root)
+     root_abs = _normalize_path(os.path.abspath(root))
+@@ -591,6 +603,9 @@
+ 
+     cache_mode_norm = str(cache_mode or "auto").strip().lower()
+     cache_key: Optional[str] = None
++    seed_terms_norm = sorted({
++        str(t).strip().lower() for t in (seed_terms or ()) if len(str(t).strip()) >= 3
++    })
+     if cache_mode_norm in ("auto", "refresh"):
+         cache_key = _engine_cache_key(
+             root_abs=root_abs,
+@@ -601,6 +616,7 @@
+             effective_max_symbols=effective_max_symbols,
+             full_engine=full_engine,
+             full_engine_edges=full_engine_edges,
++            seed_terms=seed_terms_norm,
+         )
+         if cache_mode_norm == "auto":
+             cached = _load_engine_cache(cache_key, engine_block)
+@@ -664,6 +680,7 @@
+                     internal_defined=internal_defined,
+                     import_counts=import_counts,
+                     type_shape_names=type_shape_names,
++                    seed_terms=seed_terms_norm,
+                 ),
+                 sym,
+             ),
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -16,7 +16,7 @@
+ import json
+ import hashlib
+ import datetime
+-from typing import Any, Callable, Dict, List, Optional
++from typing import Any, Callable, Dict, List, Optional, Sequence
+ 
+ # Import kernel components
+ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+@@ -56,11 +56,19 @@
+     GRAPH_CACHE_AVAILABLE = False
+ 
+ try:
+-    from core.analyzer_registry import run_analyzers, get_available_analyzers
++    from core.analyzer_registry import (
++        run_analyzers,
++        get_available_analyzers,
++        get_structural_analyzers,
++    )
+     REGISTRY_AVAILABLE = True
+ except ImportError:
+     try:
+-        from analyzer_registry import run_analyzers, get_available_analyzers
++        from analyzer_registry import (
++            run_analyzers,
++            get_available_analyzers,
++            get_structural_analyzers,
++        )
+         REGISTRY_AVAILABLE = True
+     except ImportError:
+         REGISTRY_AVAILABLE = False
+@@ -444,7 +452,8 @@
+     "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+     "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+     "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
+-    "memory": "python3 hott_kernel.py memory <submode> ...",
++    "cycle_break": "python3 hott_kernel.py cycle-break [root] [--root DIR] [--target FILE] [--output full|summary]",
++    "memory": "python3 hott_kernel.py memory <status|stats|list|search|recall|store|get|associate|consolidate|compact|drift|establish|analyze|steer|bridge|bridge-candidates|bridge-auto|kan> [args]",
+     "fiber": "python3 hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]",
+ }
+ PUBLIC_KERNEL_MODES = (
+@@ -654,6 +663,7 @@
+     max_symbols: Optional[int] = None,
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
++    seed_terms: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     """Best-effort engine symbol layer for topology/impact. Never raises.
+ 
+@@ -677,6 +687,7 @@
+             full_engine=full_engine,
+             full_engine_edges=full_engine_edges,
+             cache_mode=_ACTIVE_GRAPH_CACHE_MODE,
++            seed_terms=seed_terms,
+         )
+     except Exception as exc:
+         return _topology_engine_unavailable(
+@@ -1805,7 +1816,8 @@
+     if root_error:
+         return root_error
+     graph = _build_kernel_graph(scan_root)
+-    analyzer_output = _run_kernel_analyzers(graph)
++    structural = get_structural_analyzers() if REGISTRY_AVAILABLE else None
++    analyzer_output = _run_kernel_analyzers(graph, structural)
+     result = cross_domain_steer(
+         scan_root,
+         shared_graph=graph,
+@@ -1991,6 +2003,7 @@
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
+     cache_mode: Optional[str] = None,
++    include_engine: bool = True,
+ ) -> Dict[str, Any]:
+     """Bounded first-contact topology orientation for an unfamiliar target repo."""
+     if not SHARED_GRAPH_AVAILABLE or not TARGET_TOPOLOGY_AVAILABLE:
+@@ -2009,11 +2022,15 @@
+         if cache_err:
+             return cache_err
+     graph = _build_kernel_graph(scan_root)
+-    engine_layer = _build_topology_engine_layer(
+-        scan_root,
+-        graph,
+-        full_engine=full_engine,
+-        full_engine_edges=full_engine_edges,
++    engine_layer = (
++        _build_topology_engine_layer(
++            scan_root,
++            graph,
++            full_engine=full_engine,
++            full_engine_edges=full_engine_edges,
++        )
++        if include_engine
++        else None
+     )
+     try:
+         orientation = build_target_topology_orientation(
+@@ -2184,13 +2201,17 @@
+ 
+ 
+ _CHECK_FINDINGS_LIMIT = 100
++_CHECK_COMPACT_FINDINGS_LIMIT = 10
++_CHECK_LIMIT_AUTO = object()
+ 
+ 
+ def kernel_analyze(
+     scan_root: str = ".",
+     analyzer_names: Optional[List[str]] = None,
+     output_mode: str = "full",
+-    findings_limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
++    findings_limit: Any = _CHECK_LIMIT_AUTO,
++    compact: bool = False,
++    include_perf: bool = False,
+ ) -> Dict[str, Any]:
+     """
+     Orkestrasi penuh: build SharedGraph + run analyzers + synthesize.
+@@ -2228,9 +2249,12 @@
+             "shared_graph": graph_output,
+         }
+ 
+-    # Step 2: Run analyzers
++    # Step 2: Run analyzers (structural topo.* + hott.* by default; perf.* is opt-in)
+     if REGISTRY_AVAILABLE:
+-        analyzer_output = _run_kernel_analyzers(shared_graph, analyzer_names)
++        effective_analyzers = analyzer_names
++        if effective_analyzers is None and not include_perf:
++            effective_analyzers = get_structural_analyzers()
++        analyzer_output = _run_kernel_analyzers(shared_graph, effective_analyzers)
+     else:
+         analyzer_output = {"results": {}, "errors": {}, "analyzers_run": 0}
+ 
+@@ -2256,24 +2280,62 @@
+         ),
+     }
+ 
+-    base = {
++    if findings_limit is _CHECK_LIMIT_AUTO:
++        effective_limit: Optional[int] = (
++            _CHECK_COMPACT_FINDINGS_LIMIT if compact else _CHECK_FINDINGS_LIMIT
++        )
++    else:
++        effective_limit = findings_limit
++
++    raw_graph_cache = shared_graph.get("cache", {}) or {}
++    raw_analyzer_cache = analyzer_output.get("cache", {}) or {}
++    if compact:
++        graph_cache = {
++            k: raw_graph_cache[k]
++            for k in ("mode", "status", "cache_key", "graph_content_signature")
++            if k in raw_graph_cache
++        }
++        analyzer_cache = {
++            k: raw_analyzer_cache[k]
++            for k in ("status", "cache_key", "source_cache_key", "cache_path")
++            if k in raw_analyzer_cache
++        }
++    else:
++        graph_cache = raw_graph_cache
++        analyzer_cache = raw_analyzer_cache
++
++    base: Dict[str, Any] = {
+         "schema_version": "3.0.0-kernel",
+         "mode": "analyze",
+         "output_mode": output_mode,
+         "scan_root": scan_root,
+         "timestamp": _utc_timestamp(),
+-        "graph_cache": shared_graph.get("cache", {}),
+-        "analyzer_cache": analyzer_output.get("cache", {}),
++        "graph_cache": graph_cache,
++        "analyzer_cache": analyzer_cache,
+     }
++    if compact:
++        base["compact"] = True
+ 
+     # Step 4: Filter output berdasarkan mode
+     if output_mode == "summary":
+         base["unified_summary"] = unified_summary
+         top_findings, findings_truncated = _top_check_findings(
+-            analyzer_output, limit=findings_limit
++            analyzer_output, limit=effective_limit, compact=compact
+         )
+         base["findings"] = top_findings
+         base["findings_truncated"] = findings_truncated
++        if compact:
++            base["detail_contract"] = {
++                "compact": True,
++                "findings_limit": effective_limit,
++                "cycle_basis_cap": 2,
++                "omitted_cache_fields": [
++                    "graph_cache.stat_trust_boundary",
++                    "graph_cache.cache_path",
++                    "analyzer_cache.analyzers_*",
++                ],
++                "full_output_hint": "omit --compact (or inspect analyzer_cache.cache_path) to retrieve full check envelope",
++            }
+         return base
+ 
+     elif output_mode == "findings":
+@@ -2303,6 +2365,7 @@
+ def _top_check_findings(
+     analyzer_output: Dict[str, Any],
+     limit: Optional[int] = _CHECK_FINDINGS_LIMIT,
++    compact: bool = False,
+ ) -> tuple:
+     """Flatten actionable findings for the `plw check --json` envelope.
+ 
+@@ -2343,6 +2406,28 @@
+                 continue
+             item = dict(finding)
+             item.setdefault("analyzer", name)
++            raw_basis = item.get("cycle_basis")
++            if isinstance(raw_basis, list):
++                basis_cap = 2 if compact else 5
++                compacted_basis = []
++                for entry in raw_basis[:basis_cap]:
++                    if isinstance(entry, dict) and (
++                        "witness_edges" in entry or "vertices" in entry
++                    ):
++                        compacted = {
++                            k: v
++                            for k, v in entry.items()
++                            if k not in ("witness_edges", "vertices")
++                        }
++                        if isinstance(entry.get("witness_edges"), list):
++                            compacted["witness_edge_count"] = len(entry["witness_edges"])
++                        compacted_basis.append(compacted)
++                    else:
++                        compacted_basis.append(entry)
++                item["cycle_basis"] = compacted_basis
++                if len(raw_basis) > basis_cap:
++                    item["cycle_basis_omitted_count"] = len(raw_basis) - basis_cap
++                    item["cycle_basis_truncated"] = True
+             items.append(item)
+         if items:
+             items.sort(key=_order)
+@@ -2386,11 +2471,13 @@
+     result = query_impact(graph, target_file)
+ 
+     if output_mode == "summary":
+-        return {
++        summary_payload: Dict[str, Any] = {
+             "schema_version": "3.0.0-kernel",
+             "mode": "impact",
+             "graph_cache": graph.get("cache", {}),
+             "target": result.get("target"),
++            "requested_target": result.get("requested_target", target_file),
++            "target_resolution": result.get("target_resolution"),
+             "exists": result.get("exists"),
+             "change_risk_level": result.get("change_risk_level"),
+             "affected_entrypoints": result.get("affected_entrypoints", []),
+@@ -2398,6 +2485,11 @@
+             "upstream_count": result.get("upstream_count", 0),
+             "target_fan_in": result.get("target_fan_in", 0),
+         }
++        if result.get("candidate_targets"):
++            summary_payload["candidate_targets"] = result.get("candidate_targets", [])
++        if "error" in result:
++            summary_payload["error"] = result["error"]
++        return summary_payload
+ 
+     engine_target = (
+         str(result.get("target"))
+@@ -2460,11 +2552,13 @@
+     if output_mode == "summary":
+         impact_data = result.get("impact", {})
+         outline_data = result.get("outline", {})
+-        return {
++        summary_payload: Dict[str, Any] = {
+             "schema_version": "3.0.0-kernel",
+             "mode": "brief",
+             "graph_cache": graph.get("cache", {}),
+             "file": result.get("file"),
++            "requested_target": result.get("requested_target", target_file),
++            "target_resolution": result.get("target_resolution"),
+             "exists": result.get("exists"),
+             "export_count": outline_data.get("stats", {}).get("export_count", 0),
+             "import_count": outline_data.get("stats", {}).get("import_count", 0),
+@@ -2472,6 +2566,11 @@
+             "affected_entrypoints": impact_data.get("affected_entrypoints", []),
+             "downstream_count": impact_data.get("downstream_count", 0),
+         }
++        if result.get("candidate_targets"):
++            summary_payload["candidate_targets"] = result.get("candidate_targets", [])
++        if "error" in result:
++            summary_payload["error"] = result["error"]
++        return summary_payload
+ 
+     return {
+         "schema_version": "3.0.0-kernel",
+@@ -2504,18 +2603,32 @@
+     plan = advisor_result.get("summary", {})
+     advisories = advisor_result.get("advisories", [])
+ 
++    target_norm: Optional[str] = None
+     if target_file:
+         target_norm = os.path.normpath(target_file).replace("\\", "/")
+         if target_norm.startswith("./"):
+             target_norm = target_norm[2:]
++        resolved_cb_target: Optional[str] = None
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved_cb_target, _, _ = _resolve_query_target(
++                target_norm,
++                set(graph.get("vertices", [])),
++                scan_root=scan_root,
++            )
++        except Exception:
++            resolved_cb_target = None
++        match_tokens = [target_norm]
++        if resolved_cb_target and resolved_cb_target not in match_tokens:
++            match_tokens.append(resolved_cb_target)
+         # Filter advisories and cuts affecting target_file
+         advisories = [
+             adv for adv in advisories
+-            if any(target_norm in node for node in adv.get("cycle", []))
++            if any(any(tok in node for tok in match_tokens) for node in adv.get("cycle", []))
+         ]
+         recommended_cuts = [
+             cut for cut in plan.get("recommended_cuts", [])
+-            if target_norm in cut.get("source", "") or target_norm in cut.get("target", "")
++            if any(tok in cut.get("source", "") or tok in cut.get("target", "") for tok in match_tokens)
+         ]
+         plan = {
+             **plan,
+@@ -2527,15 +2640,18 @@
+         }
+ 
+     if output_mode == "summary":
+-        return {
++        out: Dict[str, Any] = {
+             "schema_version": CODEBASE_SCHEMA_VERSION,
+             "mode": "cycle_break",
+             "scan_root": scan_root,
+             "graph_cache": graph.get("cache", {}),
+             "summary": plan,
+         }
++        if target_norm is not None:
++            out["target"] = target_norm
++        return out
+ 
+-    return {
++    out = {
+         "schema_version": CODEBASE_SCHEMA_VERSION,
+         "mode": "cycle_break",
+         "scan_root": scan_root,
+@@ -2543,6 +2659,9 @@
+         "summary": plan,
+         "advisories": advisories,
+     }
++    if target_norm is not None:
++        out["target"] = target_norm
++    return out
+ 
+ 
+ def _memory_context_metadata(memory_context: Dict[str, Any]) -> Dict[str, Any]:
+@@ -3319,7 +3438,12 @@
+     }
+ 
+ 
+-def _engine_answer_summary(target_orientation: Dict[str, Any], terms: Any = None) -> Dict[str, Any]:
++def _engine_answer_summary(
++    target_orientation: Dict[str, Any],
++    terms: Any = None,
++    *,
++    target_resolved: bool = True,
++) -> Dict[str, Any]:
+     """Summarize engine-located symbols for the agent decision frame.
+ 
+     The topology target may stay unresolved (or ambiguous) while the
+@@ -3349,16 +3473,21 @@
+             return {}
+         terms_l = [str(t).lower() for t in (terms or []) if str(t).strip()]
+ 
+-        def _term_hits(name: str) -> int:
++        def _term_score(name: str) -> tuple:
+             lowered = (name or "").lower()
+-            return sum(1 for t in terms_l if t and t in lowered)
++            parts = lowered.split()
++            exact = sum(1 for t in terms_l if t and (lowered == t or t in parts))
++            long_hits = sum(1 for t in terms_l if len(t) >= 4 and t in lowered)
++            all_hits = sum(1 for t in terms_l if t and t in lowered)
++            best_len = max((len(t) for t in terms_l if t and t in lowered), default=0)
++            return (exact, long_hits, best_len, all_hits)
+ 
+         def _ranked(rows, key):
+             if not terms_l:
+                 return rows
+             scored = sorted(
+                 enumerate(rows),
+-                key=lambda pair: (-_term_hits(key(pair[1])), pair[0]),
++                key=lambda pair: (tuple(-v for v in _term_score(key(pair[1]))), pair[0]),
+             )
+             return [row for _, row in scored]
+ 
+@@ -3369,6 +3498,14 @@
+ 
+         nodes = _ranked(nodes, lambda n: str(n.get("symbol") or ""))
+         edges = _ranked(edges, _call_name)
++        if not target_resolved and terms_l:
++            has_match = any(
++                _term_score(str(n.get("symbol") or "")) > (0, 0, 0, 0) for n in nodes
++            ) or any(
++                _term_score(_call_name(e)) > (0, 0, 0, 0) for e in edges
++            )
++            if not has_match:
++                return {}
+         return {
+             "symbols": [
+                 {
+@@ -3564,12 +3701,18 @@
+         target_resolution=target_resolution,
+         full_engine=full_engine,
+     )
++    task_seed_block = (target_resolution or {}).get("task_seed") or {}
++    work_seed_terms = (
++        list(task_seed_block.get("terms") or [])
++        + list(task_seed_block.get("path_or_identifier_hints") or [])
++    ) if engine_targets is None else None
+     engine_layer = _build_topology_engine_layer(
+         scan_root,
+         graph,
+         target_files=engine_targets,
+         full_engine=full_engine,
+         full_engine_edges=full_engine_edges,
++        seed_terms=work_seed_terms,
+     )
+     target_orientation = (
+         build_target_topology_orientation(graph, top_n=8, include_edges=False, engine_layer=engine_layer)
+@@ -3618,15 +3761,52 @@
+             )
+             if SEMANTIC_AFFORDANCE_AVAILABLE else {}
+         )
++        blocked_readiness = {
++            "reference_pack": "BLOCKED",
++            "action": "NOT_READY",
++            "task_postcondition": "UNPROVEN",
++        }
++        blocked_authority = {
++            "execute_runtime": False,
++            "mutate_source": False,
++            "mutate_external_repository": False,
++            "commit_truth": False,
++        }
++        if frame_only:
++            handoff = dict(semantics.get("skill_handoff") or {})
++            handoff_frame = {k: v for k, v in handoff.items() if k != "inline_contract"}
++            res_block = target_resolution.get("resolution") or {}
++            target_res_frame = {
++                "schema_version": target_resolution.get("schema_version"),
++                "stage": target_resolution.get("stage"),
++                "resolution": {
++                    "state": res_block.get("state"),
++                    "selected_targets": list(res_block.get("selected_targets") or []),
++                    "reason": res_block.get("reason"),
++                },
++                "authority": target_resolution.get("authority", {}),
++            }
++            return {
++                **context,
++                "mode": "work",
++                "frame_only": True,
++                "work_status": "blocked",
++                "readiness": blocked_readiness,
++                "task": task,
++                "ui_source_handoff": ui_source_handoff,
++                "skill_handoff": handoff_frame,
++                "target_resolution": target_res_frame,
++                "detail_contract": {
++                    "level": "frame_only",
++                    "omitted": ["target_orientation", "evidence_need_derivation", "capability_selection"],
++                },
++                "authority": blocked_authority,
++            }
+         return {
+             **context,
+             "mode": "work",
+             "work_status": "blocked",
+-            "readiness": {
+-                "reference_pack": "BLOCKED",
+-                "action": "NOT_READY",
+-                "task_postcondition": "UNPROVEN",
+-            },
++            "readiness": blocked_readiness,
+             "task": task,
+             "target_orientation": target_orientation,
+             "ui_source_handoff": ui_source_handoff,
+@@ -3634,12 +3814,7 @@
+             "evidence_need_derivation": evidence_need_derivation,
+             "capability_selection": capability_selection,
+             **semantics,
+-            "authority": {
+-                "execute_runtime": False,
+-                "mutate_source": False,
+-                "mutate_external_repository": False,
+-                "commit_truth": False,
+-            },
++            "authority": blocked_authority,
+         }
+ 
+     requested_claims = list(
+@@ -3785,7 +3960,13 @@
+             skill_handoff=normalized_handoff,
+             engine_answer=_engine_answer_summary(
+                 target_orientation,
+-                terms=(target_resolution.get("task_seed") or {}).get("terms") or [],
++                terms=(
++                    list((target_resolution.get("task_seed") or {}).get("terms") or [])
++                    + list((target_resolution.get("task_seed") or {}).get("path_or_identifier_hints") or [])
++                ),
++                target_resolved=str(
++                    (target_resolution.get("resolution") or {}).get("state") or ""
++                ) in ("RESOLVED", "MULTI_TARGET_RESOLVED"),
+             ),
+         )
+     else:
+@@ -3812,6 +3993,12 @@
+             },
+             "authority": target_resolution.get("authority", {}),
+         }
++        ui_handoff_frame = dict(ui_source_handoff) if isinstance(ui_source_handoff, dict) else ui_source_handoff
++        if isinstance(ui_handoff_frame, dict) and isinstance(ui_handoff_frame.get("candidates"), list):
++            raw_ui_cands = ui_handoff_frame["candidates"]
++            if len(raw_ui_cands) > 2:
++                ui_handoff_frame["candidates"] = raw_ui_cands[:2]
++                ui_handoff_frame["candidates_omitted_in_frame"] = len(raw_ui_cands) - 2
+         return {
+             "schema_version": "4.2.0-agent-work",
+             "mode": "work",
+@@ -3826,7 +4013,7 @@
+             "task": task,
+             "scan_root": scan_root,
+             "agent_decision_frame": agent_decision_frame,
+-            "ui_source_handoff": ui_source_handoff,
++            "ui_source_handoff": ui_handoff_frame,
+             "skill_handoff": handoff_frame,
+             "target_resolution": target_res_frame,
+             "stop_reason": stop_reason,
+@@ -4404,6 +4591,7 @@
+     ui_selector: Optional[str] = None,
+     full_engine: bool = False,
+     full_engine_edges: bool = False,
++    frame_only: bool = False,
+ ) -> Dict[str, Any]:
+     """Execute the full task pipeline in-process with shared graph reuse and HMAC receipt chaining."""
+     root_error = _validate_scan_root(scan_root)
+@@ -4427,6 +4615,7 @@
+         ui_selector=ui_selector,
+         full_engine=full_engine,
+         full_engine_edges=full_engine_edges,
++        frame_only=frame_only,
+     )
+     if orient_raw.get("error"):
+         return orient_raw
+@@ -4533,6 +4722,105 @@
+         except Exception as exc:
+             cand_summary = {"error": f"candidate_provenance_failed:{type(exc).__name__}:{exc}"}
+ 
++    if frame_only:
++        tr = resolve_res.get("target_resolution") or {}
++        tr_res = tr.get("resolution") if isinstance(tr.get("resolution"), dict) else {}
++        compact_tr = {
++            "stage": tr.get("stage"),
++            "status": tr_res.get("state") or tr.get("status") or tr.get("stage"),
++            "reason": tr_res.get("reason") or tr.get("reason"),
++            "targets": list(tr_res.get("selected_targets") or tr.get("targets") or []),
++            "explicit_targets": list(tr_res.get("explicit_targets") or tr.get("explicit_targets") or []),
++            "resolution": {
++                "state": tr_res.get("state") or tr.get("status"),
++                "reason": tr_res.get("reason") or tr.get("reason"),
++                "selected_targets": list(tr_res.get("selected_targets") or tr.get("targets") or []),
++                "explicit_targets": list(tr_res.get("explicit_targets") or tr.get("explicit_targets") or []),
++            },
++        }
++        ev = evidence_res.get("evidence_need_derivation") or {}
++        ev_needed = [row for row in (ev.get("evidence_needed") or []) if isinstance(row, dict)]
++        compact_ev = {
++            "stage": ev.get("stage"),
++            "target_resolution_state": ev.get("target_resolution_state"),
++            "task_intent": ev.get("task_intent") or ev.get("stage"),
++            "required_evidence": ev.get("required_evidence") or [
++                row.get("evidence_class") or row.get("need")
++                for row in ev_needed
++                if row.get("evidence_class") or row.get("need")
++            ],
++            "missing_evidence": ev.get("missing_evidence") or [
++                row.get("need")
++                for row in ev_needed
++                if row.get("need")
++            ],
++            "evidence_needed": [
++                {
++                    "need": row.get("need"),
++                    "evidence_class": row.get("evidence_class"),
++                    "priority": row.get("priority"),
++                }
++                for row in ev_needed[:6]
++            ],
++        }
++        cs = cap_res.get("capability_selection") or {}
++        cand_caps = [row for row in (cs.get("candidate_capabilities") or []) if isinstance(row, dict)]
++        rec_caps = [
++            row.get("capability")
++            for row in cand_caps
++            if row.get("capability")
++        ]
++        cs_summary = cs.get("summary") if isinstance(cs.get("summary"), dict) else {}
++        compact_cs = {
++            "stage": cs.get("stage"),
++            "status": cs.get("status") or cs_summary.get("status") or cs.get("stage"),
++            "selected": cs.get("selected") if cs.get("selected") is not None else (rec_caps[0] if rec_caps else None),
++            "recommended_capabilities": cs.get("recommended_capabilities") or rec_caps,
++            "candidate_capabilities": [
++                {
++                    "capability": row.get("capability"),
++                    "covers_evidence_classes": row.get("covers_evidence_classes"),
++                    "aggregate_score": row.get("aggregate_score"),
++                }
++                for row in cand_caps[:6]
++            ],
++            "uncovered_needs": list(cs.get("uncovered_needs") or []),
++        }
++        return {
++            "schema_version": "plw-task-chain-v1",
++            "mode": "chain",
++            "frame_only": True,
++            "task": task,
++            "normalized_task": _normalize_receipt_task(task),
++            "scan_root": os.path.abspath(scan_root),
++            "graph_signature": graph_sig,
++            "stages_executed": stages_executed,
++            "orient": {
++                "portable_agent_state": orient_res.get("portable_agent_state"),
++                "portable_agent_reason": orient_res.get("portable_agent_reason"),
++                "agent_decision_frame": orient_res.get("agent_decision_frame"),
++                "readiness": orient_res.get("readiness"),
++            },
++            "target_resolution": compact_tr,
++            "evidence_need_derivation": compact_ev,
++            "capability_selection": compact_cs,
++            "receipt": final_receipt,
++            "next": final_next,
++            "detail_contract": {
++                "frame_only": True,
++                "omitted": ["receipt_chain", "orient.dynamic_context", "orient.skill_handoff", "orient.ui_source_handoff", "candidate_provenance"],
++                "full_output_hint": "omit --frame-only to retrieve full chain payload",
++            },
++            "authority": {
++                "read_only": True,
++                "single_process_receipt_chained": True,
++                "hmac_provenance_sealed": True,
++                "execute_runtime": False,
++                "mutate_source": False,
++                "commit_truth": False,
++            },
++        }
++
+     return {
+         "schema_version": "plw-task-chain-v1",
+         "mode": "chain",
+@@ -4593,6 +4881,7 @@
+         "impact": "python3 hott_kernel.py impact <file> [root] [--root DIR] [--output full|summary]",
+         "outline": "python3 hott_kernel.py outline <file> [root] [--root DIR]",
+         "brief": "python3 hott_kernel.py brief <file> [root] [--root DIR] [--output full|summary]",
++        "cycle_break": "python3 hott_kernel.py cycle-break [root] [--root DIR] [--target FILE] [--output full|summary]",
+         "context": "python3 hott_kernel.py context <query> [root] [--root DIR] [--target file[,file]] [--budget-tokens 1200] [--max-hops 2] [--detail outline|source] [--output prompt|summary|full]",
+         "establish": "python3 hott_kernel.py establish [root] [--root DIR] [--baseline path]",
+         "synthesize": "python3 hott_kernel.py synthesize [root] [--root DIR] [--output full|summary]",
+@@ -4686,9 +4975,18 @@
+ def _cli_flag_value(argv: List[str], *flags: str, default: Any = None) -> Any:
+     value = default
+     flag_set = set(flags)
++    is_output_flag = "--output" in flag_set
++    if is_output_flag:
++        flag_set.add("--format")
+     for i, arg in enumerate(argv):
+         if arg in flag_set and i + 1 < len(argv):
+             value = argv[i + 1]
++        elif "=" in arg:
++            flag_name, _, flag_val = arg.partition("=")
++            if flag_name in flag_set:
++                value = flag_val
++    if is_output_flag and isinstance(value, str) and value.strip().lower() == "json":
++        return "full"
+     return value
+ 
+ 
+@@ -4816,6 +5114,7 @@
+     root = _cli_positional_root(argv, idx=2)
+     analyzers_raw = _cli_flag_value(argv, "--analyzers")
+     analyzers = analyzers_raw.split(",") if analyzers_raw is not None else None
++    include_perf = "--include-perf" in argv
+     output_mode = _cli_flag_value(argv, "--output", default="full")
+     if output_mode not in ("full", "summary", "findings", "graph"):
+         _emit_cli_result(_kernel_error(
+@@ -4824,12 +5123,19 @@
+             output_mode=output_mode,
+             supported_output_modes=["full", "summary", "findings", "graph"],
+         ))
+-    _emit_cli_result(kernel_analyze(root, analyzers, output_mode))
++    _emit_cli_result(kernel_analyze(root, analyzers, output_mode, include_perf=include_perf))
+ 
+ 
+ def _cli_analyzers(_argv: List[str]) -> None:
+     if REGISTRY_AVAILABLE:
+-        _emit_cli_result({"available_analyzers": get_available_analyzers()})
++        all_names = get_available_analyzers()
++        default_names = get_structural_analyzers()
++        default_set = set(default_names)
++        _emit_cli_result({
++            "available_analyzers": all_names,
++            "default_check_analyzers": default_names,
++            "opt_in_analyzers": [name for name in all_names if name not in default_set],
++        })
+     else:
+         _emit_cli_result(_kernel_error("registry_unavailable", "registry not available"))
+ 
+@@ -4846,14 +5152,26 @@
+     _emit_cli_result(kernel_cache(action, root))
+ 
+ 
++def _normalize_target_root_pair(argv: List[str]) -> tuple:
++    target = argv[2]
++    root = _cli_positional_root(argv, idx=3)
++    if (
++        len(argv) >= 4
++        and not argv[3].startswith("--")
++        and os.path.isdir(target)
++        and not os.path.isdir(argv[3])
++    ):
++        root, target = target, argv[3]
++    return root, target
++
++
+ def _cli_impact(argv: List[str]) -> None:
+     if len(argv) < 3:
+         _emit_cli_result(_kernel_error(
+             "missing_argument",
+             "Usage: hott_kernel.py impact <file> [root]",
+         ))
+-    target = argv[2]
+-    root = _cli_positional_root(argv, idx=3)
++    root, target = _normalize_target_root_pair(argv)
+     output_mode = _cli_flag_value(argv, "--output", default="full")
+     _emit_cli_result(kernel_impact(root, target, output_mode))
+ 
+@@ -4864,8 +5182,7 @@
+             "missing_argument",
+             "Usage: hott_kernel.py outline <file> [root]",
+         ))
+-    target = argv[2]
+-    root = _cli_positional_root(argv, idx=3)
++    root, target = _normalize_target_root_pair(argv)
+     _emit_cli_result(kernel_outline(root, target))
+ 
+ 
+@@ -4875,16 +5192,46 @@
+             "missing_argument",
+             "Usage: hott_kernel.py brief <file> [root]",
+         ))
+-    target = argv[2]
+-    root = _cli_positional_root(argv, idx=3)
++    root, target = _normalize_target_root_pair(argv)
+     output_mode = _cli_flag_value(argv, "--output", default="full")
+     _emit_cli_result(kernel_brief(root, target, output_mode))
+ 
+ 
+ def _cli_cycle_break(argv: List[str]) -> None:
+-    root = _cli_positional_root(argv, idx=2)
+     target_file = _cli_flag_value(argv, "--target", "--target-file", "--file")
+     output_mode = _cli_flag_value(argv, "--output", default="full")
++    flag_root = _cli_flag_value(argv, "--root")
++    pos_args: List[str] = []
++    skip_next = False
++    for idx in range(2, len(argv)):
++        if skip_next:
++            skip_next = False
++            continue
++        arg = argv[idx]
++        if arg in ("--target", "--target-file", "--file", "--output", "--format", "--root", "--cache-mode"):
++            skip_next = True
++            continue
++        if arg.startswith("-"):
++            continue
++        pos_args.append(arg)
++    if flag_root:
++        root = flag_root
++        if target_file is None and pos_args:
++            target_file = pos_args[0]
++    elif len(pos_args) >= 2:
++        p0, p1 = pos_args[0], pos_args[1]
++        if os.path.isdir(p1) and not os.path.isdir(p0):
++            root = p1
++            if target_file is None:
++                target_file = p0
++        else:
++            root = p0
++            if target_file is None:
++                target_file = p1
++    elif len(pos_args) == 1:
++        root = pos_args[0]
++    else:
++        root = "."
+     _emit_cli_result(kernel_cycle_break(root, target_file, output_mode))
+ 
+ 
+@@ -4894,8 +5241,7 @@
+             "missing_argument",
+             "Usage: hott_kernel.py context <query> [root] [--target file[,file]] [--budget-tokens N] [--max-hops N] [--detail outline|source] [--truth-scope ID] [--no-proactive-truth] [--output prompt|summary|full]",
+         ))
+-    query = argv[2]
+-    root = _cli_positional_root(argv, idx=3)
++    root, query = _normalize_target_root_pair(argv)
+     target_files: List[str] = []
+     budget_tokens = DEFAULT_BUDGET_TOKENS
+     max_hops = DEFAULT_MAX_HOPS
+@@ -4935,8 +5281,12 @@
+             proactive_truth = False
+         elif arg == "--truth-scope" and i + 1 < len(argv):
+             truth_scope = argv[i + 1]
+-        elif arg == "--output" and i + 1 < len(argv):
+-            output_mode = argv[i + 1]
++        elif arg in ("--output", "--format") and i + 1 < len(argv):
++            raw_out = argv[i + 1]
++            output_mode = "full" if str(raw_out).strip().lower() == "json" else raw_out
++        elif arg.startswith("--output=") or arg.startswith("--format="):
++            raw_out = arg.split("=", 1)[1]
++            output_mode = "full" if str(raw_out).strip().lower() == "json" else raw_out
+     if parse_error:
+         _emit_cli_result(parse_error)
+     _emit_cli_result(kernel_context(
+@@ -4976,19 +5326,63 @@
+     usage_prefix = "hott_kernel.py memory_" if arg_offset == 2 else "memory "
+ 
+     if op == "store":
+-        if len(argv) < arg_offset + 2:
+-            _emit_cli_result({"error": f"Usage: {usage_prefix}store <type> <content> [--source src] [--importance 0.5] [--tags t1,t2]"})
++        type_aliases = {
++            "episodic": "episodic",
++            "event": "episodic",
++            "log": "episodic",
++            "observation": "episodic",
++            "semantic": "semantic",
++            "architectural": "semantic",
++            "architecture": "semantic",
++            "fact": "semantic",
++            "knowledge": "semantic",
++            "note": "semantic",
++            "design": "semantic",
++            "procedural": "procedural",
++            "workflow": "procedural",
++            "skill": "procedural",
++            "strategy": "procedural",
++            "action": "procedural",
++        }
++        pos_args = []
++        idx = arg_offset
++        while idx < len(argv):
++            tok = argv[idx]
++            if tok.startswith("--"):
++                if tok in ("--type", "--source", "--importance", "--tags", "--content") and idx + 1 < len(argv):
++                    idx += 2
++                else:
++                    idx += 1
++                continue
++            pos_args.append(tok)
++            idx += 1
++        flag_type = _cli_flag_value(argv, "--type")
++        flag_content = _cli_flag_value(argv, "--content")
++        if len(pos_args) >= 2 and pos_args[0].lower() in type_aliases:
++            mem_type = type_aliases[pos_args[0].lower()]
++            content = pos_args[1]
++        elif len(pos_args) >= 1:
++            raw_t = (flag_type or "semantic").lower()
++            mem_type = type_aliases.get(raw_t, raw_t)
++            content = flag_content if (flag_content and pos_args[0].lower() in type_aliases) else pos_args[0]
++        elif flag_content:
++            raw_t = (flag_type or "semantic").lower()
++            mem_type = type_aliases.get(raw_t, raw_t)
++            content = flag_content
++        else:
++            _emit_cli_result({"error": f"Usage: {usage_prefix}store [<type>] <content> [--type episodic|semantic|procedural] [--source src] [--importance 0.5] [--tags t1,t2]"})
+             return True
+         _emit_cli_result(kernel_memory_store(
+-            argv[arg_offset],
+-            argv[arg_offset + 1],
++            mem_type,
++            content,
+             _cli_flag_value(argv, "--source", default="manual"),
+             _cli_float_flag(argv, "--importance", 0.5),
+             _cli_flag_value(argv, "--tags"),
+         ))
+         return True
+-    if op == "recall":
+-        query = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++    if op in ("recall", "list", "search"):
++        raw_q = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++        query = None if (raw_q is not None and op == "list" and os.path.isdir(raw_q)) else raw_q
+         _emit_cli_result(kernel_memory_recall(
+             query,
+             _cli_flag_value(argv, "--type"),
+@@ -5005,7 +5399,7 @@
+             include_provenance="--include-provenance" in argv,
+         ))
+         return True
+-    if op == "stats":
++    if op in ("stats", "status"):
+         _emit_cli_result(kernel_memory_stats())
+         return True
+     if op == "associate":
+@@ -5020,16 +5414,22 @@
+         ))
+         return True
+     if op == "consolidate":
+-        min_len = 3 if arg_offset == 2 else 5
+-        if len(argv) < min_len:
+-            _emit_cli_result({"error": f"Usage: {usage_prefix}consolidate <id1,id2,...> --content '...'"})
+-            return True
+         content = _cli_flag_value(argv, "--content", default="")
++        raw_ids = argv[arg_offset] if len(argv) > arg_offset and not argv[arg_offset].startswith("--") else None
++        if not content and (raw_ids is None or os.path.isdir(raw_ids)):
++            _emit_cli_result(kernel_memory_consolidate_auto(
++                _cli_int_flag(argv, "--min-size", 3),
++                _cli_float_flag(argv, "--importance", 0.9),
++            ))
++            return True
++        if not raw_ids:
++            _emit_cli_result({"error": f"Usage: {usage_prefix}consolidate [<id1,id2,...> --content '...'] [--min-size 3]"})
++            return True
+         if not content:
+             _emit_cli_result({"error": "--content is required"})
+             return True
+         _emit_cli_result(kernel_memory_consolidate(
+-            argv[arg_offset].split(","),
++            raw_ids.split(","),
+             content,
+             _cli_flag_value(argv, "--tags"),
+             _cli_float_flag(argv, "--importance", 0.9),
+@@ -5152,12 +5552,32 @@
+ 
+ 
+ def _cli_memory(argv: List[str]) -> None:
+-    if len(argv) < 3:
+-        _emit_cli_result({"error": "Usage: hott_kernel.py memory <submode> ..."})
++    if len(argv) < 3 or argv[2] in ("-h", "--help", "help"):
++        _emit_cli_result({
++            "tool": "hott_kernel",
++            "schema_version": "4.0.0-kernel",
++            "mode": "memory",
++            "usage": "plw memory <submode> [...]",
++            "submodes": [
++                "status", "stats", "list", "search", "recall", "store", "get",
++                "associate", "consolidate", "consolidate-auto", "consolidate-by-tag",
++                "compact", "drift", "establish", "analyze", "steer",
++                "bridge", "bridge-candidates", "bridge-auto", "kan",
++            ],
++            "examples": [
++                "plw memory status . --json",
++                "plw memory list . --json",
++                "plw memory store 'Note text' --type semantic --tags tag1,tag2 --json",
++                "plw memory search 'query' --json",
++                "plw memory get <memory_id> --json",
++                "plw memory drift . --json",
++                "plw memory consolidate . --json",
++            ],
++        })
+         return
+-    submode = argv[2]
++    submode = argv[2].lower().replace("-", "_")
+     if not _cli_memory_operation(submode, argv, arg_offset=3):
+-        _emit_cli_result({"error": f"Unknown memory submode: {submode}"})
++        _emit_cli_result({"error": f"Unknown memory submode: {argv[2]}"})
+ 
+ 
+ def _cli_xanalyze(argv: List[str]) -> None:
+@@ -5184,22 +5604,66 @@
+ 
+ 
+ def _cli_fiber(argv: List[str]) -> None:
+-    if len(argv) < 3:
++    cleaned: List[str] = []
++    i = 2
++    root_dir = None
++    while i < len(argv):
++        tok = argv[i]
++        if tok == "--json":
++            i += 1
++            continue
++        if tok == "--root" and i + 1 < len(argv):
++            root_dir = argv[i + 1]
++            i += 2
++            continue
++        if tok.startswith("--root="):
++            root_dir = tok.split("=", 1)[1]
++            i += 1
++            continue
++        cleaned.append(tok)
++        i += 1
++    if cleaned and os.path.isdir(cleaned[0]):
++        root_dir = root_dir or cleaned.pop(0)
++    elif len(cleaned) >= 2 and os.path.isdir(cleaned[-1]) and cleaned[0].replace("-", "_") in (
++        "status", "stats", "info", "list", "archives", "list_archives", "section_status"
++    ):
++        root_dir = root_dir or cleaned.pop(-1)
++    if root_dir:
++        try:
++            _bind_memory_scope_to_scan(root_dir)
++        except Exception:
++            pass
++    if not cleaned:
++        subcommand = "status"
++        rest: List[str] = []
++    else:
++        subcommand = cleaned[0].lower().replace("-", "_")
++        rest = cleaned[1:]
++    alias_map = {
++        "list": "list_archives",
++        "archives": "list_archives",
++        "stats": "status",
++        "info": "status",
++        "start_section": "section_start",
++        "add_section": "section_add",
++    }
++    subcommand = alias_map.get(subcommand, subcommand)
++    if subcommand in ("--help", "-h", "help"):
+         _emit_cli_result({
+-            "error": "Usage: hott_kernel.py fiber <init|lift|descend|status|section_start|section_add|section_status|switch|transport|list_archives> [args]"
++            "mode": "fiber",
++            "usage": "plw fiber [status|init|lift|descend|section-start|section-add|section-status|switch|transport|list-archives] [args] [--root DIR] [--json]",
+         })
+         return
+-    subcommand = argv[2]
+     if subcommand == "transport":
+-        if len(argv) < 6:
++        if len(rest) < 3:
+             _emit_cli_result({
+                 "error": "Usage: fiber transport <source_fiber_id> <new_task> <new_focus> [--threshold 0.6] [--max 10] [--dry-run]"
+             })
+             return
+         _emit_cli_result(kernel_fiber_transport(
+-            argv[3],
+-            argv[4],
+-            argv[5],
++            rest[0],
++            rest[1],
++            rest[2],
+             _cli_float_flag(argv, "--threshold", 0.6),
+             _cli_int_flag(argv, "--max", 10),
+             "--dry-run" in argv,
+@@ -5207,7 +5671,7 @@
+     elif subcommand == "list_archives":
+         _emit_cli_result(kernel_fiber_list_archives())
+     else:
+-        _emit_cli_result(kernel_fiber(subcommand, argv[3:]))
++        _emit_cli_result(kernel_fiber(subcommand, rest))
+ 
+ 
+ def _memory_alias_handler(submode: str) -> Callable[[List[str]], None]:
+@@ -5265,7 +5729,7 @@
+     _configure_cli_memory_runtime(sys.argv)
+     _configure_cli_cache_mode(sys.argv)
+ 
+-    mode = sys.argv[1]
++    mode = {"cycle-break": "cycle_break"}.get(sys.argv[1], sys.argv[1])
+     valid_modes = set(PUBLIC_KERNEL_MODES)
+     if mode not in valid_modes:
+         _emit_cli_result(_kernel_error(
+--- a/memory/kan_extension.py
++++ b/memory/kan_extension.py
+@@ -724,7 +724,7 @@
+                         break
+ 
+     if isomorphs:
+-        iso_examples = [m["file"] for m in isomorphs[:2]]
++        iso_examples = sorted(m["file"] for m in isomorphs[:2])
+         hints.append(f"Rujuk pola implementasi modul isomorphic: {', '.join(iso_examples)}")
+ 
+     return {
+@@ -752,6 +752,18 @@
+     - Right Kan Extension (Ran): Limit konvensi & guided hints untuk AI agent.
+     """
+     target_norm = target_file.replace("\\", "/")
++    if shared_graph and target_norm not in shared_graph.get("file_map", {}):
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved_target, _, _ = _resolve_query_target(
++                target_norm,
++                set(shared_graph.get("vertices", [])),
++                scan_root=shared_graph.get("scan_root") or scan_root,
++            )
++            if resolved_target:
++                target_norm = resolved_target
++        except Exception:
++            pass
+ 
+     # Check content in file_map if available
+     content = ""
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -19,7 +19,7 @@
+   plw context <query> [root] [--target file] [--budget N] [--cache-mode MODE] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]
+   plw transitions <query> [root] [--target file] [--budget N] [--lineage sha256:id] [--json]
+   plw kan <target_file_or_query> [root] [--mode lan|ran|both] [--json]
+-  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]
+   plw steer [root] [--json]
+   plw brief <file> [root] [--json]
+   plw impact <file> [root] [--json]
+@@ -90,6 +90,7 @@
+ 
+ import sys
+ import os
++import re
+ import argparse
+ import json
+ import signal
+@@ -493,8 +494,11 @@
+             print(f"[Synthesis] {summary}\n")
+ 
+     if not rendered_sections:
+-        # Fallback to general output
+-        print(json.dumps(result, indent=2))
++        if isinstance(lan, dict) and lan.get("status") == "no_match":
++            msg = lan.get("message") or (ran.get("message") if isinstance(ran, dict) else None) or f"No matching memory or module nodes found for '{query}'."
++            print(f"  Status: no_match — {msg}")
++        else:
++            print(json.dumps(result, indent=2))
+ 
+ 
+ def _format_check_output(result: Dict[str, Any], as_json: bool = False) -> None:
+@@ -507,8 +511,9 @@
+     failed = summary.get("analyzers_failed", 0)
+     total = summary.get("total_findings", len(findings))
+ 
++    total_files = summary.get("total_files", result.get("total_files", "?"))
+     print(f"# [PLW Architecture & Boundary Check]")
+-    print(f"# Total Files: {result.get('total_files', '?')} | Findings: {total}")
++    print(f"# Total Files: {total_files} | Findings: {total}")
+     print("-" * 60)
+ 
+     critical_findings = [f for f in findings if f.get("severity") in ("critical", "high", "error")]
+@@ -522,7 +527,25 @@
+     else:
+         print(f"✗ ISSUES FOUND: {len(critical_findings)} critical/high severity findings:")
+         for f in critical_findings[:10]:
+-            print(f"  - [{f.get('severity', '').upper()}] {f.get('analyzer', '')}: {f.get('message', '')} ({f.get('file', '')})")
++            sev = str(f.get("severity") or "").upper()
++            analyzer = str(f.get("analyzer") or "")
++            msg = str(
++                f.get("message")
++                or f.get("observation")
++                or f.get("invariant")
++                or f.get("description")
++                or f.get("type")
++                or ""
++            ).strip()
++            loc = str(f.get("file") or "").strip()
++            if not loc:
++                seq = f.get("cycle") if isinstance(f.get("cycle"), list) else f.get("files")
++                if isinstance(seq, list) and seq:
++                    loc = " -> ".join(str(item) for item in seq[:4])
++            if loc and loc not in msg:
++                print(f"  - [{sev}] {analyzer}: {msg} ({loc})")
++            else:
++                print(f"  - [{sev}] {analyzer}: {msg}")
+         if len(critical_findings) > 10:
+             print(f"  ... and {len(critical_findings) - 10} more.")
+ 
+@@ -631,6 +654,49 @@
+         raise SystemExit(2)
+ 
+ 
++def _normalize_output_json_argv(parser, argv: List[str]) -> List[str]:
++    """Normalize --output json / --format json consistently for --json commands.
++
++    Preserves fail-closed behavior for invalid values (e.g. --output bogus)
++    by only rewriting explicit 'json' values when the parser accepts --json.
++    """
++    actions = getattr(parser, "_option_string_actions", {}) or {}
++    if "--json" not in actions:
++        return list(argv)
++    has_output = "--output" in actions
++    has_format = "--format" in actions
++    out: List[str] = []
++    i = 0
++    n = len(argv)
++    while i < n:
++        tok = argv[i]
++        if tok == "--":
++            out.extend(argv[i:])
++            break
++        tok_l = tok.lower()
++        if tok_l in ("--output=json", "--format=json"):
++            if tok_l.startswith("--output=") and has_output:
++                out.extend(["--output", "full", "--json"])
++            elif tok_l.startswith("--format=") and has_format:
++                out.append(tok)
++            else:
++                out.append("--json")
++            i += 1
++            continue
++        if tok_l in ("--output", "--format") and i + 1 < n and str(argv[i + 1]).strip().lower() == "json":
++            if tok_l == "--output" and has_output:
++                out.extend(["--output", "full", "--json"])
++            elif tok_l == "--format" and has_format:
++                out.extend([tok, argv[i + 1]])
++            else:
++                out.append("--json")
++            i += 2
++            continue
++        out.append(tok)
++        i += 1
++    return out
++
++
+ def _parse_cli_args(parser, argv):
+     """Parse argv with a _PlwArgumentParser (D2 wrapper).
+ 
+@@ -645,24 +711,28 @@
+     parse_args: intermixed parsing raises TypeError for REMAINDER.
+     The error() override still routes their failures via _cli_error.
+     """
+-    parser._plw_argv = list(argv)
++    norm_argv = _normalize_output_json_argv(parser, list(argv))
++    parser._plw_argv = list(norm_argv)
+     try:
+-        return parser.parse_intermixed_args(argv)
++        return parser.parse_intermixed_args(norm_argv)
+     except TypeError:
+-        return parser.parse_args(argv)
++        return parser.parse_args(norm_argv)
+ 
+ 
+ def cmd_context(args: List[str]) -> int:
+     if not args:
+-        print("Usage: plw context <query> [root] [--target file[,file]] [--budget N] [--max-hops N] [--cache-mode auto|refresh|off] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]")
++        print("Usage: plw context <query> [root] [--target file[,file]] [--budget N] [--max-hops N] [--detail outline|source] [--output prompt|summary|full] [--cache-mode auto|refresh|off] [--truth-scope ID] [--lineage sha256:id] [--no-proactive-truth] [--json]")
+         return 0
+     parser = _PlwArgumentParser(prog="plw context")
+-    parser.add_argument("query")
++    parser.add_argument("query", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--query", "-q", "--task", default=None, dest="query_flag")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--target", "--targets", action="append", default=None, dest="targets")
+     parser.add_argument("--budget", "--budget-tokens", type=int, default=1200)
+     parser.add_argument("--hops", "--max-hops", type=int, default=2, dest="max_hops")
++    parser.add_argument("--detail", choices=("source", "outline"), default="source")
++    parser.add_argument("--output", choices=("prompt", "summary", "full"), default="prompt", dest="output_mode")
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--truth-scope", default=None)
+     parser.add_argument("--lineage", action="append", default=None)
+@@ -670,10 +740,25 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     query = opts.query
+-    root = opts.root_flag or opts.root or "."
++    root = opts.root
++    if opts.query_flag is not None:
++        if query is not None and root == "." and opts.root_flag is None:
++            root = query
++        query = opts.query_flag
++    elif opts.root_flag is None and query is not None:
++        if root != "." and os.path.isdir(query) and not os.path.isdir(root):
++            query, root = root, query
++        elif root == "." and os.path.isdir(query):
++            root = query
++            query = os.path.basename(os.path.abspath(query)) or "overview"
++    root = opts.root_flag or root or "."
++    if query is None:
++        parser.error("the following arguments are required: query")
+     target_files = [v.strip() for raw in (opts.targets or []) for v in raw.split(",") if v.strip()]
+     budget = opts.budget
+     max_hops = opts.max_hops
++    detail = opts.detail
++    output_mode = opts.output_mode
+     cache_mode = opts.cache_mode
+     truth_scope = opts.truth_scope
+     lineage_ids = [v.strip() for raw in (opts.lineage or []) for v in raw.split(",") if v.strip()]
+@@ -701,8 +786,8 @@
+         target_files=target_files if target_files else None,
+         budget_tokens=budget,
+         max_hops=max_hops,
+-        detail="source",
+-        output_mode="prompt",
++        detail=detail,
++        output_mode=output_mode,
+         proactive_truth=proactive_truth,
+         truth_scope=truth_scope,
+         parent_lineage_ids=lineage_ids,
+@@ -744,7 +829,10 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     query = opts.query
+-    root = opts.root_flag or opts.root or "."
++    pos_root = opts.root
++    if opts.root_flag is None and pos_root != "." and os.path.isdir(query) and not os.path.isdir(pos_root):
++        query, pos_root = pos_root, query
++    root = opts.root_flag or pos_root or "."
+     target_files = [v.strip() for raw in (opts.targets or []) for v in raw.split(",") if v.strip()]
+     budget = opts.budget
+     max_hops = opts.max_hops
+@@ -872,7 +960,10 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     target = opts.target
+-    root = opts.root_flag or opts.root or "."
++    if opts.root_flag is None and opts.root is not None and os.path.isdir(target) and not os.path.isdir(opts.root):
++        target, root = opts.root, target
++    else:
++        root = opts.root_flag or opts.root or "."
+     mode = opts.mode
+     max_depth = opts.max_depth
+     cache_mode = opts.cache_mode
+@@ -886,10 +977,27 @@
+ 
+     # Check if target is a module file or path
+     is_module_target = (
+-        Path(target).exists()
++        (Path(target).exists() and not os.path.isdir(target))
++        or (os.path.isdir(root) and (Path(root) / target).exists() and not (Path(root) / target).is_dir())
+         or "/" in target
+-        or any(target.endswith(ext) for ext in (".ts", ".js", ".tsx", ".jsx", ".py"))
++        or any(target.endswith(ext) for ext in source_extensions(include_python=True))
+     )
++    shared_graph = None
++    if not is_module_target and " " not in target.strip() and len(target.strip()) >= 4 and os.path.isdir(root):
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            shared_graph = hott_kernel._build_kernel_graph(root)
++            resolved_stem, _, _ = _resolve_query_target(
++                target,
++                set(shared_graph.get("vertices", [])),
++                scan_root=shared_graph.get("scan_root") or root,
++            )
++            if resolved_stem:
++                target = resolved_stem
++                is_module_target = True
++        except Exception:
++            shared_graph = None
++
+     if is_module_target:
+         try:
+             from memory.kan_extension import impute_module_relations
+@@ -897,7 +1005,8 @@
+             # Reuse the same canonical cached SharedGraph used by context/brief/impact.
+             # This keeps module-level Kan imputation inside the incremental reference
+             # machine instead of reopening and reparsing every source file.
+-            shared_graph = hott_kernel._build_kernel_graph(root)
++            if shared_graph is None:
++                shared_graph = hott_kernel._build_kernel_graph(root)
+             res = impute_module_relations(target, shared_graph=shared_graph)
+             if isinstance(res, dict):
+                 res.setdefault("graph_cache", shared_graph.get("cache", {}))
+@@ -928,20 +1037,31 @@
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--analyzers", default=None)
++    parser.add_argument(
++        "--include-perf",
++        action="store_true",
++        dest="include_perf",
++        help="Opt in to perf.* coding-pattern heuristics (excluded from default structural check)",
++    )
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument("--target", "--targets", "--file", "--files", action="append", default=[], dest="target_filters")
+     parser.add_argument("--all", action="store_true", dest="all_findings")
++    parser.add_argument("--compact", action="store_true", dest="compact")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     root = opts.root_flag or opts.root or "."
+     analyzers = opts.analyzers.split(",") if opts.analyzers else None
+     cache_mode = opts.cache_mode
+     as_json = opts.as_json
+-    # --all wins over --limit; neither means the default 100-slot envelope.
++    target_filters = [p.strip() for item in (opts.target_filters or []) for p in str(item).split(",") if p.strip()]
++    # --all wins over --limit; --compact defaults to the compact slot cap when neither --all nor --limit is set.
+     if opts.all_findings:
+         findings_limit = None
+     elif opts.limit is not None:
+         findings_limit = opts.limit
++    elif opts.compact:
++        findings_limit = hott_kernel._CHECK_COMPACT_FINDINGS_LIMIT
+     else:
+         findings_limit = hott_kernel._CHECK_FINDINGS_LIMIT
+ 
+@@ -951,7 +1071,111 @@
+             _format_check_output(cache_error, as_json=as_json)
+             return 2
+ 
+-    res = hott_kernel.kernel_analyze(root, analyzer_names=analyzers, output_mode="summary", findings_limit=findings_limit)
++    res = hott_kernel.kernel_analyze(
++        root,
++        analyzer_names=analyzers,
++        output_mode="summary",
++        findings_limit=None if target_filters else findings_limit,
++        compact=opts.compact,
++        include_perf=opts.include_perf,
++    )
++    if target_filters and "error" not in res and isinstance(res.get("findings"), list):
++        root_abs = os.path.abspath(root).replace("\\", "/").rstrip("/")
++        path_keys = (
++            "file", "target_file", "source", "convergence", "source_boundary",
++            "target_boundary", "cycle", "files", "intermediate_nodes",
++            "path_one", "path_two", "cycle_basis",
++        )
++
++        def _extract_paths(obj: Any, acc: List[str]) -> None:
++            if isinstance(obj, str) and obj.strip():
++                acc.append(obj.strip())
++            elif isinstance(obj, list):
++                for it in obj:
++                    _extract_paths(it, acc)
++
++        def _norm_rel(raw_path: str) -> str:
++            rp = raw_path.replace("\\", "/").strip()
++            if root_abs and rp.startswith(root_abs + "/"):
++                return rp[len(root_abs) + 1:].lower()
++            return rp.lstrip("./").lower()
++
++        def _norm_flt(flt: str) -> str:
++            f_norm = flt.replace("\\", "/").strip().strip("/")
++            if root_abs and f_norm.startswith(root_abs + "/"):
++                f_norm = f_norm[len(root_abs) + 1:]
++            return f_norm.lower()
++
++        def _path_matches_strict(rp_l: str, f_l: str) -> bool:
++            if not f_l:
++                return False
++            has_sep_or_ext = ("/" in f_l) or (os.path.splitext(os.path.basename(f_l))[1] != "")
++            if has_sep_or_ext:
++                if rp_l == f_l or rp_l.endswith("/" + f_l) or rp_l.startswith(f_l + "/") or ("/" + f_l + "/") in ("/" + rp_l + "/"):
++                    return True
++                if os.path.splitext(os.path.basename(f_l))[1] == "":
++                    rp_no_ext = os.path.splitext(rp_l)[0]
++                    if rp_no_ext == f_l or rp_no_ext.endswith("/" + f_l):
++                        return True
++                return False
++            base = os.path.basename(rp_l)
++            stem = os.path.splitext(base)[0]
++            if stem == f_l or base == f_l:
++                return True
++            f_col = re.sub(r"[._-]+", "", f_l)
++            if len(f_col) >= 4 and re.sub(r"[._-]+", "", stem) == f_col:
++                return True
++            return False
++
++        def _path_matches_segment(rp_l: str, f_l: str) -> bool:
++            if not f_l or "/" in f_l or os.path.splitext(os.path.basename(f_l))[1] != "":
++                return False
++            return ("/" + f_l + "/") in ("/" + rp_l + "/") or rp_l == f_l
++
++        orig_findings = res["findings"]
++        finding_paths: List[Tuple[Dict[str, Any], List[str]]] = []
++        for finding in orig_findings:
++            if not isinstance(finding, dict):
++                continue
++            cand_paths: List[str] = []
++            for pk in path_keys:
++                if pk in finding:
++                    _extract_paths(finding.get(pk), cand_paths)
++            finding_paths.append((finding, [_norm_rel(cp) for cp in cand_paths]))
++
++        matched_ids: set[int] = set()
++        for raw_flt in target_filters:
++            f_l = _norm_flt(raw_flt)
++            strict_hits = [
++                idx for idx, (_, rps) in enumerate(finding_paths)
++                if any(_path_matches_strict(rp_l, f_l) for rp_l in rps)
++            ]
++            if strict_hits:
++                matched_ids.update(strict_hits)
++            else:
++                seg_hits = [
++                    idx for idx, (_, rps) in enumerate(finding_paths)
++                    if any(_path_matches_segment(rp_l, f_l) for rp_l in rps)
++                ]
++                matched_ids.update(seg_hits)
++        filtered_findings = [finding_paths[i][0] for i in sorted(matched_ids)]
++        truncated_after_filter = False
++        total_matched = len(filtered_findings)
++        if findings_limit is not None and total_matched > findings_limit:
++            filtered_findings = filtered_findings[:findings_limit]
++            truncated_after_filter = True
++        res["findings"] = filtered_findings
++        res["findings_truncated"] = truncated_after_filter
++        res["target_filter"] = target_filters
++        res["unfiltered_findings_count"] = len(orig_findings)
++        summary = res.get("unified_summary")
++        if isinstance(summary, dict):
++            sev_counts: Dict[str, int] = {}
++            for item in filtered_findings:
++                sev = str(item.get("severity") or "info").lower()
++                sev_counts[sev] = sev_counts.get(sev, 0) + 1
++            summary["total_findings"] = total_matched
++            summary["findings_by_severity"] = sev_counts
+     _format_check_output(res, as_json=as_json)
+     return 0 if "error" not in res else 1
+ 
+@@ -959,11 +1183,19 @@
+ def cmd_steer(args: List[str]) -> int:
+     parser = _PlwArgumentParser(prog="plw steer")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("goal", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--goal", "--query", "--task", default=None, dest="goal_flag")
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+-    root = opts.root_flag or opts.root or "."
++    pos_root = opts.root or "."
++    if opts.root_flag is None:
++        if opts.goal is not None and os.path.isdir(opts.goal) and not os.path.isdir(pos_root):
++            pos_root = opts.goal
++        elif opts.goal is None and pos_root != "." and not os.path.isdir(pos_root) and " " in pos_root:
++            pos_root = "."
++    root = opts.root_flag or pos_root or "."
+     cache_mode = opts.cache_mode
+     as_json = opts.as_json
+ 
+@@ -1243,6 +1475,8 @@
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--reference", default=None)
++    parser.add_argument("--target", "--file", default=None, dest="target_filter")
++    parser.add_argument("--kind", default=None, dest="kind_filter")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     root = opts.root_flag or opts.root or "."
+@@ -1254,6 +1488,35 @@
+         print(f"[PLW Error] simplify failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+         return 1
+ 
++    if opts.target_filter or opts.kind_filter:
++        t_flt = (opts.target_filter or "").strip().replace("\\", "/").strip("/")
++        t_collapsed = re.sub(r"[._-]+", "", t_flt.lower()) if t_flt else ""
++        k_flt = (opts.kind_filter or "").strip().lower()
++
++        def _match_cand(row: Dict[str, Any]) -> bool:
++            if k_flt and k_flt not in str(row.get("kind", "")).lower():
++                return False
++            if t_flt:
++                row_files = [str(f).replace("\\", "/") for f in (row.get("files", []) or [])]
++                row_names = [str(n) for n in (row.get("names", []) or [])]
++                matched_f = any(
++                    t_flt.lower() in rf.lower()
++                    or (len(t_collapsed) >= 4 and t_collapsed in re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(rf))[0].lower()))
++                    for rf in row_files
++                ) or any(
++                    t_flt.lower() == rn.lower()
++                    or (len(t_collapsed) >= 4 and t_collapsed == re.sub(r"[._-]+", "", rn.lower()))
++                    for rn in row_names
++                )
++                if not matched_f:
++                    return False
++            return True
++
++        target_container = result.get("candidate", {}) if reference else result
++        if isinstance(target_container, dict) and isinstance(target_container.get("candidates"), list):
++            target_container["candidates"] = [r for r in target_container["candidates"] if _match_cand(r)]
++            result["filters"] = {"target": opts.target_filter, "kind": opts.kind_filter}
++
+     if as_json:
+         print(json.dumps(result, indent=2))
+         return 0
+@@ -1459,6 +1722,8 @@
+     """Inspect procedural transition-outcome memory; never use it as truth evidence."""
+     # Track 3: argparse via the shared wrapper (was a for-loop over args).
+     parser = _PlwArgumentParser(prog="plw transition-memory")
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     as_json = opts.as_json
+@@ -1553,11 +1818,18 @@
+     """Inspect post-settlement recovery/rerun costs attributed to transition outcomes."""
+     # Track 3: argparse via the shared wrapper (was a manual loop).
+     parser = _PlwArgumentParser(prog="plw reconcile-outcomes")
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--record", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     as_json = opts.as_json
+     record = opts.record
++    target_root = opts.root_flag or opts.root or "."
++    try:
++        hott_kernel._bind_memory_scope_to_scan(target_root)
++    except Exception:
++        pass
+     try:
+         result = refresh_outcome_reconciliation()
+         if record:
+@@ -2222,7 +2494,7 @@
+     parser.add_argument("positional", nargs="*")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--no-resources", action="store_true")
+-    parser.add_argument("--file", default=None, dest="file_filter")
++    parser.add_argument("--file", "--target", default=None, dest="file_filter")
+     parser.add_argument("--selector", default=None, dest="selector_filter")
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+@@ -2233,11 +2505,18 @@
+     file_filter = opts.file_filter
+     selector_filter = opts.selector_filter
+     cache_mode = opts.cache_mode
+-    if len(positional) > 1:
++    if len(positional) > 2 or (len(positional) == 2 and (file_filter is not None or opts.root_flag is not None or (os.path.isdir(positional[0]) and os.path.isdir(positional[1])))):
+         _cli_error("angular-anchors accepts at most one root path",
+                    "invalid_arguments", as_json=as_json, rc=2)
+         return 2
+-    root = opts.root_flag or (positional[0] if positional else ".")
++    if len(positional) == 2:
++        p0, p1 = positional[0], positional[1]
++        if os.path.isdir(p1) and not os.path.isdir(p0):
++            root, file_filter = p1, p0
++        else:
++            root, file_filter = p0, p1
++    else:
++        root = opts.root_flag or (positional[0] if positional else ".")
+     if cache_mode is not None:
+         cache_error = hott_kernel._set_graph_cache_mode(cache_mode)
+         if cache_error:
+@@ -2911,6 +3190,8 @@
+     parser.add_argument("--max-candidates", type=int, default=8)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.root != "." and opts.root_flag is None and os.path.isdir(opts.query) and not os.path.isdir(opts.root):
++        opts.root, opts.query = opts.query, opts.root
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     try:
+         graph = hott_kernel._build_kernel_graph(opts.root)
+@@ -2928,8 +3209,34 @@
+         print("# Status: " + decision["status"])
+         print("# Candidates: " + str(decision["matching_candidate_count"]))
+         for item in result["candidates"]:
+-            print(f"- {item['component_file']} -> {item['template_file']}:{item['template_line']} "
+-                  f"{item['element']['tag']} {item['element']['label']!r}")
++            t_line = item.get("template_line")
++            d_line = item.get("template_declaration_line")
++            loc_suffix = (
++                f":{t_line}"
++                if t_line is not None
++                else (f"@decl:{d_line}" if d_line is not None else "")
++            )
++            el = item["element"]
++            label = el["label"]
++            attrs = el.get("attributes") or {}
++            ev_attr_keys = list(((item.get("match_evidence") or {}).get("attribute_terms") or {}).keys())
++            shown_attrs = []
++            for key in ev_attr_keys + ["aria-label", "title", "id", "name", "routerlink", "class"]:
++                if key in attrs and key not in {k for k, _ in shown_attrs}:
++                    val = str(attrs[key]).strip()
++                    if val:
++                        shown_attrs.append((key, val[:48]))
++                if len(shown_attrs) >= 2:
++                    break
++            attr_note = (
++                " [" + ", ".join(f"{k}={v!r}" for k, v in shown_attrs) + "]"
++                if shown_attrs and (not label or ev_attr_keys)
++                else ""
++            )
++            print(
++                f"- {item['component_file']} -> {item['template_file']}{loc_suffix} "
++                f"{el['tag']} {label!r}{attr_note}"
++            )
+         print("# Runtime geometry: UNOBSERVED; browser execution: false")
+     return 0
+ 
+@@ -4020,6 +4327,7 @@
+     parser.add_argument("--full-edges", action="store_true")
+     parser.add_argument("--full-engine", action="store_true")
+     parser.add_argument("--full-engine-edges", action="store_true")
++    parser.add_argument("--compact", "--no-engine", action="store_true", dest="no_engine")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+@@ -4030,6 +4338,7 @@
+         full_engine=opts.full_engine,
+         full_engine_edges=opts.full_engine_edges,
+         cache_mode=opts.cache_mode,
++        include_engine=not opts.no_engine,
+     )
+     code = 0 if not result.get("error") else 3
+     if opts.as_json:
+@@ -4064,16 +4373,22 @@
+     """Generate a multi-depth Mermaid architecture & dependency diagram (depths 1..4)."""
+     parser = _PlwArgumentParser(prog="plw mermaid")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("focus_pos", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--depth", type=int, default=1)
+     parser.add_argument("--focus", default=None)
++    parser.add_argument("--target", "--file", default=None, dest="target_focus")
+     parser.add_argument("--direction", default="LR")
+     parser.add_argument("--max-nodes", type=int, default=24, dest="max_nodes")
+     parser.add_argument("--include-tests", action="store_true", dest="include_tests")
+     parser.add_argument("--out", default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.focus_pos is not None and opts.root_flag is None:
++        if os.path.isdir(opts.focus_pos) and not os.path.isdir(opts.root):
++            opts.root, opts.focus_pos = opts.focus_pos, opts.root
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    opts.focus = opts.focus if opts.focus is not None else (opts.target_focus if opts.target_focus is not None else opts.focus_pos)
+ 
+     result = hott_kernel.kernel_mermaid(
+         opts.root,
+@@ -4153,10 +4468,12 @@
+ 
+ 
+ def _load_receipt_arg(value):
+-    """Parse a --receipt value (JSON string or @path). Raises ValueError."""
++    """Parse a --receipt value (JSON string, @path, or file path). Raises ValueError."""
+     raw = value
+     if value.startswith("@"):
+         raw = Path(value[1:]).read_text(encoding="utf-8")
++    elif not value.lstrip().startswith("{") and Path(value).is_file():
++        raw = Path(value).read_text(encoding="utf-8")
+     data = json.loads(raw)
+     if not isinstance(data, dict):
+         raise ValueError("--receipt must be a JSON object")
+@@ -4259,18 +4576,33 @@
+ def _parse_target_task_args(args: List[str], prog: str):
+     import argparse
+     parser = _PlwArgumentParser(prog=prog)
+-    parser.add_argument("task")
++    parser.add_argument("task", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--task", default=None, dest="task_flag")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--receipt", default=None)
+     parser.add_argument("--strict-chain", action="store_true", dest="strict_chain")
+-    parser.add_argument("--target", action="append", default=[])
++    parser.add_argument("--target", "--targets", "--target-file", "--target-files", "--file", action="append", default=[], dest="target")
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+-    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     opts.target = [p.strip() for item in (opts.target or []) for p in str(item).split(",") if p.strip()]
++    if opts.task_flag is not None:
++        if opts.task is not None and opts.root == "." and opts.root_flag is None:
++            opts.root = opts.task
++        opts.task = opts.task_flag
++    elif opts.root != "." and opts.root_flag is None and opts.task is not None:
++        if os.path.isdir(opts.task) and not os.path.isdir(opts.root):
++            opts.root, opts.task = opts.task, opts.root
++    elif opts.target and opts.task is not None and opts.root == "." and opts.root_flag is None and os.path.isdir(opts.task):
++        opts.root = opts.task
++        opts.task = None
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    if not opts.task and opts.target:
++        opts.task = " ".join(opts.target)
++    if not opts.task:
++        parser.error("the following arguments are required: task")
+     return opts
+ 
+ 
+@@ -4398,16 +4730,50 @@
+     """Resolve a declarative operation plan without invoking the operation."""
+     import argparse
+     parser = _PlwArgumentParser(prog="plw operation-plan")
+-    parser.add_argument("operation", choices=("resolve",))
+-    parser.add_argument("plan")
+-    parser.add_argument("--json", action="store_true", dest="as_json")
+-    opts = _parse_cli_args(parser, args)
++    parser.add_argument("first", nargs="?", default=None)
++    parser.add_argument("second", nargs="?", default=None)
++    parser.add_argument("third", nargs="?", default=None)
++    parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--task", default=None, dest="task_flag")
++    parser.add_argument("--capability", default="candidate")
++    parser.add_argument("--operation-id", default="candidate.select.v1", dest="operation_id")
++    parser.add_argument("--json", action="store_true", dest="as_json")
++    opts = _parse_cli_args(parser, args)
++    pos = [x for x in (opts.first, opts.second, opts.third) if x is not None]
++    if pos and pos[0] == "resolve":
++        pos = pos[1:]
++    if not pos and opts.task_flag is None:
++        parser.error("the following arguments are required: plan (or <root> <task>)")
++    synthesized_plan = None
++    if opts.task_flag is not None:
++        root_val = opts.root_flag or (pos[0] if pos else ".")
++        synthesized_plan = {
++            "schema_version": "plw-operation-plan-v1",
++            "capability": opts.capability,
++            "operation_id": opts.operation_id,
++            "inputs": {"task": opts.task_flag, "root": root_val},
++        }
++    elif len(pos) == 2 and (os.path.isdir(pos[0]) or os.path.isdir(pos[1])):
++        root_val, task_val = (pos[0], pos[1]) if os.path.isdir(pos[0]) else (pos[1], pos[0])
++        root_val = opts.root_flag or root_val
++        synthesized_plan = {
++            "schema_version": "plw-operation-plan-v1",
++            "capability": opts.capability,
++            "operation_id": opts.operation_id,
++            "inputs": {"task": task_val, "root": root_val},
++        }
++    plan_arg = pos[0] if pos else ""
+     try:
+-        if opts.plan == "-":
++        if synthesized_plan is not None:
++            plan = synthesized_plan
++        elif plan_arg == "-":
+             raw = sys.stdin.read()
++            plan = json.loads(raw)
++        elif plan_arg.lstrip().startswith("{"):
++            plan = json.loads(plan_arg)
+         else:
+-            raw = Path(opts.plan).read_text(encoding="utf-8")
+-        plan = json.loads(raw)
++            raw = Path(plan_arg).read_text(encoding="utf-8")
++            plan = json.loads(raw)
+         if not isinstance(plan, dict):
+             raise ValueError("operation plan must be a JSON object")
+     except (OSError, json.JSONDecodeError, ValueError) as exc:
+@@ -4445,15 +4811,29 @@
+     """Select a discovery candidate and optionally match its internal contract."""
+     import argparse
+     parser = _PlwArgumentParser(prog="plw candidate")
+-    parser.add_argument("operation", choices=("select", "capability-match"))
+-    parser.add_argument("task")
++    parser.add_argument("operation", choices=("select", "list", "capability-match", "match"))
++    parser.add_argument("task", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--task", default=None, dest="task_flag")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--receipt", default=None)
+     parser.add_argument("--strict-chain", action="store_true", dest="strict_chain")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.operation == "list":
++        opts.operation = "select"
++    elif opts.operation == "match":
++        opts.operation = "capability-match"
++    if opts.task_flag is not None:
++        if opts.task is not None and opts.root == "." and opts.root_flag is None:
++            opts.root = opts.task
++        opts.task = opts.task_flag
++    elif opts.root != "." and opts.root_flag is None and opts.task is not None:
++        if os.path.isdir(opts.task) and not os.path.isdir(opts.root):
++            opts.root, opts.task = opts.task, opts.root
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    if opts.task is None:
++        parser.error("the following arguments are required: task")
+     stage = "candidate-select" if opts.operation == "select" else "candidate-capability-match"
+     rc = _check_receipt_arg(
+         opts.receipt, stage, opts.task, opts.root,
+@@ -4561,6 +4941,12 @@
+         # second is the query (or the index status word).
+         root = Path(flag_root).expanduser().resolve()
+         return root, pos2 if pos2 is not None else pos1, None
++    if operation == "index" and pos1 in ("status", "warm", "clean"):
++        root = (
++            Path(pos2).expanduser().resolve()
++            if pos2 is not None else Path(".").resolve()
++        )
++        return root, pos1, None
+     if operation in ("doctor", "index"):
+         root = (
+             Path(pos1).expanduser().resolve()
+@@ -4596,16 +4982,39 @@
+     """
+     import argparse
+     parser = _PlwArgumentParser(prog="plw ast", epilog="Argument order: two positionals are always root-first (root, then query); a single positional is the query unless it names a directory, in which case it is the root; --root DIR is always explicit.")
+-    parser.add_argument("operation", choices=("defs", "callers", "related", "search", "doctor", "index"))
++    parser.add_argument(
++        "operation",
++        choices=(
++            "defs", "def", "definitions", "symbols",
++            "callers", "refs", "references",
++            "related", "search", "doctor", "index",
++            "status", "warm", "clean",
++        ),
++    )
+     parser.add_argument("root", nargs="?", default=None)
+     parser.add_argument("query", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--file", "--target", default=None, dest="file_flag")
+     parser.add_argument("--binary", default=None)
+     parser.add_argument("--cache-dir", default=None)
+     parser.add_argument("--timeout", type=int, default=120)
+     parser.add_argument("--limit", type=int, default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.operation in ("status", "warm", "clean"):
++        idx_mode = opts.operation
++        opts.operation = "index"
++        if opts.query is None:
++            opts.query = idx_mode
++    elif opts.operation in ("def", "definitions", "symbols"):
++        opts.operation = "defs"
++    elif opts.operation in ("refs", "references"):
++        opts.operation = "callers"
++    query_derived_from_file = False
++    if opts.file_flag and opts.query is None and opts.operation in ("defs", "callers", "related", "search"):
++        if opts.root is None or os.path.isdir(opts.root):
++            opts.query = Path(opts.file_flag).stem
++            query_derived_from_file = True
+     root, query, resolve_error = _resolve_ast_positionals(
+         opts.operation, opts.root, opts.query, opts.root_flag,
+     )
+@@ -4666,6 +5075,68 @@
+                 )
+     except EngineError as exc:
+         result = error_envelope(opts.operation, str(root), query or "", str(exc))
++    if opts.file_flag and not query_derived_from_file and result.get("ok") and opts.operation in ("defs", "callers", "related", "search"):
++        f_flt = str(opts.file_flag).strip().replace("\\", "/").strip("/")
++        f_l = f_flt.lower()
++        has_sep_or_ext = ("/" in f_l) or (os.path.splitext(os.path.basename(f_l))[1] != "")
++        f_collapsed = re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(f_l))[0])
++
++        def _row_matches_strict(row: Any) -> bool:
++            if not isinstance(row, dict):
++                return False
++            rp = str(row.get("path") or "").replace("\\", "/").strip().lstrip("./")
++            if not rp:
++                return False
++            rp_l = rp.lower()
++            if has_sep_or_ext:
++                if rp_l == f_l or rp_l.endswith("/" + f_l) or rp_l.startswith(f_l + "/") or ("/" + f_l + "/") in ("/" + rp_l + "/"):
++                    return True
++                if os.path.splitext(os.path.basename(f_l))[1] == "":
++                    rp_no_ext = os.path.splitext(rp_l)[0]
++                    if rp_no_ext == f_l or rp_no_ext.endswith("/" + f_l):
++                        return True
++                return False
++            stem_l = os.path.splitext(os.path.basename(rp_l))[0]
++            if stem_l == f_l:
++                return True
++            if len(f_collapsed) >= 4 and re.sub(r"[._-]+", "", stem_l) == f_collapsed:
++                return True
++            return False
++
++        def _row_matches_segment(row: Any) -> bool:
++            if not isinstance(row, dict):
++                return False
++            rp = str(row.get("path") or "").replace("\\", "/").strip().lstrip("./")
++            if not rp:
++                return False
++            rp_l = rp.lower()
++            return ("/" + f_l + "/") in ("/" + rp_l + "/") or f_l in os.path.basename(rp_l)
++
++        def _filter_ast_list(rows: List[Any]) -> List[Any]:
++            strict = [r for r in rows if _row_matches_strict(r)]
++            if strict or has_sep_or_ext:
++                return strict
++            return [r for r in rows if _row_matches_segment(r)]
++
++        eng_res = result.get("engine_result")
++        total_filtered = 0
++        if isinstance(eng_res, dict):
++            for rk in ("hits", "calls", "related"):
++                if isinstance(eng_res.get(rk), list):
++                    eng_res[rk] = _filter_ast_list(eng_res[rk])
++                    total_filtered = len(eng_res[rk])
++        grouped_map = result.get("grouped")
++        if isinstance(grouped_map, dict):
++            total_filtered = 0
++            for gk in list(grouped_map.keys()):
++                if isinstance(grouped_map[gk], list):
++                    grouped_map[gk] = _filter_ast_list(grouped_map[gk])
++                    total_filtered += len(grouped_map[gk])
++        if isinstance(result.get("summary"), dict):
++            result["summary"]["total"] = total_filtered
++            if "shown" in result["summary"]:
++                result["summary"]["shown"] = total_filtered
++        result["file_filter"] = opts.file_flag
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+     else:
+@@ -4811,23 +5282,39 @@
+     """Execute the full task-routing pipeline in a single process with HMAC receipt chaining."""
+     import argparse
+     parser = _PlwArgumentParser(prog="plw chain")
+-    parser.add_argument("task")
++    parser.add_argument("task", nargs="?", default=None)
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--task", default=None, dest="task_flag")
+     parser.add_argument("--root", default=None, dest="root_flag")
+-    parser.add_argument("--target", action="append", default=[])
++    parser.add_argument("--target", "--targets", "--target-file", "--target-files", "--file", action="append", default=[], dest="target")
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+     parser.add_argument("--with-candidates", action="store_true", dest="with_candidates")
+     parser.add_argument("--ui-selector", default=None)
+     parser.add_argument("--goal", default="auto")
+     parser.add_argument("--depth", default="auto")
++    parser.add_argument("--frame-only", action="store_true", dest="frame_only")
+     parser.add_argument("--full-engine", action="store_true")
+     parser.add_argument("--full-engine-edges", action="store_true")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--receipt", default=None)
+     opts = _parse_cli_args(parser, args)
+-    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     opts.target = [p.strip() for item in (opts.target or []) for p in str(item).split(",") if p.strip()]
++    if opts.task_flag is not None:
++        if opts.task is not None and opts.root == "." and opts.root_flag is None:
++            opts.root = opts.task
++        opts.task = opts.task_flag
++    elif opts.root != "." and opts.root_flag is None and opts.task is not None:
++        if os.path.isdir(opts.task) and not os.path.isdir(opts.root):
++            opts.root, opts.task = opts.task, opts.root
++    elif opts.target and opts.task is not None and opts.root == "." and opts.root_flag is None and os.path.isdir(opts.task):
++        opts.root = opts.task
++        opts.task = None
++    opts.root = opts.root_flag if opts.root_flag is not None else opts.root
++    if not opts.task and opts.target:
++        opts.task = " ".join(opts.target)
++    if not opts.task:
++        parser.error("the following arguments are required: task")
+     if opts.receipt is not None:
+         return _receipt_arg_error(
+             "plw chain starts from entry stage orient and takes no incoming receipt",
+@@ -4846,6 +5333,7 @@
+         ui_selector=opts.ui_selector,
+         full_engine=opts.full_engine,
+         full_engine_edges=opts.full_engine_edges,
++        frame_only=opts.frame_only,
+     )
+     return _print_chain_result(result, as_json=opts.as_json)
+ 
+@@ -4856,8 +5344,9 @@
+     parser = _PlwArgumentParser(prog="plw agent")
+     parser.add_argument("operation", choices=("orient", "chain"))
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("task_pos", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+-    parser.add_argument("--task", required=True)
++    parser.add_argument("--task", default=None)
+     parser.add_argument("--target", action="append", default=[])
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+@@ -4871,6 +5360,16 @@
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--receipt", default=None)
+     opts = _parse_cli_args(parser, args)
++    if opts.task is None:
++        if opts.task_pos is not None:
++            if opts.root_flag is None and not os.path.isdir(opts.root) and os.path.isdir(opts.task_pos):
++                opts.task, opts.root = opts.root, opts.task_pos
++            else:
++                opts.task = opts.task_pos
++        elif opts.root != "." and opts.root_flag is None and not os.path.isdir(opts.root):
++            opts.task, opts.root = opts.root, "."
++    if not opts.task:
++        parser.error("the following arguments are required: --task")
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+     opts.target = [p.strip() for item in (opts.target or []) for p in str(item).split(",") if p.strip()]
+     if opts.receipt is not None:
+@@ -4890,6 +5389,7 @@
+             ui_selector=opts.ui_selector,
+             full_engine=opts.full_engine,
+             full_engine_edges=opts.full_engine_edges,
++            frame_only=opts.frame_only,
+         )
+         return _print_chain_result(result, as_json=opts.as_json)
+     result = hott_kernel.kernel_work(
+@@ -5028,7 +5528,7 @@
+                "  reconcile -> plw reconcile-outcomes\n"
+                "Additive aliases; canonical names unchanged.")
+     parser.add_argument("operation", choices=(
+-        "lineage", "accountability", "chain", "memory", "model", "reconcile"))
++        "lineage", "accountability", "chain", "memory", "status", "model", "reconcile"))
+     parser.add_argument("rest", nargs=argparse.REMAINDER)
+     opts = _parse_cli_args(parser, args)
+     if opts.operation == "lineage":
+@@ -5037,7 +5537,7 @@
+         return cmd_accountability(opts.rest)
+     if opts.operation == "chain":
+         return cmd_accountability_chain(opts.rest)
+-    if opts.operation == "memory":
++    if opts.operation in ("memory", "status"):
+         return cmd_transition_memory(opts.rest)
+     if opts.operation == "model":
+         return cmd_transition_model(opts.rest)
+@@ -5048,14 +5548,53 @@
+     """Read-only predictive semantics for agents unfamiliar with PLW vocabulary."""
+     import argparse
+     parser = _PlwArgumentParser(prog="plw semantic")
+-    parser.add_argument("operation", choices=("describe", "route"))
+-    parser.add_argument("value")
++    parser.add_argument("operation", nargs="?", default=None)
++    parser.add_argument("value", nargs="?", default=None)
++    parser.add_argument("extra", nargs="?", default=None)
++    parser.add_argument("extra2", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--goal", default="auto")
+     parser.add_argument("--receipt", default=None)
+     parser.add_argument("--strict-chain", action="store_true", dest="strict_chain")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.operation not in ("describe", "route"):
++        if opts.operation is not None and os.path.isdir(opts.operation):
++            if opts.root_flag is None:
++                opts.root_flag = opts.operation
++            if opts.value is not None:
++                opts.operation = "route"
++            else:
++                opts.operation = "describe"
++                opts.value = "check"
++        elif opts.operation is not None and opts.value is None:
++            opts.value = opts.operation
++            opts.operation = "describe"
++        else:
++            parser.error(f"argument operation: invalid choice: {opts.operation!r} (choose from 'describe', 'route')")
++    from core.semantic_affordance import ALIAS_TO_CANONICAL, COMMAND_CONTRACTS, FIRST_CONTACT_HELP
++    _plw_terms = set(COMMAND_CONTRACTS) | set(ALIAS_TO_CANONICAL) | set(FIRST_CONTACT_HELP)
++    if opts.extra2 is not None and opts.extra is not None and opts.value is not None:
++        if opts.operation == "describe" and (
++            opts.value.lower() in _plw_terms or not os.path.isdir(opts.value)
++        ) and not os.path.isdir(opts.extra):
++            opts.value = f"{opts.value} {opts.extra}"
++            opts.extra = opts.extra2
++    if opts.extra is not None and opts.value is not None:
++        val_is_dir = os.path.isdir(opts.value) and opts.value.lower() not in _plw_terms
++        if val_is_dir and not os.path.isdir(opts.extra):
++            if opts.root_flag is None:
++                opts.root_flag = opts.value
++            opts.value = opts.extra
++        elif os.path.isdir(opts.extra) and opts.root_flag is None:
++            opts.root_flag = opts.extra
++        elif opts.operation == "describe" and not os.path.isdir(opts.extra):
++            opts.value = f"{opts.value} {opts.extra}"
++    if opts.value is None:
++        if opts.operation == "describe":
++            opts.value = "check"
++        else:
++            parser.error("the following arguments are required: value")
+     inherited_root = opts.root_flag
+     inherited_graph_sig = None
+     if opts.operation == "describe":
+@@ -5105,6 +5644,12 @@
+             print("# Missing: " + str(gap.get("missing", result.get("error", "-"))))
+             print("# Information gain: " + "; ".join(result.get("information_gain", [])[:4]))
+             print("# Read before use: " + str(result.get("read_before_use", "-")))
++            if result.get("alias_of"):
++                print("# Alias of: " + str(result.get("alias_of")))
++            if result.get("hint"):
++                print("# Hint: " + str(result.get("hint")))
++            if not result.get("known") and not result.get("hint") and result.get("available_commands"):
++                print("# Available commands: " + ", ".join(result.get("available_commands", [])[:12]))
+         else:
+             print("# Capability: " + str(result.get("capability", "-")))
+             print("# Skill: " + str(result.get("skill_path", "-")))
+@@ -5161,7 +5706,7 @@
+       -> Tree-sitter structural queries via the codesearch-go engine (external binary, fail-closed); two positionals are always root-first, a single positional is the query unless it names a directory, and --root DIR is explicit; callers are name-based leads, not proof
+   plw agent orient [root] --task TASK [--target file] [--goal GOAL] [--depth DEPTH] [--frame-only] [--full-engine] [--full-engine-edges] [--json]
+       -> Official target-first agent entrypoint; orientation only, no runtime/source mutation authority
+-  plw chain <task> [root] [--target file] [--with-candidates] [--goal GOAL] [--depth DEPTH] [--json]
++  plw chain <task> [root] [--target file] [--with-candidates] [--goal GOAL] [--depth DEPTH] [--frame-only] [--json]
+       -> Single-process task pipeline (orient -> resolve-target -> evidence-needs -> capability-match) with HMAC receipt chaining
+   plw capability list [--json]
+   plw capability describe <command> [--json]
+@@ -5169,10 +5714,12 @@
+   plw skill list [--json]
+   plw skill show <command-or-skill-path> [--json]
+       -> Lists or reads exact version-aligned embedded skill contracts
+-  plw topology [root] [--top N] [--cache-mode auto|refresh|off] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
++  plw topology [root] [--top N] [--cache-mode auto|refresh|off] [--compact|--no-engine] [--full-edges] [--full-engine] [--full-engine-edges] [--json]
+       -> First-contact target-codebase map: file→import→file graph, hubs, entrypoints/tests, SCCs, unresolved/external imports
+   plw mermaid [root] [--depth 1|2|3|4] [--focus PATH] [--direction LR|TD] [--max-nodes N] [--include-tests] [--out FILE] [--json]
+       -> Multi-depth Mermaid architecture & dependency graph (L1 subsystems, L2 modules, L3 hubs/cycles, L4 file symbols+blast radius) with progressive zoom hints
++  plw cycle-break [root] [--target FILE] [--output full|summary] [--json]
++      -> Prescriptive cycle-break advisories and Feedback Arc Set cut plan for circular dependencies
+   plw resolve-target <task> [root] [--target file] [--top N] [--neighbors N] [--json]
+       -> Grounds task to graph nodes; ambiguity/unresolved blocks specialized routing
+   plw evidence-needs <task> [root] [--target file] [--json]
+@@ -5191,7 +5738,7 @@
+   plw semantic describe <command> [--json]
+   plw semantic route <task> [--goal GOAL] [--json]
+       -> Read-only predictive semantics: canonical technical anchors, information gain, and exact skill handoff
+-  plw context <query> [root] [--target file] [--budget N] [--cache-mode MODE] [--json]
++  plw context <query> [root] [--target file] [--budget N] [--detail outline|source] [--output prompt|summary|full] [--cache-mode MODE] [--json]
+       -> Generates budget-bounded prompt context with Kan Extension imputation
+   plw transitions <query> [root] [--target file] [--budget N] [--lineage sha256:id] [--json]
+       -> Compiles valid proof-gap transitions; never executes them
+@@ -5199,15 +5746,15 @@
+       -> Imputes expected imports, callers, and conventions for new/isolated files
+ 
+ 2. Analysis, quality & context
+-  plw check [root] [--analyzers a,b] [--limit N] [--all] [--json]
+-      -> Quick architectural and boundary violation check; --json includes high+medium findings (low/info stay in the analyzer cache)
++  plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]
++      -> Quick structural & boundary check (topo.* + hott.* by default; pass --include-perf or --analyzers perf.* to opt into coding-pattern heuristics); --json includes high+medium findings
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
+   plw simplify [root] [--reference stable-root] [--json]
+       -> Structural simplification candidates (duplicate bodies, forwarding wrappers, redundant branches); read-only candidate generation, never a patch
+-  plw brief <file> [root] [--json]
++  plw brief <file> [root] [--output full|summary] [--json]
+       -> Brief profile of a single file
+-  plw impact <file> [root] [--json]
++  plw impact <file> [root] [--output full|summary] [--json]
+       -> Downstream impact analysis
+   plw outline <file> [root] [--json]
+       -> File symbols and exports outline
+@@ -5343,6 +5890,8 @@
+         sys.exit(cmd_candidate(sub_args))
+     elif cmd in ("semantic", "semantics", "affordance"):
+         sys.exit(cmd_semantic(sub_args))
++    elif cmd == "describe":
++        sys.exit(cmd_semantic(["describe"] + sub_args))
+     elif cmd == "lease":
+         sys.exit(cmd_lease(sub_args))
+     elif cmd == "proof":
+@@ -5433,7 +5982,24 @@
+         # Standard passthrough to hott_kernel.main()
+         # Rewriting sys.argv so hott_kernel sees original arguments
+         sys.argv = [sys.argv[0]] + sys.argv[1:]
++        is_help = any(arg in ("-h", "--help") for arg in sub_args)
+         try:
++            if is_help:
++                import io
++                from contextlib import redirect_stdout
++                buf = io.StringIO()
++                raised = False
++                exit_code = None
++                try:
++                    with redirect_stdout(buf):
++                        hott_kernel.main()
++                except SystemExit as se:
++                    raised = True
++                    exit_code = se.code
++                sys.stdout.write(buf.getvalue().replace("python3 hott_kernel.py ", "plw "))
++                if raised:
++                    sys.exit(exit_code)
++                return
+             hott_kernel.main()
+         except SystemExit as se:
+             sys.exit(se.code)

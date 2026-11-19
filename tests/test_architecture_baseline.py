@@ -1942,5 +1942,111 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(cb_route["selection_source"], "bounded_task_signal")
         self.assertEqual(cb_route["capability"], "cycle-break")
 
+    def test_calibration_ux_v18_uniform_output_json_flag_normalization(self) -> None:
+        """Consolidated calibration overlay + uniform --output/--format json normalization."""
+        import io
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+
+        import hott_kernel
+        import plw_cli
+
+        tmp_ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_ctx.cleanup)
+        tmp_root = Path(tmp_ctx.name) / "v18_uniform_json_repo"
+        (tmp_root / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (tmp_root / "src" / "app" / "app.ts").write_text(
+            "import { helper } from './helper';\n"
+            "export class App { run() { return helper(); } }\n",
+            encoding="utf-8",
+        )
+        (tmp_root / "src" / "app" / "helper.ts").write_text(
+            "export function helper() { return 42; }\n",
+            encoding="utf-8",
+        )
+
+        # 1. plw_cli commands accept --output json, --output=json, --format json, --format=json uniformly
+        cli_cases = [
+            (plw_cli.cmd_resolve_target, ["--root", str(tmp_root), "--target", "app", "--output", "json"]),
+            (plw_cli.cmd_resolve_target, ["--root", str(tmp_root), "--target", "app", "--output=json"]),
+            (plw_cli.cmd_mermaid, [str(tmp_root), "app", "--format", "json"]),
+            (plw_cli.cmd_mermaid, [str(tmp_root), "app", "--format=json"]),
+            (plw_cli.cmd_check, [str(tmp_root), "--target", "app", "--output", "json"]),
+            (plw_cli.cmd_simplify, [str(tmp_root), "--target", "app", "--format=json"]),
+            (plw_cli.cmd_context, ["helper", str(tmp_root), "--output", "json"]),
+            (plw_cli.cmd_context, ["helper", str(tmp_root), "--output=json"]),
+            (plw_cli.cmd_context, ["helper", str(tmp_root), "--format", "json"]),
+            (plw_cli.cmd_semantic, ["describe", "cycle-break", "--output", "json"]),
+        ]
+        for fn, argv in cli_cases:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = fn(argv)
+            self.assertEqual(rc, 0, f"{fn.__name__}({argv}) failed with rc={rc}: {buf.getvalue()}")
+            payload = json.loads(buf.getvalue())
+            self.assertIsInstance(payload, dict, f"{fn.__name__}({argv}) did not emit JSON object")
+
+        # 2. plw_cli fails closed (exit 2) on invalid --output / --format values
+        for fn, argv in [
+            (plw_cli.cmd_resolve_target, ["--root", str(tmp_root), "--target", "app", "--output", "bogus"]),
+            (plw_cli.cmd_mermaid, [str(tmp_root), "--format", "yaml"]),
+            (plw_cli.cmd_context, ["helper", str(tmp_root), "--output", "bogus"]),
+        ]:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    fn(argv)
+            self.assertEqual(ctx.exception.code, 2, f"{fn.__name__}({argv}) should fail closed with rc=2")
+
+        # 3. Missing required arg with --output json still emits structured JSON error
+        buf_err = io.StringIO()
+        with redirect_stdout(buf_err):
+            with self.assertRaises(SystemExit) as err_ctx:
+                plw_cli.cmd_context(["--root", str(tmp_root), "--output", "json"])
+        self.assertEqual(err_ctx.exception.code, 2)
+        err_payload = json.loads(buf_err.getvalue())
+        self.assertIn("error", err_payload)
+
+        # 4. hott_kernel CLI passthrough commands support --output json, --output=json, --format json, --format=json, --output=summary
+        kernel_cases = [
+            ("impact", ["hott_kernel.py", "impact", "app", str(tmp_root), "--output", "json"]),
+            ("impact", ["hott_kernel.py", "impact", "app", str(tmp_root), "--output=json"]),
+            ("brief", ["hott_kernel.py", "brief", "app", str(tmp_root), "--format", "json"]),
+            ("brief", ["hott_kernel.py", "brief", "app", str(tmp_root), "--format=json"]),
+            ("brief", ["hott_kernel.py", "brief", "app", str(tmp_root), "--output=summary"]),
+            ("cycle_break", ["hott_kernel.py", "cycle-break", "app", str(tmp_root), "--output", "json"]),
+            ("cycle_break", ["hott_kernel.py", "cycle-break", "app", str(tmp_root), "--format=json"]),
+        ]
+        for key, argv in kernel_cases:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                hott_kernel._KERNEL_CLI_DISPATCH[key](argv)
+            payload = json.loads(buf.getvalue())
+            self.assertIsInstance(payload, dict, f"kernel {key}({argv}) did not emit JSON")
+            self.assertNotIn("error", payload, f"kernel {key}({argv}) returned error: {payload}")
+
+        # 5. hott_kernel fails closed with exit 2 on invalid output mode
+        for key, argv in [
+            ("impact", ["hott_kernel.py", "impact", "app", str(tmp_root), "--output", "bogus"]),
+            ("cycle_break", ["hott_kernel.py", "cycle-break", "app", str(tmp_root), "--format=yaml"]),
+        ]:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    hott_kernel._KERNEL_CLI_DISPATCH[key](argv)
+            self.assertEqual(ctx.exception.code, 2)
+            payload = json.loads(buf.getvalue())
+            self.assertIn("Invalid output mode", payload.get("error", ""))
+
+        # 6. Consolidated overlay integrity: v3..v17 dirs replaced by calibration_ux_consolidated_v1
+        overlay_dir = Path(plw_cli.__file__).resolve().parent / "runtime_overlay"
+        self.assertTrue((overlay_dir / "calibration_ux_consolidated_v1" / "change.patch").is_file())
+        self.assertTrue((overlay_dir / "calibration_ux_consolidated_v1" / "PATCH_SHA256").is_file())
+        for v in range(3, 18):
+            self.assertFalse(
+                (overlay_dir / f"calibration_ux_v{v}").exists(),
+                f"Superseded overlay calibration_ux_v{v} should be consolidated",
+            )
+
 if __name__ == "__main__":
     unittest.main()

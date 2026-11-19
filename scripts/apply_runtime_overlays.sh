@@ -371,17 +371,14 @@ grep -Fq '_KERNEL_CLI_DISPATCH' hott_kernel.py
 grep -Fq 'def _cli_memory_operation(' hott_kernel.py
 grep -Fq 'def is_python_type_checking_guard(' language_semantics.py
 grep -Fq 'is_python_type_checking_guard as _is_type_checking_guard' codebase/cycle_break.py
-apply_reviewable_overlay "calibration_ux_v3"
+apply_reviewable_overlay "calibration_ux_consolidated_v1"
 grep -Fq '"between"' codebase/static_ui_reference.py
 grep -Fq 'cycle_basis_omitted_count' hott_kernel.py
 grep -Fq '{"cycle-break": "cycle_break"}' hott_kernel.py
 grep -Fq 'Path(value).is_file()' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v4"
 grep -Fq 'include_engine: bool = True' hott_kernel.py
-grep -Fq 'out["target"] = target_norm_out' hott_kernel.py
+grep -Fq 'out["target"] = target_norm' hott_kernel.py
 grep -Fq '"--compact", "--no-engine"' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v5"
-grep -Fq 'len(label_words) > 4' codebase/static_ui_reference.py
 grep -Fq 'strategy = "barrel_reexport"' codebase/cycle_break.py
 grep -Fq 'is_index_barrel' codebase/cycle_break.py
 grep -Fq 'compacted["witness_edge_count"]' hott_kernel.py
@@ -391,44 +388,33 @@ grep -Fq '"target_resolution": target_res_frame' hott_kernel.py
 grep -Fq 'root_relative_exact' codebase/topology_analyzers.py
 grep -Fq 'scan_root: Optional[str] = None,' core/context_optimizer.py
 grep -Fq 'detail=detail,' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v6"
 grep -Fq '"cycle_break": "python3 hott_kernel.py cycle-break' hott_kernel.py
 grep -Fq '_CHECK_COMPACT_FINDINGS_LIMIT = 10' hott_kernel.py
 grep -Fq 'basis_cap = 2 if compact else 5' hott_kernel.py
 grep -Fq 'action="store_true", dest="compact"' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v7"
 grep -Fq '"ui_source_handoff": ui_handoff_frame,' hott_kernel.py
 grep -Fq 'if operation == "index" and pos1 in ("status", "warm", "clean"):' plw_cli.py
 grep -Fq 'def _query_ui_words(query: str) -> List[str]:' codebase/static_ui_reference.py
 grep -Fq 'def _blank_multiline_template_literals(content: str) -> str:' codebase/performance_analyzers.py
 grep -Fq 'if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:' codebase/topology_analyzers.py
-apply_reviewable_overlay "calibration_ux_v8"
-apply_reviewable_overlay "calibration_ux_v9"
-apply_reviewable_overlay "calibration_ux_v10"
-apply_reviewable_overlay "calibration_ux_v11"
 grep -Fq '_JS_TS_EXTENSIONS = frozenset({' codebase/performance_analyzers.py
 grep -Fq 'if b_files and not any(' codebase/hott_analyzers.py
 grep -Fq 'Test.kt", "Tests.kt", "Spec.kt", "_test.rs' core/shared_graph.py
-apply_reviewable_overlay "calibration_ux_v12"
 grep -Fq 'def get_structural_analyzers()' core/analyzer_registry.py
 grep -Fq 'include_perf: bool = False' hott_kernel.py
-apply_reviewable_overlay "calibration_ux_v13"
 grep -Fq 'def _split_camel_parts(token: str) -> List[str]:' core/target_resolution.py
 grep -Fq 'seed_terms: Optional[Sequence[str]] = None,' core/topology_engine.py
 grep -Fq 'target_resolved: bool = True,' hott_kernel.py
-apply_reviewable_overlay "calibration_ux_v14"
 grep -Fq 'def _estimate_tokens(' core/context_optimizer.py
 grep -Fq 'used_chars <= char_budget and estimated_tokens <= budget_tokens' core/context_optimizer.py
 grep -Fq '"plw": "plw --help",' core/semantic_affordance.py
 grep -Fq '@decl:{d_line}' plw_cli.py
 grep -Fq '# Alias of: ' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v15"
 grep -Fq '"unique_stem_match"' codebase/topology_analyzers.py
 grep -Fq 'parse_rust_imports,' codebase/topology_analyzers.py
 grep -Fq 'summary_payload["error"] = result["error"]' hott_kernel.py
 grep -Fq 'iso_examples = sorted(m["file"] for m in isomorphs[:2])' memory/kan_extension.py
 grep -Fq 'Status: no_match — ' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v16"
 grep -Fq '"unique_stem"' core/target_resolution.py
 grep -Fq 'resolved_rel, _, _ = _resolve_query_target(' codebase/mermaid_graph.py
 grep -Fq 'resolved_filter_target, _, _ = _resolve_query_target(' codebase/angular_semantics.py
@@ -437,13 +423,14 @@ grep -Fq 'query_derived_from_file = False' plw_cli.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
-apply_reviewable_overlay "calibration_ux_v17"
 grep -Fq 'elif len(requested) >= 2:' codebase/topology_analyzers.py
 grep -Fq 'elif len(requested) >= 2:' core/target_resolution.py
 grep -Fq '"cycle-break": _contract(' core/semantic_affordance.py
 grep -Fq 'def _filter_ast_list(rows: List[Any])' plw_cli.py
 grep -Fq 'res["unfiltered_findings_count"] = len(orig_findings)' plw_cli.py
 grep -Fq 'if not opts.task and opts.target:' plw_cli.py
+grep -Fq 'def _normalize_output_json_argv(' plw_cli.py
+grep -Fq 'is_output_flag = "--output" in flag_set' hott_kernel.py
 grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py
 grep -Fq 'new\s+\w*LRU\w*' codebase/performance_analyzers.py
 python3 -m py_compile core/operation_plan.py
