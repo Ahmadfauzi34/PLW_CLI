@@ -428,6 +428,12 @@ grep -Fq 'parse_rust_imports,' codebase/topology_analyzers.py
 grep -Fq 'summary_payload["error"] = result["error"]' hott_kernel.py
 grep -Fq 'iso_examples = sorted(m["file"] for m in isomorphs[:2])' memory/kan_extension.py
 grep -Fq 'Status: no_match — ' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v16"
+grep -Fq '"unique_stem"' core/target_resolution.py
+grep -Fq 'resolved_rel, _, _ = _resolve_query_target(' codebase/mermaid_graph.py
+grep -Fq 'resolved_filter_target, _, _ = _resolve_query_target(' codebase/angular_semantics.py
+grep -Fq 'resolved_cb_target, _, _ = _resolve_query_target(' hott_kernel.py
+grep -Fq 'query_derived_from_file = False' plw_cli.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
