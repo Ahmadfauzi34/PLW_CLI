@@ -1818,5 +1818,129 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertEqual(simp_payload["filters"]["target"], "PyodideClient")
         self.assertTrue(len(simp_payload["candidates"]) >= 1)
 
+    def test_calibration_ux_v17_short_stem_target_only_ui_swap_ast_precision_check_filter_and_cycle_break_contract(self) -> None:
+        import plw_cli
+        v17_root = self.proj.parent / "v17_proj"
+        (v17_root / "src" / "app").mkdir(parents=True)
+        (v17_root / "src" / "core" / "rag").mkdir(parents=True)
+        (v17_root / "src" / "dup_a").mkdir(parents=True)
+        (v17_root / "src" / "dup_b").mkdir(parents=True)
+
+        (v17_root / "src" / "app" / "app.ts").write_text(
+            "import { Component } from '@angular/core';\n"
+            "import { queryRag } from '../core/rag/rag';\n"
+            "@Component({ selector: 'app-root', template: `<button class=\"btn-send\" aria-label=\"Send\">Send</button>` })\n"
+            "export class App { run() { return queryRag(); } }\n",
+            encoding="utf-8",
+        )
+        (v17_root / "src" / "app" / "app.spec.ts").write_text(
+            "import { App } from './app';\n"
+            "export class AppSpec { check() { return new App().run(); } }\n",
+            encoding="utf-8",
+        )
+        (v17_root / "src" / "core" / "rag" / "rag.ts").write_text(
+            "import { App } from '../../app/app';\n"
+            "export function queryRag() { return App; }\n",
+            encoding="utf-8",
+        )
+        # Ambiguous short stem 'db' in two directories -> must fail closed
+        (v17_root / "src" / "dup_a" / "db.ts").write_text("export const dbA = 1;\n", encoding="utf-8")
+        (v17_root / "src" / "dup_b" / "db.ts").write_text("export const dbB = 2;\n", encoding="utf-8")
+
+        # 1. Short 2-3 char exact stem resolution (app, rag) + ambiguous fail-closed (db)
+        out_app = hott_kernel.kernel_outline(str(v17_root), "app")
+        self.assertTrue(out_app.get("exists"), out_app)
+        self.assertTrue(str(out_app.get("file", "")).endswith("src/app/app.ts"), out_app)
+        self.assertEqual(out_app.get("target_resolution"), "unique_stem_match")
+
+        out_rag = hott_kernel.kernel_outline(str(v17_root), "rag")
+        self.assertTrue(out_rag.get("exists"), out_rag)
+        self.assertTrue(str(out_rag.get("file", "")).endswith("src/core/rag/rag.ts"), out_rag)
+
+        out_db = hott_kernel.kernel_outline(str(v17_root), "db")
+        self.assertFalse(out_db.get("exists"), out_db)
+        self.assertEqual(out_db.get("target_resolution"), "ambiguous")
+        self.assertEqual(len(out_db.get("candidate_targets", [])), 2)
+
+        # 2. Target-only invocation without mandatory task on resolve-target & chain
+        buf_rt = io.StringIO()
+        with redirect_stdout(buf_rt):
+            rc_rt = plw_cli.cmd_resolve_target([str(v17_root), "--target", "rag", "--json"])
+        self.assertEqual(rc_rt, 0)
+        rt_payload = json.loads(buf_rt.getvalue())
+        self.assertEqual(rt_payload["target_resolution"]["resolution"]["state"], "RESOLVED")
+        self.assertEqual(rt_payload["target_resolution"]["resolution"]["selected_targets"], ["src/core/rag/rag.ts"])
+
+        buf_ch = io.StringIO()
+        with redirect_stdout(buf_ch):
+            rc_ch = plw_cli.cmd_chain(["--root", str(v17_root), "--file", "app", "--json"])
+        self.assertEqual(rc_ch, 0)
+        ch_payload = json.loads(buf_ch.getvalue())
+        self.assertEqual(ch_payload["task"], "app")
+        self.assertEqual(ch_payload["target_resolution"]["resolution"]["state"], "RESOLVED")
+
+        # Missing both task and --target must still fail closed with SystemExit(2)
+        with self.assertRaises(SystemExit) as ctx_err:
+            plw_cli.cmd_resolve_target(["--root", str(v17_root), "--json"])
+        self.assertEqual(ctx_err.exception.code, 2)
+
+        # 3. ui static <root> <query> positional auto-swap
+        buf_ui = io.StringIO()
+        with redirect_stdout(buf_ui):
+            rc_ui = plw_cli.cmd_ui_static([str(v17_root), "send", "--json"])
+        self.assertEqual(rc_ui, 0)
+        ui_payload = json.loads(buf_ui.getvalue())
+        self.assertEqual(ui_payload["query"], "send")
+        self.assertEqual(ui_payload["decision"]["status"], "RESOLVED")
+
+        # 4. plw check --target / --file scoping
+        buf_chk_all = io.StringIO()
+        with redirect_stdout(buf_chk_all):
+            rc_chk_all = plw_cli.cmd_check([str(v17_root), "--all", "--json"])
+        self.assertEqual(rc_chk_all, 0)
+        chk_all = json.loads(buf_chk_all.getvalue())
+
+        buf_chk_rag = io.StringIO()
+        with redirect_stdout(buf_chk_rag):
+            rc_chk_rag = plw_cli.cmd_check([str(v17_root), "--target", "rag", "--json"])
+        self.assertEqual(rc_chk_rag, 0)
+        chk_rag = json.loads(buf_chk_rag.getvalue())
+        self.assertEqual(chk_rag.get("target_filter"), ["rag"])
+        self.assertEqual(chk_rag.get("unfiltered_findings_count"), len(chk_all.get("findings", [])))
+        self.assertEqual(chk_rag["unified_summary"]["total_findings"], len(chk_rag["findings"]))
+
+        # 5. plw ast --file strict exact stem vs spec/directory disambiguation (via mocked codesearch)
+        fake_ast_res = {
+            "ok": True,
+            "mode": "defs",
+            "root": str(v17_root),
+            "query": "App",
+            "summary": {"total": 3, "shown": 3},
+            "engine_result": {
+                "hits": [
+                    {"path": "src/app/app.ts", "line": 4, "name": "App"},
+                    {"path": "src/app/app.spec.ts", "line": 2, "name": "AppSpec"},
+                    {"path": "src/app/other/helper.ts", "line": 1, "name": "AppHelper"},
+                ]
+            },
+        }
+        with mock.patch("core.codesearch_engine.discover_codesearch", return_value=("/bin/fake", "test")),              mock.patch("core.codesearch_engine.run_query", return_value=fake_ast_res):
+            buf_ast = io.StringIO()
+            with redirect_stdout(buf_ast):
+                rc_ast = plw_cli.cmd_ast(["defs", str(v17_root), "App", "--file", "app", "--json"])
+        self.assertEqual(rc_ast, 0)
+        ast_payload = json.loads(buf_ast.getvalue())
+        self.assertEqual([h["path"] for h in ast_payload["engine_result"]["hits"]], ["src/app/app.ts"])
+        self.assertEqual(ast_payload["summary"]["total"], 1)
+
+        # 6. cycle-break registered in semantic_affordance + semantic route
+        from core.semantic_affordance import describe_command, route_task_semantics
+        cb_desc = describe_command("cycle-break")
+        self.assertTrue(cb_desc["known"], cb_desc)
+        self.assertEqual(cb_desc["command"], "cycle-break")
+        cb_route = route_task_semantics("find circular dependencies in modules")
+        self.assertEqual(cb_route["selection_source"], "bounded_task_signal")
+        self.assertEqual(cb_route["capability"], "cycle-break")
+
 if __name__ == "__main__":
     unittest.main()

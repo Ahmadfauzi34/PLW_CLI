@@ -437,6 +437,13 @@ grep -Fq 'query_derived_from_file = False' plw_cli.py
 grep -Fq '"--include-perf"' plw_cli.py
 grep -Fq 'if op in ("stats", "status"):' hott_kernel.py
 grep -Fq 'parser.add_argument("--target", "--file", default=None, dest="target_focus")' plw_cli.py
+apply_reviewable_overlay "calibration_ux_v17"
+grep -Fq 'elif len(requested) >= 2:' codebase/topology_analyzers.py
+grep -Fq 'elif len(requested) >= 2:' core/target_resolution.py
+grep -Fq '"cycle-break": _contract(' core/semantic_affordance.py
+grep -Fq 'def _filter_ast_list(rows: List[Any])' plw_cli.py
+grep -Fq 'res["unfiltered_findings_count"] = len(orig_findings)' plw_cli.py
+grep -Fq 'if not opts.task and opts.target:' plw_cli.py
 grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py
 grep -Fq 'new\s+\w*LRU\w*' codebase/performance_analyzers.py
 python3 -m py_compile core/operation_plan.py
