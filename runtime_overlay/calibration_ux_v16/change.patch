@@ -1,0 +1,368 @@
+--- a/core/target_resolution.py
++++ b/core/target_resolution.py
+@@ -113,6 +113,34 @@
+             return matches[0], [], "unique_suffix"
+         if len(matches) > 1:
+             return None, matches, "ambiguous"
++        if os.path.splitext(os.path.basename(requested))[1] == "":
++            if "/" in requested:
++                stem_matches = sorted(
++                    original for normed, original in vertex_norm.items()
++                    if os.path.splitext(normed)[0].endswith(suffix)
++                )
++            elif len(requested) >= 4:
++                req_l = requested.lower()
++                req_collapsed = re.sub(r"[._-]+", "", req_l)
++                exact_stem = sorted(
++                    original for normed, original in vertex_norm.items()
++                    if os.path.splitext(os.path.basename(normed))[0].lower() == req_l
++                )
++                if exact_stem:
++                    stem_matches = exact_stem
++                elif len(req_collapsed) >= 4:
++                    stem_matches = sorted(
++                        original for normed, original in vertex_norm.items()
++                        if re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(normed))[0].lower()) == req_collapsed
++                    )
++                else:
++                    stem_matches = []
++            else:
++                stem_matches = []
++            if len(stem_matches) == 1:
++                return stem_matches[0], [], "unique_stem"
++            if len(stem_matches) > 1:
++                return None, stem_matches, "ambiguous"
+     return None, [], "unresolved"
+ 
+ 
+--- a/codebase/mermaid_graph.py
++++ b/codebase/mermaid_graph.py
+@@ -1229,6 +1229,18 @@
+             cyclic_files.add(str(member).replace("\\", "/"))
+ 
+     focus_norm = str(focus or "").strip().replace("\\", "/").strip("/")
++    if focus_norm and not any(focus_norm.lower() in r.lower() for r in rel_by_abs.values()):
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved_rel, _, _ = _resolve_query_target(
++                focus_norm,
++                set(rel_by_abs.values()),
++                scan_root=None,
++            )
++            if resolved_rel:
++                focus_norm = resolved_rel
++        except Exception:
++            pass
+     root_arg = scan_root if scan_root != "." else "."
+ 
+     if depth == 1:
+--- a/codebase/angular_semantics.py
++++ b/codebase/angular_semantics.py
+@@ -877,20 +877,58 @@
+     file_map = shared_graph.get("file_map", {}) if isinstance(shared_graph, dict) else {}
+     vertices = set(shared_graph.get("vertices", [])) if isinstance(shared_graph, dict) else set()
+     normalized_file_filter = normalize_path(file_filter) if file_filter else None
++    resolved_filter_target: Optional[str] = None
++    if normalized_file_filter:
++        candidate_pool = vertices if vertices else set(file_map)
++        has_direct = any(
++            normalize_path(fp) == normalized_file_filter
++            or normalize_path(fp).endswith("/" + normalized_file_filter)
++            for fp in candidate_pool
++        )
++        if not has_direct:
++            try:
++                from codebase.topology_analyzers import _resolve_query_target
++                resolved_filter_target, _, _ = _resolve_query_target(
++                    normalized_file_filter,
++                    {normalize_path(fp) for fp in candidate_pool},
++                    scan_root=shared_graph.get("scan_root"),
++                )
++            except Exception:
++                resolved_filter_target = None
+     components: List[Dict[str, Any]] = []
++    all_extracted: List[Dict[str, Any]] = []
+     files_considered = 0
+     for file_path in sorted(file_map):
+         if vertices and file_path not in vertices:
+             continue
+-        if normalized_file_filter and normalize_path(file_path) != normalized_file_filter:
+-            # Also allow caller-relative suffix to avoid forcing absolute roots.
+-            if not normalize_path(file_path).endswith("/" + normalized_file_filter) and normalize_path(file_path) != normalized_file_filter:
+-                continue
++        norm_fp = normalize_path(file_path)
+         content = file_map.get(file_path)
+         if not isinstance(content, str):
+             continue
++        if normalized_file_filter:
++            target_cmp = resolved_filter_target or normalized_file_filter
++            if norm_fp != target_cmp and not norm_fp.endswith("/" + target_cmp):
++                if resolved_filter_target is None and "/" not in normalized_file_filter:
++                    all_extracted.extend(
++                        extract_angular_components(
++                            file_path, content, read_resources=read_resources, resource_root=shared_graph.get("scan_root"),
++                        )
++                    )
++                continue
+         files_considered += 1
+         components.extend(extract_angular_components(file_path, content, read_resources=read_resources, resource_root=shared_graph.get("scan_root")))
++    if normalized_file_filter and not components and all_extracted:
++        flt_collapsed = re.sub(r"[._-]+", "", normalized_file_filter.lower())
++        matched_rows = [
++            row for row in all_extracted
++            if str(row.get("class_name", "")).lower() == normalized_file_filter.lower()
++            or re.sub(r"[._-]+", "", str(row.get("class_name", "")).lower()) == flt_collapsed
++            or re.sub(r"[._-]+", "", str(row.get("class_name", "")).lower()).removesuffix("component") == flt_collapsed.removesuffix("component")
++            or str(row.get("selector", {}).get("value", "")).lower() == normalized_file_filter.lower()
++        ]
++        if matched_rows:
++            components = matched_rows
++            files_considered = len({row.get("file") for row in matched_rows})
+     if selector_filter is not None:
+         components = [row for row in components if row.get("selector", {}).get("value") == selector_filter]
+ 
+--- a/hott_kernel.py
++++ b/hott_kernel.py
+@@ -2608,14 +2608,27 @@
+         target_norm = os.path.normpath(target_file).replace("\\", "/")
+         if target_norm.startswith("./"):
+             target_norm = target_norm[2:]
++        resolved_cb_target: Optional[str] = None
++        try:
++            from codebase.topology_analyzers import _resolve_query_target
++            resolved_cb_target, _, _ = _resolve_query_target(
++                target_norm,
++                set(graph.get("vertices", [])),
++                scan_root=scan_root,
++            )
++        except Exception:
++            resolved_cb_target = None
++        match_tokens = [target_norm]
++        if resolved_cb_target and resolved_cb_target not in match_tokens:
++            match_tokens.append(resolved_cb_target)
+         # Filter advisories and cuts affecting target_file
+         advisories = [
+             adv for adv in advisories
+-            if any(target_norm in node for node in adv.get("cycle", []))
++            if any(any(tok in node for tok in match_tokens) for node in adv.get("cycle", []))
+         ]
+         recommended_cuts = [
+             cut for cut in plan.get("recommended_cuts", [])
+-            if target_norm in cut.get("source", "") or target_norm in cut.get("target", "")
++            if any(tok in cut.get("source", "") or tok in cut.get("target", "") for tok in match_tokens)
+         ]
+         plan = {
+             **plan,
+@@ -5176,9 +5189,40 @@
+ 
+ 
+ def _cli_cycle_break(argv: List[str]) -> None:
+-    root = _cli_positional_root(argv, idx=2)
+     target_file = _cli_flag_value(argv, "--target", "--target-file", "--file")
+     output_mode = _cli_flag_value(argv, "--output", default="full")
++    flag_root = _cli_flag_value(argv, "--root")
++    pos_args: List[str] = []
++    skip_next = False
++    for idx in range(2, len(argv)):
++        if skip_next:
++            skip_next = False
++            continue
++        arg = argv[idx]
++        if arg in ("--target", "--target-file", "--file", "--output", "--root", "--cache-mode"):
++            skip_next = True
++            continue
++        if arg.startswith("-"):
++            continue
++        pos_args.append(arg)
++    if flag_root:
++        root = flag_root
++        if target_file is None and pos_args:
++            target_file = pos_args[0]
++    elif len(pos_args) >= 2:
++        p0, p1 = pos_args[0], pos_args[1]
++        if os.path.isdir(p1) and not os.path.isdir(p0):
++            root = p1
++            if target_file is None:
++                target_file = p0
++        else:
++            root = p0
++            if target_file is None:
++                target_file = p1
++    elif len(pos_args) == 1:
++        root = pos_args[0]
++    else:
++        root = "."
+     _emit_cli_result(kernel_cycle_break(root, target_file, output_mode))
+ 
+ 
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -90,6 +90,7 @@
+ 
+ import sys
+ import os
++import re
+ import argparse
+ import json
+ import signal
+@@ -1331,6 +1332,8 @@
+     parser.add_argument("root", nargs="?", default=".")
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--reference", default=None)
++    parser.add_argument("--target", "--file", default=None, dest="target_filter")
++    parser.add_argument("--kind", default=None, dest="kind_filter")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
+     root = opts.root_flag or opts.root or "."
+@@ -1342,6 +1345,35 @@
+         print(f"[PLW Error] simplify failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+         return 1
+ 
++    if opts.target_filter or opts.kind_filter:
++        t_flt = (opts.target_filter or "").strip().replace("\\", "/").strip("/")
++        t_collapsed = re.sub(r"[._-]+", "", t_flt.lower()) if t_flt else ""
++        k_flt = (opts.kind_filter or "").strip().lower()
++
++        def _match_cand(row: Dict[str, Any]) -> bool:
++            if k_flt and k_flt not in str(row.get("kind", "")).lower():
++                return False
++            if t_flt:
++                row_files = [str(f).replace("\\", "/") for f in (row.get("files", []) or [])]
++                row_names = [str(n) for n in (row.get("names", []) or [])]
++                matched_f = any(
++                    t_flt.lower() in rf.lower()
++                    or (len(t_collapsed) >= 4 and t_collapsed in re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(rf))[0].lower()))
++                    for rf in row_files
++                ) or any(
++                    t_flt.lower() == rn.lower()
++                    or (len(t_collapsed) >= 4 and t_collapsed == re.sub(r"[._-]+", "", rn.lower()))
++                    for rn in row_names
++                )
++                if not matched_f:
++                    return False
++            return True
++
++        target_container = result.get("candidate", {}) if reference else result
++        if isinstance(target_container, dict) and isinstance(target_container.get("candidates"), list):
++            target_container["candidates"] = [r for r in target_container["candidates"] if _match_cand(r)]
++            result["filters"] = {"target": opts.target_filter, "kind": opts.kind_filter}
++
+     if as_json:
+         print(json.dumps(result, indent=2))
+         return 0
+@@ -2319,7 +2351,7 @@
+     parser.add_argument("positional", nargs="*")
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     parser.add_argument("--no-resources", action="store_true")
+-    parser.add_argument("--file", default=None, dest="file_filter")
++    parser.add_argument("--file", "--target", default=None, dest="file_filter")
+     parser.add_argument("--selector", default=None, dest="selector_filter")
+     parser.add_argument("--cache-mode", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+@@ -2330,11 +2362,18 @@
+     file_filter = opts.file_filter
+     selector_filter = opts.selector_filter
+     cache_mode = opts.cache_mode
+-    if len(positional) > 1:
++    if len(positional) > 2 or (len(positional) == 2 and (file_filter is not None or opts.root_flag is not None or (os.path.isdir(positional[0]) and os.path.isdir(positional[1])))):
+         _cli_error("angular-anchors accepts at most one root path",
+                    "invalid_arguments", as_json=as_json, rc=2)
+         return 2
+-    root = opts.root_flag or (positional[0] if positional else ".")
++    if len(positional) == 2:
++        p0, p1 = positional[0], positional[1]
++        if os.path.isdir(p1) and not os.path.isdir(p0):
++            root, file_filter = p1, p0
++        else:
++            root, file_filter = p0, p1
++    else:
++        root = opts.root_flag or (positional[0] if positional else ".")
+     if cache_mode is not None:
+         cache_error = hott_kernel._set_graph_cache_mode(cache_mode)
+         if cache_error:
+@@ -4189,6 +4228,7 @@
+     """Generate a multi-depth Mermaid architecture & dependency diagram (depths 1..4)."""
+     parser = _PlwArgumentParser(prog="plw mermaid")
+     parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("focus_pos", nargs="?", default=None)
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--depth", type=int, default=1)
+     parser.add_argument("--focus", default=None)
+@@ -4199,8 +4239,11 @@
+     parser.add_argument("--out", default=None)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+     opts = _parse_cli_args(parser, args)
++    if opts.focus_pos is not None and opts.root_flag is None:
++        if os.path.isdir(opts.focus_pos) and not os.path.isdir(opts.root):
++            opts.root, opts.focus_pos = opts.focus_pos, opts.root
+     opts.root = opts.root_flag if opts.root_flag is not None else opts.root
+-    opts.focus = opts.focus if opts.focus is not None else opts.target_focus
++    opts.focus = opts.focus if opts.focus is not None else (opts.target_focus if opts.target_focus is not None else opts.focus_pos)
+ 
+     result = hott_kernel.kernel_mermaid(
+         opts.root,
+@@ -4394,7 +4437,7 @@
+     parser.add_argument("--root", default=None, dest="root_flag")
+     parser.add_argument("--receipt", default=None)
+     parser.add_argument("--strict-chain", action="store_true", dest="strict_chain")
+-    parser.add_argument("--target", action="append", default=[])
++    parser.add_argument("--target", "--targets", "--target-file", "--target-files", "--file", action="append", default=[], dest="target")
+     parser.add_argument("--top", type=int, default=8)
+     parser.add_argument("--neighbors", type=int, default=8)
+     parser.add_argument("--json", action="store_true", dest="as_json")
+@@ -4817,9 +4860,11 @@
+         opts.operation = "defs"
+     elif opts.operation in ("refs", "references"):
+         opts.operation = "callers"
++    query_derived_from_file = False
+     if opts.file_flag and opts.query is None and opts.operation in ("defs", "callers", "related", "search"):
+         if opts.root is None or os.path.isdir(opts.root):
+             opts.query = Path(opts.file_flag).stem
++            query_derived_from_file = True
+     root, query, resolve_error = _resolve_ast_positionals(
+         opts.operation, opts.root, opts.query, opts.root_flag,
+     )
+@@ -4880,6 +4925,43 @@
+                 )
+     except EngineError as exc:
+         result = error_envelope(opts.operation, str(root), query or "", str(exc))
++    if opts.file_flag and not query_derived_from_file and result.get("ok") and opts.operation in ("defs", "callers", "related", "search"):
++        f_flt = str(opts.file_flag).strip().replace("\\", "/").strip("/")
++        f_collapsed = re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(f_flt))[0].lower())
++
++        def _row_matches_file(row: Any) -> bool:
++            if not isinstance(row, dict):
++                return False
++            rp = str(row.get("path") or "").replace("\\", "/")
++            if not rp:
++                return False
++            if f_flt.lower() in rp.lower():
++                return True
++            if len(f_collapsed) >= 4:
++                r_stem_collapsed = re.sub(r"[._-]+", "", os.path.splitext(os.path.basename(rp))[0].lower())
++                if r_stem_collapsed == f_collapsed:
++                    return True
++            return False
++
++        eng_res = result.get("engine_result")
++        total_filtered = 0
++        if isinstance(eng_res, dict):
++            for rk in ("hits", "calls", "related"):
++                if isinstance(eng_res.get(rk), list):
++                    eng_res[rk] = [r for r in eng_res[rk] if _row_matches_file(r)]
++                    total_filtered = len(eng_res[rk])
++        grouped_map = result.get("grouped")
++        if isinstance(grouped_map, dict):
++            total_filtered = 0
++            for gk in list(grouped_map.keys()):
++                if isinstance(grouped_map[gk], list):
++                    grouped_map[gk] = [r for r in grouped_map[gk] if _row_matches_file(r)]
++                    total_filtered += len(grouped_map[gk])
++        if isinstance(result.get("summary"), dict):
++            result["summary"]["total"] = total_filtered
++            if "shown" in result["summary"]:
++                result["summary"]["shown"] = total_filtered
++        result["file_filter"] = opts.file_flag
+     if opts.as_json:
+         print(json.dumps(result, indent=2, ensure_ascii=False))
+     else:

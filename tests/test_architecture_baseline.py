@@ -1734,5 +1734,89 @@ class ArchitectureBaselineTests(unittest.TestCase):
         iso_hints = [h for h in hints if h.startswith("Rujuk pola implementasi modul isomorphic:")]
         self.assertEqual(len(iso_hints), len(set(iso_hints)))
 
+    def test_calibration_ux_v16_target_resolution_mermaid_cycle_break_angular_and_ast_filter(self) -> None:
+        import plw_cli
+
+        v16_root = self.proj.parent / "v16_repo"
+        (v16_root / "src" / "services").mkdir(parents=True, exist_ok=True)
+        (v16_root / "src" / "services" / "pyodide-client.ts").write_text(
+            "import { Helper } from './worker-pool';\n"
+            "export class PyodideClient {\n"
+            "  clear(): void { const x = 1; return; }\n"
+            "  run(): number { return Helper ? 1 : 0; }\n"
+            "}\n"
+            "export function isReady(v: { kind: string }): boolean {\n"
+            "  if (v.kind === 'ok') {\n"
+            "    return true;\n"
+            "  }\n"
+            "  return false;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (v16_root / "src" / "services" / "worker-pool.ts").write_text(
+            "import { PyodideClient } from './pyodide-client';\n"
+            "export class Helper {\n"
+            "  clear(): void { const x = 1; return; }\n"
+            "  ref(): unknown { return PyodideClient; }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (v16_root / "src" / "ui").mkdir(parents=True, exist_ok=True)
+        (v16_root / "src" / "ui" / "stream-orchestrator.ts").write_text(
+            "import { Component } from '@angular/core';\n"
+            "@Component({ selector: 'app-unified-shell', template: `<div>Shell</div>` })\n"
+            "export class AgentUnifiedShellComponent {}\n",
+            encoding="utf-8",
+        )
+
+        # 1. Explicit stem/PascalCase target resolution in evidence-needs & capability-match + --targets alias
+        buf_en = io.StringIO()
+        with redirect_stdout(buf_en):
+            rc_en = plw_cli.cmd_evidence_needs(["Audit PyodideClient", str(v16_root), "--targets", "PyodideClient", "--json"])
+        self.assertEqual(rc_en, 0)
+        en_payload = json.loads(buf_en.getvalue())
+        self.assertEqual(en_payload["evidence_need_derivation"]["stage"], "EVIDENCE_NEEDS_DERIVED")
+
+        # 2. Mermaid focus stem/PascalCase resolution & positional <focus> (<root> <focus> and <focus> <root>)
+        buf_mm1 = io.StringIO()
+        with redirect_stdout(buf_mm1):
+            rc_mm1 = plw_cli.cmd_mermaid([str(v16_root), "PyodideClient", "--depth", "4", "--json"])
+        self.assertEqual(rc_mm1, 0)
+        mm1_payload = json.loads(buf_mm1.getvalue())
+        self.assertEqual(mm1_payload["decision"], "MERMAID_GRAPH_READY")
+
+        buf_mm2 = io.StringIO()
+        with redirect_stdout(buf_mm2):
+            rc_mm2 = plw_cli.cmd_mermaid(["PyodideClient", str(v16_root), "--depth", "3", "--json"])
+        self.assertEqual(rc_mm2, 0)
+        self.assertEqual(json.loads(buf_mm2.getvalue())["decision"], "MERMAID_GRAPH_READY")
+
+        # 3. cycle-break stem target resolution and <target> <root> positional support
+        cb_res = hott_kernel.kernel_cycle_break(str(v16_root), target_file="PyodideClient")
+        self.assertEqual(cb_res["summary"]["cycles_affecting_target"], 1)
+        self.assertEqual(cb_res["target"], "PyodideClient")
+
+        # 4. angular-anchors --target alias, stem file filter, and class_name filter
+        buf_ng1 = io.StringIO()
+        with redirect_stdout(buf_ng1):
+            rc_ng1 = plw_cli.cmd_angular_anchors([str(v16_root), "--target", "StreamOrchestrator", "--json"])
+        self.assertEqual(rc_ng1, 0)
+        self.assertEqual(json.loads(buf_ng1.getvalue())["summary"]["component_count"], 1)
+
+        buf_ng2 = io.StringIO()
+        with redirect_stdout(buf_ng2):
+            rc_ng2 = plw_cli.cmd_angular_anchors([str(v16_root), "AgentUnifiedShell", "--json"])
+        self.assertEqual(rc_ng2, 0)
+        self.assertEqual(json.loads(buf_ng2.getvalue())["summary"]["component_count"], 1)
+
+        # 5. simplify --target / --kind filtering
+        buf_simp = io.StringIO()
+        with redirect_stdout(buf_simp):
+            rc_simp = plw_cli.cmd_simplify([str(v16_root), "--target", "PyodideClient", "--json"])
+        self.assertEqual(rc_simp, 0)
+        simp_payload = json.loads(buf_simp.getvalue())
+        self.assertEqual(simp_payload["filters"]["target"], "PyodideClient")
+        self.assertTrue(len(simp_payload["candidates"]) >= 1)
+
 if __name__ == "__main__":
     unittest.main()
