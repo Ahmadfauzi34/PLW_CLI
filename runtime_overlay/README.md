@@ -8,7 +8,8 @@ All **95** historical overlays accumulated through `v0.2.41` (base commit `dc15d
 
 - **Previous base capsule SHA-256** (149 files): `58084d32ea5afe395d57ad876e171942ede6473647c5222952d6448392c743fa`
 - **Current baked base capsule SHA-256** (162 files): `8847c999756832bab5b03db18969cb96c65c360c3bb8908b239658eaf8af729b`
-- **Active incremental overlays**: `0`
+- **Active incremental overlays**: `1`
+  - `plw_cli_modular_v1` (`0b4714846140c9f53710218ff34769a184d3e0cdaebeb29e25f224a5c1cf17c6`): decomposes `plw_cli.py` (6,014 -> 391 lines) into 10 acyclic domain modules + `common.py` + `help_text.py` under `core/cli/`, preserving 100% backward-compatible re-exports on `plw_cli`, declarative `_CLI_COMMAND_DISPATCH` parity (184 aliases), and `cyclic_sccs == 0`.
 - **Full per-overlay history & patches**: preserved in Git history at commit `dc15d8e` (`v0.2.41`).
 
 ## Adding a Future Incremental Overlay
