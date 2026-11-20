@@ -62,7 +62,12 @@ apply_reviewable_overlay() {
 # are baked into runtime_source/plw-runtime-src.tar.gz.
 # Append new apply_reviewable_overlay "<name>" entries below as needed.
 
-echo "RUNTIME_OVERLAYS_APPLIED: 0 (baked capsule v0.2.41)"
+apply_reviewable_overlay "plw_cli_modular_v1"
+grep -Fq "_CLI_COMMAND_DISPATCH" plw_cli.py
+grep -Fq "from core.cli.common import" plw_cli.py
+python3 -m py_compile plw_cli.py core/cli/*.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 1 (plw_cli_modular_v1 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py

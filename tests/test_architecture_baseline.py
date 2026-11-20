@@ -2782,5 +2782,162 @@ class ArchitectureBaselineTests(unittest.TestCase):
             self.assertEqual(mani["summary"]["runtime_cyclic_sccs"], 2)
             self.assertTrue(mani["manifold"]["structural_archetype"].endswith("_cyclic"), mani["manifold"]["structural_archetype"])
 
+    def test_plw_cli_modular_v1_structure_reexports_dispatch_and_zero_cycles(self) -> None:
+        """Regression tests for plw_cli.py modularization into core/cli/ domain modules."""
+        import importlib
+        import plw_cli
+        from codebase.cycle_break import find_cyclic_sccs
+        from core.cli.help_text import PLW_CLI_HELP_TEXT
+        from core.shared_graph import build_shared_graph
+
+        repo_root = Path(plw_cli.__file__).resolve().parent
+        cli_dir = repo_root / "core" / "cli"
+
+        # 1. All modular CLI files exist and plw_cli.py stays a thin facade
+        expected_modules = [
+            "__init__.py",
+            "common.py",
+            "analysis_cmds.py",
+            "topology_cmds.py",
+            "ast_cmds.py",
+            "agent_cmds.py",
+            "memory_cmds.py",
+            "action_cmds.py",
+            "ui_cmds.py",
+            "validation_cmds.py",
+            "umbrella_cmds.py",
+            "help_text.py",
+        ]
+        for fname in expected_modules:
+            self.assertTrue((cli_dir / fname).is_file(), f"Missing modular CLI file: core/cli/{fname}")
+
+        plw_cli_lines = len((repo_root / "plw_cli.py").read_text(encoding="utf-8").splitlines())
+        self.assertLess(plw_cli_lines, 500, f"plw_cli.py regrew beyond thin facade: {plw_cli_lines} lines")
+
+        # 2. Backward-compatible re-exports on plw_cli resolve to their exact core.cli.* origin
+        reexport_checks = [
+            ("_PlwArgumentParser", "core.cli.common"),
+            ("_normalize_output_json_argv", "core.cli.common"),
+            ("_parse_cli_args", "core.cli.common"),
+            ("_load_receipt_arg", "core.cli.common"),
+            ("_format_check_output", "core.cli.analysis_cmds"),
+            ("cmd_check", "core.cli.analysis_cmds"),
+            ("cmd_context", "core.cli.analysis_cmds"),
+            ("cmd_topology", "core.cli.topology_cmds"),
+            ("cmd_mermaid", "core.cli.topology_cmds"),
+            ("cmd_simplify", "core.cli.topology_cmds"),
+            ("_resolve_ast_positionals", "core.cli.ast_cmds"),
+            ("cmd_ast", "core.cli.ast_cmds"),
+            ("cmd_agent", "core.cli.agent_cmds"),
+            ("cmd_chain", "core.cli.agent_cmds"),
+            ("cmd_semantic", "core.cli.agent_cmds"),
+            ("cmd_compact_output", "core.cli.memory_cmds"),
+            ("cmd_accountability", "core.cli.memory_cmds"),
+            ("cmd_action_lease", "core.cli.action_cmds"),
+            ("cmd_ui", "core.cli.ui_cmds"),
+            ("cmd_ui_static", "core.cli.ui_cmds"),
+            ("cmd_validation_plan", "core.cli.validation_cmds"),
+            ("cmd_fullstack_state", "core.cli.validation_cmds"),
+            ("cmd_lease", "core.cli.umbrella_cmds"),
+            ("cmd_proof", "core.cli.umbrella_cmds"),
+            ("cmd_ledger", "core.cli.umbrella_cmds"),
+        ]
+        for sym, mod_name in reexport_checks:
+            mod = importlib.import_module(mod_name)
+            self.assertIs(getattr(plw_cli, sym), getattr(mod, sym), f"plw_cli.{sym} diverged from {mod_name}.{sym}")
+
+        # 3. Declarative dispatch registry completeness
+        dispatch = plw_cli._CLI_COMMAND_DISPATCH
+        self.assertIsInstance(dispatch, dict)
+        self.assertGreaterEqual(len(dispatch), 180)
+        for alias, handler in dispatch.items():
+            self.assertTrue(callable(handler), f"Non-callable handler for alias {alias!r}")
+        for required_alias in ("doctor", "ast", "agent", "topology", "mermaid", "check", "ui", "describe", "lease", "proof", "ledger"):
+            self.assertIn(required_alias, dispatch)
+
+        # 4. Help text parity
+        self.assertTrue(PLW_CLI_HELP_TEXT.startswith("PLW — Proof Logic Working"))
+        self.assertIn("plw topology [root]", PLW_CLI_HELP_TEXT)
+
+        # 5. Non-vacuous zero circular dependencies across the full runtime graph
+        graph = build_shared_graph(str(repo_root), include_tool_source=True)
+        vertices = list(graph.get("vertices") or [])
+        edges = list(graph.get("edges") or [])
+        self.assertGreaterEqual(len(vertices), 130, "Expected full runtime graph scan")
+        self.assertGreaterEqual(len(edges), 100, "Expected non-vacuous runtime import edges")
+        adj = {v: [] for v in vertices}
+        for u, v in edges:
+            adj.setdefault(u, []).append(v)
+        sccs = find_cyclic_sccs(vertices, adj)
+        self.assertEqual(sccs, [], f"Modular CLI introduced circular dependencies: {sccs}")
+        # 6. Permanent modular hygiene gate: 0 unused top-level imports & 0 unbound globals across core/cli/*.py
+        import builtins
+        import symtable
+        for mod_file in sorted(cli_dir.glob("*.py")):
+            mod_src = mod_file.read_text(encoding="utf-8")
+            mod_tree = ast.parse(mod_src, filename=str(mod_file))
+            imported = {}
+            for node in mod_tree.body:
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        imported[a.asname or a.name.split(".")[0]] = node.lineno
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        imported[a.asname or a.name] = node.lineno
+            used = set()
+            for node in mod_tree.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name):
+                        used.add(sub.id)
+            unused = sorted(n for n in imported if n not in used)
+            self.assertEqual(unused, [], f"Unused imports in {mod_file.name}: {unused}")
+
+            defined = set(dir(builtins)) | {"__name__", "__file__", "__doc__", "__package__", "__spec__"} | set(imported)
+            for node in mod_tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name):
+                            defined.add(tgt.id)
+            st = symtable.symtable(mod_src, str(mod_file), "exec")
+            def _check_scope(tbl, path_label):
+                for sym in tbl.get_symbols():
+                    if sym.is_global() and sym.is_referenced() and not sym.is_assigned():
+                        self.assertIn(sym.get_name(), defined, f"Unbound global {sym.get_name()!r} in {mod_file.name}:{path_label}")
+                for child in tbl.get_children():
+                    _check_scope(child, f"{path_label}.{child.get_name()}")
+            _check_scope(st, "<module>")
+
+        # 7. Live --help and --json error contract gate across all unique dispatch handlers
+        seen_fns = set()
+        for alias, fn in dispatch.items():
+            if fn in seen_fns:
+                continue
+            seen_fns.add(fn)
+            buf_h, err_h = io.StringIO(), io.StringIO()
+            rc_h = None
+            try:
+                with redirect_stdout(buf_h), mock.patch("sys.stderr", new=err_h):
+                    rc_h = fn(["--help"])
+            except SystemExit as se:
+                rc_h = se.code
+            self.assertEqual(rc_h, 0, f"{alias} --help failed: rc={rc_h}")
+            self.assertTrue(buf_h.getvalue().strip(), f"{alias} --help emitted empty stdout")
+
+            buf_e, err_e = io.StringIO(), io.StringIO()
+            rc_e = None
+            try:
+                with redirect_stdout(buf_e), mock.patch("sys.stderr", new=err_e):
+                    rc_e = fn(["--unknown-audit-flag-xyz", "--json"])
+            except SystemExit as se:
+                rc_e = se.code
+            self.assertEqual(rc_e, 2, f"{alias} invalid --json flag should exit 2, got {rc_e}")
+            self.assertEqual(err_e.getvalue().strip(), "", f"{alias} invalid --json flag leaked stderr")
+            err_payload = json.loads(buf_e.getvalue())
+            self.assertIn("error", err_payload, f"{alias} invalid --json payload missing error key")
+
 if __name__ == "__main__":
     unittest.main()
