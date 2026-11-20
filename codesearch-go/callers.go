@@ -49,6 +49,12 @@ type callLang struct {
 // "x.Method" and Rust's "foo::bar", so calleeBase reduces it to the
 // trailing name. Constructor calls (Foo()) are call_expressions too
 // and match the plain pattern.
+// jsCallQuery captures both standard calls and JS/TS constructor invocations (`new Foo(...)`).
+const jsCallQuery = `[
+	(call_expression function: (_) @callee) @call
+	(new_expression constructor: (_) @callee) @call
+]`
+
 const ktCallQuery = `[
 	(call_expression (simple_identifier) @callee) @call
 	(call_expression (navigation_expression) @callee) @call
@@ -64,30 +70,14 @@ var callLangs = []callLang{
 	{".py", grammars.PythonLanguage, `[
 		(call function: (_) @callee) @call
 	]`},
-	{".js", grammars.JavascriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".mjs", grammars.JavascriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".cjs", grammars.JavascriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".ts", grammars.TypescriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".mts", grammars.TypescriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".cts", grammars.TypescriptLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".tsx", grammars.TsxLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
-	{".jsx", grammars.TsxLanguage, `[
-		(call_expression function: (_) @callee) @call
-	]`},
+	{".js", grammars.JavascriptLanguage, jsCallQuery},
+	{".mjs", grammars.JavascriptLanguage, jsCallQuery},
+	{".cjs", grammars.JavascriptLanguage, jsCallQuery},
+	{".ts", grammars.TypescriptLanguage, jsCallQuery},
+	{".mts", grammars.TypescriptLanguage, jsCallQuery},
+	{".cts", grammars.TypescriptLanguage, jsCallQuery},
+	{".tsx", grammars.TsxLanguage, jsCallQuery},
+	{".jsx", grammars.TsxLanguage, jsCallQuery},
 	{".kt", grammars.KotlinLanguage, ktCallQuery},
 }
 

@@ -467,6 +467,23 @@ grep -Fq 'clean_content = _rust_strip_comments_and_strings(content)' core/shared
 grep -Fq 'def _non_cyclic_rust_mod_edges(' codebase/cycle_break.py
 grep -Fq 'or set(ed.get("semantic_usages") or ()) == {"rust_mod"}' core/target_topology.py
 grep -Fq 'non_cyclic_edges=non_cyclic_mod_edges' codebase/hott_analyzers.py
+apply_reviewable_overlay "engine_state_v5"
+grep -Fq 'KNOWN_SCHEMA = "go13"' core/codesearch_engine.py
+grep -Fq '"go13": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v13"
+grep -Fq '8ae0b08323eb04fedecf5056548e91e368253acfd7fead315e671f80b5828fa9' core/codesearch_engine.py
+grep -Fq '416c70f4e8f5' core/codesearch_engine.py
+apply_reviewable_overlay "type_only_downstream_consistency_v1"
+grep -Fq 'import shlex' codebase/mermaid_graph.py
+grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
+grep -Fq 'def _is_all_inline_type_clause(' codebase/cycle_break.py
+grep -Fq '"extract_types_leaf"' codebase/cycle_break.py
+grep -Fq '"optional_type_only_cuts"' codebase/cycle_break.py
+grep -Fq '"type_only_cyclic_sccs"' core/target_topology.py
+grep -Fq '"type_only_directed"' codebase/hott_analyzers.py
+grep -Fq 'directed_cycles=len(runtime_cyclic_sccs)' codebase/hott_analyzers.py
+grep -Fq '"type_only_directed_basis_witnesses"' core/synthesizer.py
+grep -Fq 'type-only SCCs:' plw_cli.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan

@@ -279,13 +279,13 @@ class AdapterTestCase(unittest.TestCase):
         self.assertIn("digest", str(ctx.exception))
 
     def test_version_schema_checked_before_digest(self):
-        # go13 stub with an unpinned digest must fail with the schema
-        # message (G9 W5), not the pin message. (go13: one past the
-        # current KNOWN_SCHEMA go12, so it is newer by construction.)
-        stub = self.stub(env={"STUB_SCHEMA": "go13"})
+        # go14 stub with an unpinned digest must fail with the schema
+        # message (G9 W5), not the pin message. (go14: one past the
+        # current KNOWN_SCHEMA go13, so it is newer by construction.)
+        stub = self.stub(env={"STUB_SCHEMA": "go14"})
         with self.assertRaises(ce.EngineError) as ctx:
             ce.version_info(stub)
-        self.assertIn("go13", str(ctx.exception))
+        self.assertIn("go14", str(ctx.exception))
         self.assertIn("engine is newer", str(ctx.exception))
         self.assertNotIn("not pinned", str(ctx.exception))
 
@@ -612,11 +612,11 @@ class AdapterTestCase(unittest.TestCase):
         self.assertEqual(out["cache_dir"], str(ce.resolve_cache_dir()))
 
     def test_doctor_schema_mismatch_fields(self):
-        stub = self.stub(env={"STUB_SCHEMA": "go13"})
+        stub = self.stub(env={"STUB_SCHEMA": "go14"})
         out = ce.doctor_status(explicit=str(stub), root=self.fixture)
         self.assertFalse(out["available"])
-        self.assertEqual(out.get("engine_schema"), "go13")
-        self.assertEqual(out.get("known_schema"), "go12")
+        self.assertEqual(out.get("engine_schema"), "go14")
+        self.assertEqual(out.get("known_schema"), "go13")
 
     def test_doctor_envelope(self):
         stub = self.stub()
@@ -718,6 +718,33 @@ class AdapterTestCase(unittest.TestCase):
                 invocations = [a for a in self._logged_calls(log_path) if "--version" not in a]
                 self.assertTrue(all("--cached" not in a for a in invocations), invocations)
 
+
+    def test_real_engine_js_ts_new_expression_callers(self):
+        repo_bin = Path(__file__).resolve().parent.parent / "codesearch-go" / "codesearch-go"
+        env_bin = os.environ.get("CODESEARCH_BIN")
+        candidate = Path(env_bin) if env_bin else repo_bin
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            self.skipTest("built codesearch-go binary not present in unit-only run")
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "ts_ctor"
+            (proj / "src").mkdir(parents=True)
+            (proj / "src" / "policy.ts").write_text(
+                "export class VSARLPolicyKernel { run(): number { return 1; } }\n"
+            )
+            (proj / "src" / "consumer.ts").write_text(
+                'import { VSARLPolicyKernel } from "./policy";\n'
+                "export function makeKernel() { return new VSARLPolicyKernel(); }\n"
+            )
+            cache_dir = Path(tmp) / "cache"
+            env = {**os.environ, "CODESEARCH_CACHE_DIR": str(cache_dir)}
+            res = subprocess.run(
+                [str(candidate), "--root", str(proj / "src"), "--once", "--json", "--callers", "VSARLPolicyKernel"],
+                capture_output=True, text=True, env=env, check=True,
+            )
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["total"], 1, data)
+            self.assertEqual(data["calls"][0]["callee"], "VSARLPolicyKernel")
+            self.assertEqual(data["calls"][0]["caller"], "makeKernel")
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,13 +5,13 @@ If this document and the code disagree, the code wins and this
 document must be fixed in the same change — a stale contract is
 worse than none, because the adapter trusts it.
 
-## Current schema: `go12`
+## Current schema: `go13`
 
-`schemaV` (`index.go`) is `go12`. PLW's adapter
+`schemaV` (`index.go`) is `go13`. PLW's adapter
 (`core/codesearch_engine.py`) accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12"}`.
+`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13"}`.
 
-### What `go12` guarantees
+### What `go13` guarantees
 
 1. **Index format.** A gob index (`diskIndex`) with fields
    `SchemaV`, `Root`, `Chunks`, `Files` (with `FileMeta.Skip`
@@ -106,7 +106,15 @@ worse than none, because the adapter trusts it.
     A go11 index lacks those `RelDefs`/`CallSites` and is rejected
     by the schema bump, never silently served.
 
-### What `go12` does NOT guarantee
+13. **JS/TS/JSX/TSX constructor calls (`new_expression`).** `jsCallQuery`
+    captures `(new_expression constructor: (_) @callee) @call` alongside
+    `call_expression` across `.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`,
+    `.tsx`, and `.jsx`, so `new ClassName(...)` and `new ns.ClassName<T>(...)`
+    invocations are extracted into `CallSites` and returned by `--callers`
+    (fresh and `--cached`). A go12 index lacks constructor `CallSites`
+    and is rejected by the schema bump, never silently served.
+
+### What `go13` does NOT guarantee
 
 - **Type resolution.** `--callers` and `--related` remain name-based
   on the trailing identifier; rows are leads to verify against source.
@@ -149,11 +157,15 @@ older).
 
 ## History
 
+- `go13` (2026-11-20): JS/TS/JSX/TSX constructor invocations
+  (`new_expression`) captured in `CallSites` and `--callers`
+  (fresh and `--cached`) via `jsCallQuery`; `go12` indexes rejected and
+  rebuilt. Still current.
 - `go12` (2026-11-20): Kotlin parity — `--related` and `--callers`
   share the AST+regex def helper with `--defs-only` (anchored lines,
   byte spans incl. regex-recovered defs); decl-header false call
   sites filtered; local vals inside recovered defs no longer leak as
-  top-level properties. Still current.
+  top-level properties.
 - `go11` (2026-11-14): `CallSites` + `FileMeta.Generated` persisted
   for `--cached --callers`/`--related`; `filterDefChunks` excludes
   AST `"window"` chunks, `.md`/`.txt`/`.rst`/`.adoc`, `.d.ts`/`.d.mts`/

@@ -72,12 +72,12 @@ is null (except `search`, where the engine reports it).
 ## Schema contract
 
 The adapter accepts the schemas listed in `SUPPORTED_SCHEMAS`
-(`core/codesearch_engine.py`), currently `{"go9", "go10", "go11", "go12"}`
-with `KNOWN_SCHEMA = "go12"`.
+(`core/codesearch_engine.py`), currently `{"go9", "go10", "go11", "go12", "go13"}`
+with `KNOWN_SCHEMA = "go13"`.
 The machine-checked contract lives in
 [codesearch-go/ENGINE_CONTRACT.md](../codesearch-go/ENGINE_CONTRACT.md)
 and is verified in CI by `scripts/check_engine_contract.sh`. A
-newer engine (`go13`) fails with a message saying the engine is
+newer engine (`go14`) fails with a message saying the engine is
 newer than the PLW build; an older engine fails saying it is stale.
 A schema bump means a new entry in the adapter **and** a new
 contract section, plus the black-box suite and the battery re-run —
@@ -128,7 +128,7 @@ refuse them, with a plain message.
 - `binary digest ... is not pinned` — rebuild with
   `codesearch-go/build.sh` and pin the digest (above), or set
   `CODESEARCH_ALLOW_UNPINNED=1` explicitly for a development run.
-- `index schema 'go13' is not the known-good 'go12'` — the engine is
+- `index schema 'go14' is not the known-good 'go13'` — the engine is
   newer than this PLW build; upgrade PLW or pin the matching engine.
 - `engine predates index management` — the engine binary is older
   than index support; rebuild it, or use queries without
