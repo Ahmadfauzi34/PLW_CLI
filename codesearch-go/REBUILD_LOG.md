@@ -595,3 +595,53 @@ Rebuild lokal pasca-perbaikan mereproduksi digest CI byte-for-byte,
 membuktikan klaim reproducible build kini berlaku lintas locale dan
 toolchain yang sama. Didorong sebagai PR #27 (branch
 `fix/kotlin-go-def-spans-v1`, commit `051b95e8` + commit koreksi pin).
+
+## 2026-11-20 — Kotlin parity @Annotation + Visibility: --related & --callers (go12)
+**Perubahan.** Akar yang sama dengan #27 (grammar gagal parse `@Annotation
+<visibility/modifier>` → ERROR) tapi menjangkau dua konsumen AST lain yang
+belum memakai jalur pemulihan: `related.go::extractRelatedKotlin` (0 hasil
+untuk def berpola itu + `val` lokal bocor sebagai top-level palsu) dan
+`callers.go::extractCalls` (fragmen header dilaporkan sebagai call site
+palsu; panggilan valid di body ber-AST-rusak teratribusi ke caller "").
+Satu sumber kebenaran baru `kotlinASTAndFallbackDefs` di `kotlin_fallback.go`
+(def AST ter-anchor `kotlinAnchorStart` + merge `kotlinRegexDefinitions`
+bila `HasError() || len(defs)==0`); `astDefinitions`, `extractRelatedKotlin`,
+dan `extractCalls` memakainya (perilaku --defs-only tetap identik —
+diferensial korpus: 4549→4549 sebelum dua perbaikan di bawah). Skema
+go11→go12 (`index.go`, `ENGINE_CONTRACT.md` §12 baru). Dua bug tambahan
+yang ditemukan diferensial korpus (bukan di proposal): (1) `kotlinAnchorStart`
+mengembalikan byte komentar trailing `// ...` di baris anotasi (anak
+declaration di antara modifiers dan keyword) → def AST di baris anotasi
+sementara regex di baris keyword → --related menggandakan ChatTimeline
+(28+29); perbaikan: lewati node `line_comment`/`block_comment` di kedua
+loop anchor; (2) `kotlinDeclRe` hanya skip 1 segmen receiver →
+`TimelineItem.ToolCall.cardText` dinamai `ToolCall` (def hantu + caller
+salah); perbaikan: grup receiver `?` → `*` (menyimpang sengaja dari
+kalibrasi Python satu-segmen — perbaikan Python scope adapter/topology).
+Tes baru: `TestExtractRelatedKotlinAnnotationVisibility`,
+`TestExtractCallsKotlinAnnotationVisibility`,
+`TestKotlinParityPersistsAcrossSaveLoad`,
+`TestExtractRelatedKotlinAnnotationTrailingComment`,
+`TestExtractRelatedKotlinExtensionReceiver`,
+`TestExtractCallsKotlinExtensionReceiver`; harness 4-gerbang baru
+`kotlin_parity_spec.go` + `verify-kotlin-parity.sh`.
+**Verifikasi.** `verify-kotlin-parity.sh` PASS (`READY_TO_COMMIT`,
+48 kasus, 4 perspektif); `verify-kotlin-defs.sh` (#27) tetap
+`READY_TO_COMMIT`; `./build.sh` lolos semua gerbang (`gofmt`,
+`go vet -mod=vendor ./...`, `go test -mod=vendor ./...`); black-box
+`test_codesearch_go.py` 100/100. Diferensial korpus OOPBoT
+(`~/workspace/oopbot-trial`, daftar nama 2687, `--once --json` batch;
+skrip `~/workspace/plw-trial/diff_corpus_v2.py`, data `diff-v2/`):
+--defs-only 4549→4546 (9 chunk-start move; 3 chunk duplikat lama runtuh;
+2 chunk hantu receiver terhapus; 2 def baru ditemukan; 3 top-hit pindah
+file — tidak ada def asli hilang); --callers 14886→14769 (883
+ter-atribusi ulang `""`→nama; 117 header palsu terhapus; 0 baru —
+tidak ada call site asli hilang); --related 3848→3824 (944 move semua
+positif; 165 val member/lokal bocor terfilter; 139 def pulih fallback;
++2 baris overload baru — falsifier bedah tidak terpicu).
+Biner baru: `codesearch schema=go12 commit=84bb7eda6dd7 built=unknown go=go1.27.3`,
+digest `f471777c4713cb37746f339dbf77c7dc3658a3320d8941e1099b9a297c1ffa1d`
+(2 build berturut-turut byte-identik, `LC_ALL=C bash build.sh`, go1.27.3).
+Adapter naik via `engine_state_v4` (KNOWN_SCHEMA go12) +
+`engine_pin_v12` (digest lama 42b615b1… keluar pin; entri aset v0.2.5
+dipertahankan); `check_engine_contract.sh` PASS.

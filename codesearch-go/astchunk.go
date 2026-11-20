@@ -156,6 +156,13 @@ type definition struct {
 	endLine   int
 	name      string
 	sigEnd    int
+	// Byte span of the declaration. startByte is the anchor byte for
+	// Kotlin (first non-annotation modifier, else the keyword), so a
+	// property filter on bytes agrees with the anchored line. Populated
+	// for AST defs and regex-recovered defs alike; 0/0 means unknown
+	// (defs built by extractCalls, which only needs line spans).
+	startByte uint32
+	endByte   uint32
 }
 
 // astDefinitions parses text and returns definition line ranges.
@@ -185,70 +192,56 @@ func astDefinitions(relPath, text string) (defs []definition, ok bool) {
 	if err != nil {
 		return nil, false
 	}
-	cursor := spec.query.Exec(tree.RootNode(), spec.lang, src)
-	for {
-		m, ok := cursor.NextMatch()
-		if !ok {
-			break
-		}
-		var sb, eb uint32
-		var name string
-		var bodyStart uint32
-		var defNode *gotreesitter.Node
-		hasBody := false
-		found := false
-		for _, c := range m.Captures {
-			if c.Name == "def" {
-				sb, eb = c.Node.StartByte(), c.Node.EndByte()
-				defNode = c.Node
-				found = true
+	if ext == ".kt" {
+		// Kotlin defs come from the shared helper (kotlin_fallback.go),
+		// so --defs-only, --related and --callers agree on names,
+		// anchored lines, and byte spans.
+		defs = kotlinASTAndFallbackDefs(tree, spec.lang, spec.query, src, lineOf)
+	} else {
+		cursor := spec.query.Exec(tree.RootNode(), spec.lang, src)
+		for {
+			m, ok := cursor.NextMatch()
+			if !ok {
+				break
 			}
-			if c.Name == "name" {
-				name = string(src[c.Node.StartByte():c.Node.EndByte()])
+			var sb, eb uint32
+			var name string
+			var bodyStart uint32
+			hasBody := false
+			found := false
+			for _, c := range m.Captures {
+				if c.Name == "def" {
+					sb, eb = c.Node.StartByte(), c.Node.EndByte()
+					found = true
+				}
+				if c.Name == "name" {
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				}
+				if c.Name == "body" {
+					bodyStart = c.Node.StartByte()
+					hasBody = true
+				}
 			}
-			if c.Name == "body" {
-				bodyStart = c.Node.StartByte()
-				hasBody = true
+			if !found {
+				continue
 			}
-		}
-		if !found {
-			continue
-		}
-		sl, el := lineOf(sb), lineOf(eb)
-		if el < sl {
-			continue
-		}
-		// Kotlin: anchor the span on the declaration itself (first
-		// non-annotation modifier, else the keyword), never on a
-		// leading @annotation — the Python calibration rule (PR #26).
-		// Without this, `@Composable` funs report the annotation line.
-		if ext == ".kt" && defNode != nil {
-			if anchor, ok := kotlinAnchorStart(defNode, spec.lang); ok {
-				sl = lineOf(anchor)
+			sl, el := lineOf(sb), lineOf(eb)
+			if el < sl {
+				continue
 			}
-		}
-		d := definition{sl, el, name, 0}
-		if hasBody {
-			// Signature end: the body's first line for brace languages
-			// (the block starts on the `{` line); the line before the
-			// body for Python (the block starts after the `:` line).
-			bl := lineOf(bodyStart)
-			if ext == ".py" {
-				d.sigEnd = bl - 1
-			} else {
-				d.sigEnd = bl
+			d := definition{startLine: sl, endLine: el, name: name, startByte: sb, endByte: eb}
+			if hasBody {
+				// Signature end: the body's first line for brace languages
+				// (the block starts on the `{` line); the line before the
+				// body for Python (the block starts after the `:` line).
+				bl := lineOf(bodyStart)
+				if ext == ".py" {
+					d.sigEnd = bl - 1
+				} else {
+					d.sigEnd = bl
+				}
 			}
-		}
-		defs = append(defs, d)
-	}
-	// Kotlin: when the parse is damaged (HasError) or yields nothing,
-	// the grammar failed on some declaration (annotation before a
-	// visibility modifier — see kotlin_fallback.go). Recover those
-	// definitions with the regex fallback and merge them with whatever
-	// the AST found; AST defs are never dropped.
-	if ext == ".kt" && (tree.RootNode().HasError() || len(defs) == 0) {
-		if rd := kotlinRegexDefinitions(norm, lineOf); len(rd) > 0 {
-			defs = mergeKotlinRegexDefs(defs, rd)
+			defs = append(defs, d)
 		}
 	}
 	if len(defs) == 0 {

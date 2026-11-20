@@ -5,13 +5,13 @@ If this document and the code disagree, the code wins and this
 document must be fixed in the same change — a stale contract is
 worse than none, because the adapter trusts it.
 
-## Current schema: `go11`
+## Current schema: `go12`
 
-`schemaV` (`index.go`) is `go11`. PLW's adapter
+`schemaV` (`index.go`) is `go12`. PLW's adapter
 (`core/codesearch_engine.py`) accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11"}`.
+`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12"}`.
 
-### What `go11` guarantees
+### What `go12` guarantees
 
 1. **Index format.** A gob index (`diskIndex`) with fields
    `SchemaV`, `Root`, `Chunks`, `Files` (with `FileMeta.Skip`
@@ -91,8 +91,22 @@ worse than none, because the adapter trusts it.
     empty single queries exit 2. A query that cannot run exits 1.
     `--callers` / `--related` scan fresh by default (and read the
     synced gob index with `--cached`), printing a proof line to stderr.
+12. **Kotlin parity across defs/related/callers.** One shared helper
+    (`kotlinASTAndFallbackDefs`) supplies definitions to `--defs-only`,
+    `--related`, and `--callers`, so all three agree on names and on
+    anchored lines (first non-annotation modifier, else the keyword)
+    for declarations the grammar failed to parse (annotation before
+    a visibility modifier, one-line layout). `--related` reports those
+    declarations and keeps top-level properties exact: a local val
+    inside a recovered def's body is inside its byte span and is not
+    reported. `--callers` attributes calls inside a recovered def's
+    body to that def, and drops the declaration header itself as a
+    false call site (a call on a def's start line whose callee is
+    that def's name, with no body delimiter `=`/`{` before it).
+    A go11 index lacks those `RelDefs`/`CallSites` and is rejected
+    by the schema bump, never silently served.
 
-### What `go11` does NOT guarantee
+### What `go12` does NOT guarantee
 
 - **Type resolution.** `--callers` and `--related` remain name-based
   on the trailing identifier; rows are leads to verify against source.
@@ -135,13 +149,17 @@ older).
 
 ## History
 
+- `go12` (2026-11-20): Kotlin parity — `--related` and `--callers`
+  share the AST+regex def helper with `--defs-only` (anchored lines,
+  byte spans incl. regex-recovered defs); decl-header false call
+  sites filtered; local vals inside recovered defs no longer leak as
+  top-level properties. Still current.
 - `go11` (2026-11-14): `CallSites` + `FileMeta.Generated` persisted
   for `--cached --callers`/`--related`; `filterDefChunks` excludes
   AST `"window"` chunks, `.md`/`.txt`/`.rst`/`.adoc`, `.d.ts`/`.d.mts`/
   `.d.cts`, and generated/minified assets; `isGeneratedOrMinified`
   covers `@ts-self-types`, `wasm-bindgen` internals, `public/assets/`,
   and declaration files; `defaultExts` adds `.cjs`/`.jsx`/`.mts`/`.cts`.
-  Still current.
 - `go10` (2026-11-13): TS interface members (`method_signature`)
   are definitions (chunking, callers, related via `tsDefQuery`);
   go9 indexes rejected and rebuilt.

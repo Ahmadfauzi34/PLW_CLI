@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const schemaV = "go11" // go11: CallSites + FileMeta.Generated persisted for --cached --callers/--related, AST window/doc/generated filtering in --defs-only; was go10
+const schemaV = "go12" // go12: Kotlin parity — --related/--callers share the AST+regex def helper (anchored lines, byte spans) and the decl-header call filter; a go11 index is rejected (stale RelDefs/CallSites); was go11
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {

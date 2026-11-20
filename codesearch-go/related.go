@@ -212,6 +212,15 @@ func (li lineIndex) lineOf(byteOff uint32) int {
 	return i
 }
 
+// lineStart returns the byte offset at which line (1-based) starts,
+// or -1 when the line is out of range.
+func (li lineIndex) lineStart(line int) int {
+	if line < 1 || line > len(li.starts) {
+		return -1
+	}
+	return li.starts[line-1]
+}
+
 var (
 	reFromClause = regexp.MustCompile(`from\s+['"]([^'"]+)['"]`)
 	reExportFn   = regexp.MustCompile(`^export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
@@ -323,37 +332,28 @@ func extractRelatedKotlin(relPath string, src []byte, li lineIndex) ([]relDef, [
 	if !ok {
 		return nil, nil, nil, false
 	}
-	dq := spec.query
 	parser := gotreesitter.NewParser(spec.lang)
 	tree, err := parser.Parse(src)
 	if err != nil {
 		return nil, nil, nil, false
 	}
+	// Definitions come from the shared helper (kotlin_fallback.go), so
+	// --related agrees with --defs-only on names, anchored lines, and
+	// byte spans — including declarations the grammar failed to parse
+	// (annotation before a visibility modifier), which the regex
+	// fallback recovers with byte spans of their own. The property
+	// filter below keeps working on byte ranges unchanged: a local
+	// val inside a recovered def's body is inside its byte span, so
+	// it no longer leaks as a top-level property.
+	ktDefs := kotlinASTAndFallbackDefs(tree, spec.lang, spec.query, src, li.lineOf)
 	var defs []relDef
 	var defRanges [][2]uint32
-	dcursor := dq.Exec(tree.RootNode(), spec.lang, src)
-	for {
-		m, ok := dcursor.NextMatch()
-		if !ok {
-			break
-		}
-		var sb, eb uint32
-		var name string
-		found := false
-		for _, c := range m.Captures {
-			if c.Name == "def" {
-				sb, eb = c.Node.StartByte(), c.Node.EndByte()
-				found = true
-			}
-			if c.Name == "name" {
-				name = string(src[c.Node.StartByte():c.Node.EndByte()])
-			}
-		}
-		if !found || name == "" {
+	for _, d := range ktDefs {
+		if d.name == "" {
 			continue
 		}
-		defs = append(defs, relDef{Path: relPath, Line: li.lineOf(sb), Name: name})
-		defRanges = append(defRanges, [2]uint32{sb, eb})
+		defs = append(defs, relDef{Path: relPath, Line: d.startLine, Name: d.name})
+		defRanges = append(defRanges, [2]uint32{d.startByte, d.endByte})
 	}
 	// Top-level properties: declarators outside every def range.
 	// (Member properties sit inside their class def range and are

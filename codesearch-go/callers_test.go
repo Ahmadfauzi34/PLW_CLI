@@ -180,6 +180,59 @@ func TestExtractCallsKotlin(t *testing.T) {
 	}
 }
 
+func TestExtractCallsKotlinAnnotationVisibility(t *testing.T) {
+	// Parity (2026-11-20): the header of a grammar-damaged def must
+	// not appear as a call site, and calls inside its body must be
+	// attributed to it. The single-expression body (`= PrimaryChip(x)`)
+	// must still count as a call from ChipAlias.
+	text := "package demo\n\n" +
+		"@Composable internal fun PrimaryChip(label: String) {\n" +
+		"    renderIcon(label)\n" +
+		"}\n\n" +
+		"@Composable fun ScreenView() {\n" +
+		"    PrimaryChip(\"ok\")\n" +
+		"}\n\n" +
+		"@Composable internal fun ChipAlias(x: String) = PrimaryChip(x)\n"
+	sites, ok := extractCalls("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	// Lines: 1 pkg, 2 blank, 3 PrimaryChip header, 4 renderIcon,
+	// 5 }, 6 blank, 7 ScreenView, 8 PrimaryChip("ok"), 9 }, 10 blank,
+	// 11 ChipAlias.
+	want := [][3]string{
+		{"renderIcon", "PrimaryChip", "4"},
+		{"PrimaryChip", "ScreenView", "8"},
+		{"PrimaryChip", "ChipAlias", "11"},
+	}
+	if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
+// Regression (2026-11-20, OOPBoT differential): a call inside an
+// extension function with a multi-segment receiver must be
+// attributed to the function (`cardText`), not to its receiver type
+// (`ToolCall`) — the regex fallback used to name the def after the
+// receiver. Same fixture as TestExtractRelatedKotlinExtensionReceiver.
+func TestExtractCallsKotlinExtensionReceiver(t *testing.T) {
+	text := "package demo\n\n" +
+		"internal fun TimelineItem.ToolCall.cardText(): String {\n" +
+		"  return editPairs(args)\n" +
+		"}\n\n" +
+		"@Composable internal fun BrokenChip(label: String) {}\n"
+	sites, ok := extractCalls("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	want := [][3]string{
+		{"editPairs", "cardText", "4"},
+	}
+	if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
 func TestExtractCallsJSReferenceNotCall(t *testing.T) {
 	// Bare references and member access without () are not calls.
 	text := "const h = foo;\nfoo.bar;\n"

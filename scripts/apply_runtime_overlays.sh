@@ -315,6 +315,12 @@ grep -Fq -- '-s -w' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v11"
 grep -Fq '42b615b1b3f74c26f055f7145839c58cc6ca7c9e9bfc058a9d222d50cb527719' core/codesearch_engine.py
 grep -Fq '2c213de5f411' core/codesearch_engine.py
+apply_reviewable_overlay "engine_state_v4"
+grep -Fq 'KNOWN_SCHEMA = "go12"' core/codesearch_engine.py
+grep -Fq '"go12": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v12"
+grep -Fq 'f471777c4713cb37746f339dbf77c7dc3658a3320d8941e1099b9a297c1ffa1d' core/codesearch_engine.py
+grep -Fq '84bb7eda6dd7' core/codesearch_engine.py
 apply_reviewable_overlay "topology_resolution_v1"
 grep -Fq 'def kotlin_same_package_declarations(' language_semantics.py
 grep -Fq 'def rust_manifest_entrypoints(' language_semantics.py

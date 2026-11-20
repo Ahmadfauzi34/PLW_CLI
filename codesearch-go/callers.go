@@ -210,6 +210,64 @@ type callSite struct {
 	Text   string
 }
 
+// isKotlinDeclHeaderCall reports whether a call match is really the
+// header of a Kotlin declaration the grammar failed to parse: when
+// `@Annotation internal fun Name(...)` degrades to an ERROR node,
+// tree-sitter treats the `Name(...)` fragment as a call_expression,
+// so the declaration line itself shows up as a call site with an
+// empty caller. A match is a header call when its callee is the name
+// of a def starting on the same line and no body delimiter (`=` or
+// `{` at paren depth 0) precedes the call on that line — a real call
+// in a single-expression body (`fun wrap(x) = Name(x)`) or a
+// single-line body (`fun f() { Name() }`) always has such a delimiter
+// before it. Known residual: a recursive call in a default argument
+// (`fun f(x: Int = f(0))`) has no delimiter before it and is filtered
+// too; a def the regex fallback missed keeps its false header.
+func isKotlinDeclHeaderCall(calStart uint32, calText string, line int, lineText string, li lineIndex, defs []definition) bool {
+	callee := calleeBase(calText)
+	if callee == "" {
+		return false
+	}
+	found := false
+	for i := range defs {
+		if defs[i].name == callee && defs[i].startLine == line {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	// Column of the call within its line.
+	lineStart := li.lineStart(line)
+	if lineStart < 0 || int(calStart) < lineStart {
+		return false
+	}
+	col := int(calStart) - lineStart
+	if col > len(lineText) {
+		return false
+	}
+	prefix := lineText[:col]
+	// A body delimiter at paren depth 0 before the call means the call
+	// is inside the body (or the single-expression body), not the header.
+	depth := 0
+	for _, r := range prefix {
+		switch r {
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '=', '{':
+			if depth == 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // calleeBase reduces a callee expression to its trailing identifier:
 // generics and index arguments are stripped (foo::<T> -> foo,
 // pkg.Fn[int] -> Fn), then the last segment after "." or "::" wins.
@@ -255,9 +313,16 @@ func extractCalls(relPath, text string) ([]callSite, bool) {
 	}
 	// Enclosing definitions (with names) for the caller column, from the
 	// same parsed tree: the chunking def query where available, else the
-	// JS/TS def query. One parse per file serves both queries.
+	// JS/TS def query. One parse per file serves both queries. Kotlin
+	// defs come from the shared helper (kotlin_fallback.go), so calls
+	// inside a function the grammar failed to parse are still
+	// attributed to that function instead of landing at top level.
 	var defs []definition
-	if dq, ok := defQueryFor(ext); ok {
+	if ext == ".kt" {
+		if cs, ok := getSpec(ext); ok {
+			defs = kotlinASTAndFallbackDefs(tree, cs.lang, cs.query, src, lineOf)
+		}
+	} else if dq, ok := defQueryFor(ext); ok {
 		dcursor := dq.Exec(tree.RootNode(), spec.lang, src)
 		for {
 			m, ok := dcursor.NextMatch()
@@ -328,6 +393,13 @@ func extractCalls(relPath, text string) ([]callSite, bool) {
 		text := ""
 		if line >= 1 && line <= len(lines) {
 			text = lines[line-1]
+		}
+		// Kotlin: a declaration header the grammar failed to parse
+		// degrades to an ERROR node whose `Name(...)` fragment reads
+		// as a call — filter that false call site (see
+		// isKotlinDeclHeaderCall).
+		if ext == ".kt" && isKotlinDeclHeaderCall(calStart, calText, line, text, li, defs) {
+			continue
 		}
 		out = append(out, callSite{
 			Path:   relPath,

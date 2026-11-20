@@ -223,6 +223,159 @@ func TestExtractRelatedKotlin(t *testing.T) {
 	}
 }
 
+func TestExtractRelatedKotlinAnnotationVisibility(t *testing.T) {
+	// Parity (2026-11-20): annotation+visibility on ONE line defeats
+	// the vendored grammar; the regex fallback recovers the def and
+	// --related must agree with --defs-only (anchored line), while a
+	// local val inside the recovered body must not leak as top-level.
+	text := "package demo\n\n" +
+		"@Composable internal fun PrimaryChip(label: String) {\n" +
+		"    val localTmp = label.length\n" +
+		"    renderIcon(label)\n" +
+		"}\n\n" +
+		"@Deprecated(\"old\") internal class LegacyBox {\n" +
+		"    val flag = 1\n" +
+		"}\n\n" +
+		"internal object BridgeClient {\n" +
+		"    val flag = 1\n" +
+		"}\n\n" +
+		"const val TOP_LEVEL_FLAG = true\n"
+	defs, _, _, ok := extractRelated("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	byName := map[string]int{}
+	for _, d := range defs {
+		byName[d.Name] = d.Line
+	}
+	// Lines: 1 pkg, 2 blank, 3 PrimaryChip, 4 localTmp, 5 renderIcon,
+	// 6 }, 7 blank, 8 LegacyBox, 9 flag, 10 }, 11 blank,
+	// 12 BridgeClient, 13 flag, 14 }, 15 blank, 16 TOP_LEVEL_FLAG.
+	for name, line := range map[string]int{
+		"PrimaryChip": 3, "LegacyBox": 8, "BridgeClient": 12, "TOP_LEVEL_FLAG": 16,
+	} {
+		if got, present := byName[name]; !present || got != line {
+			t.Errorf("defs = %+v, want %s at line %d (got %d, present=%v)", defs, name, line, got, present)
+		}
+	}
+	for _, no := range []string{"localTmp", "flag"} {
+		if _, present := byName[no]; present {
+			t.Errorf("defs = %+v, must not contain %s", defs, no)
+		}
+	}
+	// resolveRelated returns exactly one row for the recovered def.
+	rows := resolveRelated("PrimaryChip", defs, nil, nil, map[string]bool{})
+	if len(rows) != 1 || rows[0].Line != 3 {
+		t.Errorf("resolveRelated(PrimaryChip) = %+v, want exactly 1 row at line 3", rows)
+	}
+
+	// Annotation on its own line before `fun` also defeats the grammar
+	// (probe matrix 2026-11-20); before `class` it parses.
+	sep := "package demo\n\n@Composable\ninternal fun SeparateChip(label: String) {\n    renderIcon(label)\n}\n"
+	sdefs, _, _, ok := extractRelated("x.kt", sep)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	found := false
+	for _, d := range sdefs {
+		if d.Name == "SeparateChip" && d.Line == 4 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("separate-line defs = %+v, want SeparateChip at line 4", sdefs)
+	}
+}
+
+// Regression (2026-11-20, found by the OOPBoT corpus differential):
+// tree-sitter attaches a trailing `// ...` on the annotation line as
+// a child of the declaration, between the modifiers node and the
+// keyword. kotlinAnchorStart used to return that comment's byte, so
+// the AST def landed on the annotation line (3) while the regex
+// fallback (fired because the file HasError) landed on the keyword
+// line (4) — and mergeKotlinRegexDefs kept both, so --related
+// reported ChatTimeline twice (lines 28 and 29 in the real file).
+// The anchor must skip comment nodes in both loops.
+func TestExtractRelatedKotlinAnnotationTrailingComment(t *testing.T) {
+	// Lines: 1 pkg, 2 blank, 3 @Suppress + trailing comment,
+	// 4 class, 5 clock, 6 ) {, 7 lock, 8 }, 9 blank,
+	// 10 @Composable internal fun BrokenChip (grammar-defeating,
+	// recovered by the regex; also the HasError trigger that
+	// makes the regex run at all in this file).
+	text := "package demo\n\n" +
+		"@Suppress(\"TooManyFunctions\") // Owns everything the chat renders.\n" +
+		"class ChatTimeline(\n" +
+		"  private val clock: () -> Long = System::currentTimeMillis,\n" +
+		") {\n" +
+		"  private val lock = Any()\n" +
+		"}\n\n" +
+		"@Composable internal fun BrokenChip(label: String) {}\n"
+	defs, _, _, ok := extractRelated("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	count := map[string]int{}
+	byName := map[string]int{}
+	for _, d := range defs {
+		count[d.Name]++
+		byName[d.Name] = d.Line
+	}
+	if count["ChatTimeline"] != 1 || byName["ChatTimeline"] != 4 {
+		t.Errorf("defs = %+v, want exactly 1 ChatTimeline at line 4", defs)
+	}
+	if got, present := byName["BrokenChip"]; !present || got != 10 {
+		t.Errorf("defs = %+v, want BrokenChip at line 10 (got %d, present=%v)", defs, got, present)
+	}
+	for _, no := range []string{"clock", "lock"} {
+		if _, present := byName[no]; present {
+			t.Errorf("defs = %+v, must not contain %s", defs, no)
+		}
+	}
+	rows := resolveRelated("ChatTimeline", defs, nil, nil, map[string]bool{})
+	if len(rows) != 1 || rows[0].Line != 4 {
+		t.Errorf("resolveRelated(ChatTimeline) = %+v, want exactly 1 row at line 4", rows)
+	}
+}
+
+// Regression (2026-11-20, OOPBoT differential): an extension function
+// with a multi-segment receiver (`TimelineItem.ToolCall.cardText`)
+// was named after its receiver (`ToolCall`) by the regex fallback,
+// which skipped at most one dotted segment. That produced a phantom
+// def in --related and a wrong caller in --callers. The regex now
+// skips all receiver segments, so the fallback def dedups against
+// the AST def (`cardText`).
+func TestExtractRelatedKotlinExtensionReceiver(t *testing.T) {
+	// Lines: 1 pkg, 2 blank, 3 extension fun, 4 return, 5 },
+	// 6 blank, 7 BrokenChip (grammar-defeating: the HasError
+	// trigger that makes the regex run at all in this file).
+	text := "package demo\n\n" +
+		"internal fun TimelineItem.ToolCall.cardText(): String {\n" +
+		"  return editPairs(args)\n" +
+		"}\n\n" +
+		"@Composable internal fun BrokenChip(label: String) {}\n"
+	defs, _, _, ok := extractRelated("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	byName := map[string]int{}
+	for _, d := range defs {
+		byName[d.Name] = d.Line
+	}
+	if got, present := byName["cardText"]; !present || got != 3 {
+		t.Errorf("defs = %+v, want cardText at line 3 (got %d, present=%v)", defs, got, present)
+	}
+	if _, present := byName["ToolCall"]; present {
+		t.Errorf("defs = %+v, must not contain phantom receiver name ToolCall", defs)
+	}
+	if got, present := byName["BrokenChip"]; !present || got != 7 {
+		t.Errorf("defs = %+v, want BrokenChip at line 7 (got %d, present=%v)", defs, got, present)
+	}
+	rows := resolveRelated("cardText", defs, nil, nil, map[string]bool{})
+	if len(rows) != 1 || rows[0].Line != 3 {
+		t.Errorf("resolveRelated(cardText) = %+v, want exactly 1 row at line 3", rows)
+	}
+}
+
 func TestResolveRelatedFFI(t *testing.T) {
 	defs := []relDef{{Path: "bind.mjs", Line: 5, Name: "getGraphParametersFlat"}}
 	bridges := []relBridge{
