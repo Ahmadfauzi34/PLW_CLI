@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const schemaV = "go12" // go12: Kotlin parity — --related/--callers share the AST+regex def helper (anchored lines, byte spans) and the decl-header call filter; a go11 index is rejected (stale RelDefs/CallSites); was go11
+const schemaV = "go13" // go13: JS/TS/JSX/TSX constructor calls (`new_expression`) captured in CallSites/--callers; a go12 index is rejected (stale CallSites); was go12
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {

@@ -395,3 +395,48 @@ func TestRunCallersCachedMatchesFresh(t *testing.T) {
 		t.Errorf("post-sync mismatch: fresh=%+v cached=%+v", f3, c3)
 	}
 }
+
+func TestExtractCallsJSNewExpression(t *testing.T) {
+	ts := "import { VSARLPolicyKernel } from './policy';\n" +
+		"export function boot() {\n" +
+		"\tconst a = new VSARLPolicyKernel();\n" +
+		"\tconst b = new pkg.VSARLPolicyKernel<string>();\n" +
+		"\treturn [a, b];\n" +
+		"}\n" +
+		"const topLevel = new VSARLPolicyKernel();\n"
+	for _, ext := range []string{".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx"} {
+		if ext == ".js" || ext == ".mjs" || ext == ".cjs" || ext == ".jsx" {
+			body := "export function boot() {\n" +
+				"\tconst a = new VSARLPolicyKernel();\n" +
+				"\tconst b = new pkg.VSARLPolicyKernel();\n" +
+				"\treturn [a, b];\n" +
+				"}\n" +
+				"const topLevel = new VSARLPolicyKernel();\n"
+			sites, ok := extractCalls("src/runner"+ext, body)
+			if !ok {
+				t.Fatalf("extractCalls(%s) failed", ext)
+			}
+			want := [][3]string{
+				{"VSARLPolicyKernel", "boot", "2"},
+				{"pkg.VSARLPolicyKernel", "boot", "3"},
+				{"VSARLPolicyKernel", "", "6"},
+			}
+			if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s calls = %v, want %v", ext, got, want)
+			}
+			continue
+		}
+		sites, ok := extractCalls("src/runner"+ext, ts)
+		if !ok {
+			t.Fatalf("extractCalls(%s) failed", ext)
+		}
+		want := [][3]string{
+			{"VSARLPolicyKernel", "boot", "3"},
+			{"pkg.VSARLPolicyKernel", "boot", "4"},
+			{"VSARLPolicyKernel", "", "7"},
+		}
+		if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s calls = %v, want %v", ext, got, want)
+		}
+	}
+}

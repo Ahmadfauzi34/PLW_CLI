@@ -645,3 +645,11 @@ digest `f471777c4713cb37746f339dbf77c7dc3658a3320d8941e1099b9a297c1ffa1d`
 Adapter naik via `engine_state_v4` (KNOWN_SCHEMA go12) +
 `engine_pin_v12` (digest lama 42b615b1… keluar pin; entri aset v0.2.5
 dipertahankan); `check_engine_contract.sh` PASS.
+
+## 2026-11-20 — JS/TS/JSX/TSX `new_expression` constructor calls in --callers (go13)
+**Perubahan.** `plw ast callers src VSARLPolicyKernel` sebelumnya mengembalikan `total: 0` meski terdapat pemanggilan konstruktor `new VSARLPolicyKernel(...)` karena `jsCallQuery` di `codesearch-go/callers.go` hanya mencocokkan `call_expression` dan belum menangkap node `new_expression` milik grammar tree-sitter JS/TS/TSX. Diperbaiki dengan menambahkan pola `(new_expression constructor: (_) @callee) @call` pada `jsCallQuery` untuk semua ekstensi `.js/.mjs/.cjs/.ts/.mts/.cts/.tsx/.jsx`. Skema index dinaikkan `go12→go13` (`codesearch-go/index.go`, `ENGINE_CONTRACT.md` §13) agar `CallSites` di `.gob` cache lama yang belum menyimpan `new_expression` ditolak dan dibangun ulang secara otomatis.
+Tes baru: `TestExtractCallsJSNewExpression` (menguji `.js/.mjs/.cjs/.ts/.mts/.cts/.tsx/.jsx`, top-level & dalam fungsi, `new VSARLPolicyKernel()`, `new pkg.VSARLPolicyKernel<string>()`), serta pembaruan tes penolakan cache `go12` dan versi `schema=go13`.
+**Verifikasi.** `./build.sh` lolos semua gerbang (`gofmt`, `go vet -mod=vendor ./...`, `go test -mod=vendor ./...`).
+Biner baru: `codesearch schema=go13 commit=416c70f4e8f5 built=unknown go=go1.27.3`,
+digest `8ae0b08323eb04fedecf5056548e91e368253acfd7fead315e671f80b5828fa9`.
+Adapter naik via `engine_state_v5` (KNOWN_SCHEMA `go13`, SUPPORTED_SCHEMAS tambah `go13`) + `engine_pin_v13` (digest `go12` `f471777c…` digantikan `8ae0b083…`; entri aset `v0.2.5` dipertahankan); `check_engine_contract.sh` PASS.

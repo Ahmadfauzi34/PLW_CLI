@@ -2589,5 +2589,178 @@ class ArchitectureBaselineTests(unittest.TestCase):
         self.assertIn("run_step", mod_to_runner["rationale"])
         self.assertNotIn("(runner", mod_to_runner["rationale"])
 
+    def test_type_only_downstream_consistency_and_mermaid_shlex_quoting(self):
+        import io
+        import shlex
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        import tempfile
+        import plw_cli
+        from core.shared_graph import build_shared_graph
+        from codebase.topology_analyzers import analyze_circular
+        from codebase.cycle_break import compute_cycle_break_advisory
+        from codebase.hott_analyzers import analyze_manifold
+        from core.target_topology import build_target_topology_orientation
+        from core.synthesizer import encode_topological_invariants
+        from hott_kernel import kernel_cycle_break, kernel_xsteer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "ts type repo"
+            (repo / "src" / "math compesor").mkdir(parents=True)
+            # Cycle 1: pure `import type` + `export type`
+            (repo / "src" / "a.ts").write_text(
+                'import type { BSpec } from "./b";\n'
+                'export interface ASpec { id: string; b?: BSpec }\n'
+                'export function makeA(): ASpec { return { id: "a" }; }\n'
+            )
+            (repo / "src" / "b.ts").write_text(
+                'import type { ASpec } from "./a";\n'
+                'export type { ASpec } from "./a";\n'
+                'export interface BSpec { a?: ASpec }\n'
+            )
+            # Cycle 2: `import { type ... }` inline type modifier
+            (repo / "src" / "c.ts").write_text(
+                'import { type DType } from "./d";\n'
+                'export type CType = { d?: DType };\n'
+            )
+            (repo / "src" / "d.ts").write_text(
+                'import { type CType } from "./c";\n'
+                'export type DType = { c?: CType };\n'
+            )
+            # Directory with spaces for Mermaid zoom hint quoting + entry hub
+            (repo / "src" / "math compesor" / "zip.ts").write_text(
+                'export function compress(v: number): number { return v + 1; }\n'
+            )
+            (repo / "src" / "math compesor" / "index.ts").write_text(
+                'import { compress } from "./zip";\n'
+                'import { makeA } from "../a";\n'
+                'export function runAll(): number { makeA(); return compress(1); }\n'
+            )
+
+            g = build_shared_graph(str(repo))
+            circ = analyze_circular(g)
+            self.assertEqual(circ["summary"]["total_cycles"], 2)
+            self.assertEqual(circ["summary"]["type_only_cycles"], 2)
+            self.assertEqual(circ["summary"]["runtime_cycles"], 0)
+            self.assertEqual(circ["summary"]["cycle_break_plan"]["total_cuts_required"], 0)
+            self.assertEqual(circ["summary"]["cycle_break_plan"]["recommended_cuts"], [])
+            self.assertGreater(len(circ["summary"]["cycle_break_plan"]["optional_type_only_cuts"]), 0)
+
+            cb = compute_cycle_break_advisory(g, [c["cycle"] for c in circ["findings"]])
+            self.assertEqual(cb["cycle_break_plan"]["total_cuts_required"], 0)
+            self.assertEqual(cb["cycle_break_plan"]["recommended_cuts"], [])
+            self.assertEqual(cb["cycle_break_plan"]["runtime_cycles"], 0)
+            self.assertEqual(cb["cycle_break_plan"]["type_only_cycles"], 2)
+            for adv in cb["advisories_by_cycle"]:
+                self.assertTrue(adv["is_type_only"], adv)
+                self.assertEqual(adv["cycle_nature"], "type_only", adv)
+                for cut in adv["candidate_edges"]:
+                    self.assertEqual(cut["strategy"], "extract_types_leaf", cut)
+                    steps_txt = " ".join(cut.get("actionable_steps", []))
+                    self.assertNotIn("Change import in", steps_txt)
+
+            kb = kernel_cycle_break(str(repo), target_file="src/a.ts")
+            self.assertEqual(kb["summary"]["total_cuts_required"], 0)
+            self.assertEqual(kb["summary"]["runtime_cycles_affecting_target"], 0)
+            self.assertEqual(kb["summary"]["type_only_cycles_affecting_target"], 1)
+            self.assertEqual(len(kb["summary"]["recommended_cuts"]), 0)
+            self.assertGreater(len(kb["summary"]["optional_type_only_cuts"]), 0)
+
+            topo = build_target_topology_orientation(g)
+            self.assertEqual(topo["inventory"]["cyclic_sccs"], 0)
+            self.assertEqual(topo["inventory"]["runtime_cyclic_sccs"], 0)
+            self.assertEqual(topo["inventory"]["type_only_cyclic_sccs"], 2)
+            self.assertEqual(len(topo["type_only_cyclic_sccs"]), 2)
+
+            mani = analyze_manifold(g)
+            self.assertEqual(mani["summary"]["runtime_cyclic_sccs"], 0)
+            self.assertEqual(mani["summary"]["type_only_cyclic_sccs"], 2)
+            self.assertFalse(mani["manifold"]["structural_archetype"].endswith("_cyclic"), mani["manifold"]["structural_archetype"])
+            orient = mani["manifold"]["cycle_orientation_counts"]
+            self.assertEqual(orient["directed"], 0)
+            self.assertGreater(orient["type_only_directed"], 0)
+
+            brief = encode_topological_invariants(str(repo), shared_graph=g, analyzer_output={"results": {"hott.manifold": mani}})
+            self.assertGreater(brief["cycle_semantics"]["type_only_directed_basis_witnesses"], 0)
+
+            xs = kernel_xsteer(str(repo))
+            cb_steer = xs["codebase_steering"]
+            self.assertFalse(cb_steer["archetype"].endswith("_cyclic"), cb_steer)
+            self.assertNotEqual(cb_steer["strategy"], "cycle_breaking_and_layering")
+
+            # CLI smoke: topology human output + mermaid shlex.quote on spaced dir/root
+            buf_t = io.StringIO()
+            with redirect_stdout(buf_t):
+                rc_t = plw_cli.cmd_topology([str(repo)])
+            self.assertEqual(rc_t, 0)
+            self.assertIn("type-only SCCs: 2", buf_t.getvalue())
+
+            for depth in ("1", "2", "3", "4"):
+                buf_m = io.StringIO()
+                with redirect_stdout(buf_m):
+                    rc_m = plw_cli.cmd_mermaid([str(repo), "--depth", depth, "--json"])
+                self.assertEqual(rc_m, 0)
+                mm = json.loads(buf_m.getvalue())
+                for hint in mm.get("next_zoom_hints", []):
+                    tokens = shlex.split(hint["command"])
+                    if "--focus" in tokens:
+                        idx = tokens.index("--focus")
+                        self.assertEqual(tokens[idx + 1], hint["target"])
+
+    def test_unannotated_type_import_still_recommends_type_only_and_mixed_edge_priority(self):
+        from pathlib import Path
+        import tempfile
+        from core.shared_graph import build_shared_graph
+        from codebase.topology_analyzers import analyze_circular
+        from codebase.cycle_break import compute_cycle_break_advisory
+        from codebase.hott_analyzers import analyze_manifold
+        from core.target_topology import build_target_topology_orientation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "mixed"
+            (repo / "src").mkdir(parents=True)
+            # Cycle A: unannotated runtime import importing only an interface -> MUST stay type_only_import cut!
+            (repo / "src" / "ua.ts").write_text(
+                'import { UBSpec } from "./ub";\n'
+                'export interface UASpec { b?: UBSpec }\n'
+            )
+            (repo / "src" / "ub.ts").write_text(
+                'import { UASpec } from "./ua";\n'
+                'export interface UBSpec { a?: UASpec }\n'
+            )
+            # Cycle B: real runtime cycle + a type_only back-edge in same SCC
+            (repo / "src" / "rx.ts").write_text(
+                'import { ry } from "./ry";\n'
+                'import type { RZ } from "./rz";\n'
+                'export function rx(): number { return ry(); }\n'
+                'export type RX = { z?: RZ };\n'
+            )
+            (repo / "src" / "ry.ts").write_text(
+                'import { rx } from "./rx";\n'
+                'export function ry(): number { return rx(); }\n'
+            )
+            (repo / "src" / "rz.ts").write_text(
+                'import type { RX } from "./rx";\n'
+                'export interface RZ { x?: RX }\n'
+            )
+
+            g = build_shared_graph(str(repo))
+            circ = analyze_circular(g)
+            cb = compute_cycle_break_advisory(g, [c["cycle"] for c in circ["findings"]])
+            # Unannotated ua<->ub AND runtime rx<->ry must require cuts
+            self.assertEqual(cb["cycle_break_plan"]["runtime_cycles"], 2)
+            self.assertEqual(cb["cycle_break_plan"]["total_cuts_required"], 2)
+            # Ensure ua<->ub gets type_only_import strategy (not extract_types_leaf)
+            ua_adv = [a for a in cb["advisories_by_cycle"] if any("ua.ts" in n for n in a["cycle"])][0]
+            self.assertFalse(ua_adv["is_type_only"])
+            self.assertTrue(any(c["strategy"] == "type_only_import" for c in ua_adv["candidate_edges"]), ua_adv)
+
+            # Ensure rx<->ry runtime SCC is still detected and classifies as cyclic despite type_only chord
+            topo = build_target_topology_orientation(g)
+            self.assertEqual(topo["inventory"]["runtime_cyclic_sccs"], 2)
+            mani = analyze_manifold(g)
+            self.assertEqual(mani["summary"]["runtime_cyclic_sccs"], 2)
+            self.assertTrue(mani["manifold"]["structural_archetype"].endswith("_cyclic"), mani["manifold"]["structural_archetype"])
+
 if __name__ == "__main__":
     unittest.main()
