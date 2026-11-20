@@ -433,6 +433,12 @@ grep -Fq 'def _normalize_output_json_argv(' plw_cli.py
 grep -Fq 'is_output_flag = "--output" in flag_set' hott_kernel.py
 grep -Fq 'def _is_nested_boundary_pair(b_a: str, b_b: str) -> bool:' codebase/hott_analyzers.py
 grep -Fq 'new\s+\w*LRU\w*' codebase/performance_analyzers.py
+apply_reviewable_overlay "topo_circular_opt_v1"
+grep -Fq 'def find_cyclic_sccs(' codebase/cycle_break.py
+grep -Fq 'def find_directed_cycles_with_metadata(' codebase/cycle_break.py
+grep -Fq 'type_only_edge_count = sum(1 for n in cycle_edge_natures if n == "type_only")' codebase/topology_analyzers.py
+grep -Fq 'if target in cyc[:-1]' codebase/topology_analyzers.py
+grep -Fq 'call_stack: List[List[Any]] = [[vertex, 0]]' core/target_topology.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
