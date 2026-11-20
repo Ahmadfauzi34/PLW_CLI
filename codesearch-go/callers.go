@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/odvcencio/gotreesitter"
 	"github.com/odvcencio/gotreesitter/grammars"
@@ -258,22 +260,80 @@ func isKotlinDeclHeaderCall(calStart uint32, calText string, line int, lineText 
 	return true
 }
 
-// calleeBase reduces a callee expression to its trailing identifier:
-// generics and index arguments are stripped (foo::<T> -> foo,
-// pkg.Fn[int] -> Fn), then the last segment after "." or "::" wins.
+// calleeBase reduces a callee expression to its trailing identifier,
+// processing right-to-left: a balanced generic/index suffix at the very
+// end (<...> or [...]) is peeled first — repeatedly, so foo::<T>[0]
+// becomes foo — then trailing separators (. :: ?.) are skipped and the
+// trailing identifier run wins. Indexed receivers (items[0].execute)
+// and Rust turbofish (Boxed::<u32>::build) keep their trailing name,
+// while a call result used as the callee (getFn(x)()) yields "".
 // "" when nothing identifier-like remains.
+//
+// The old implementation cut at the FIRST < or [ anywhere in the
+// expression, so items[0].execute reduced to "items" (a false positive
+// for --callers items) and execute itself matched nothing (P1-A, go14).
 func calleeBase(expr string) string {
-	if i := strings.IndexAny(expr, "<["); i >= 0 {
-		expr = expr[:i]
+	expr = strings.TrimSpace(expr)
+	for {
+		stripped, ok := stripBalancedSuffix(expr)
+		if !ok {
+			break
+		}
+		expr = strings.TrimSpace(stripped)
 	}
-	expr = strings.ReplaceAll(expr, "::", ".")
-	parts := strings.Split(expr, ".")
-	for i := len(parts) - 1; i >= 0; i-- {
-		if parts[i] != "" {
-			return parts[i]
+	// Skip trailing separators (foo::, a., x?.) then take the run.
+	i := len(expr)
+	for i > 0 {
+		r, size := utf8.DecodeLastRuneInString(expr[:i])
+		if r == '.' || r == ':' || r == '?' || unicode.IsSpace(r) {
+			i -= size
+			continue
+		}
+		break
+	}
+	j := i
+	for j > 0 {
+		r, size := utf8.DecodeLastRuneInString(expr[:j])
+		if r == '_' || r == '$' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+			j -= size
+			continue
+		}
+		break
+	}
+	return expr[j:i]
+}
+
+// stripBalancedSuffix peels one balanced <...> or [...] suffix at the end
+// of expr, returning the remainder. ok=false when expr does not end with
+// a bracket or the brackets are unbalanced (malformed input: the caller
+// then falls through to the identifier run, which yields "" for a
+// bracket-terminated expression).
+func stripBalancedSuffix(expr string) (string, bool) {
+	if expr == "" {
+		return expr, false
+	}
+	var open, close byte
+	switch expr[len(expr)-1] {
+	case '>':
+		open, close = '<', '>'
+	case ']':
+		open, close = '[', ']'
+	default:
+		return expr, false
+	}
+	depth := 0
+	for i := len(expr) - 1; i >= 0; i-- {
+		switch expr[i] {
+		case close:
+			depth++
+		case open:
+			depth--
+			if depth == 0 {
+				return expr[:i], true
+			}
 		}
 	}
-	return ""
+	return expr, false
 }
 
 // extractCalls parses text and returns every call site in it.

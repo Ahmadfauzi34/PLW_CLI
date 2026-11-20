@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -22,11 +23,72 @@ func TestCalleeBase(t *testing.T) {
 		{"a.b.c", "c"},
 		{"foo::", "foo"},
 		{"", ""},
+		// P1-A (go14): indexed receiver and turbofish keep the trailing
+		// name instead of the receiver/type (old code cut at the first
+		// < or [ anywhere, so items[0].execute reduced to "items").
+		{"items[0].execute", "execute"},
+		{"Boxed::<u32>::build", "build"},
+		{"std::vec::Vec::<String>::new", "new"},
+		{"holders[0].getWorker().doWork", "doWork"},
+		{"holders[0].getWorker", "getWorker"},
+		{"m[\"k\"]?.finish", "finish"},
+		{"a?.b?.c", "c"},
+		// A call result used as the callee is not a name.
+		{"getFn(x)()", ""},
+		// Repeated balanced suffixes; nested generics; JS new target.
+		{"foo::<Vec<T>>", "foo"},
+		{"foo::<T>[0]", "foo"},
+		{"callbacks[0]", "callbacks"},
+		{"x[0][1]", "x"},
+		{"new pkg.Foo", "Foo"},
+		{"pkg.Fn[map[string]int]", "Fn"},
 	}
 	for _, c := range cases {
 		if got := calleeBase(c.in); got != c.want {
 			t.Errorf("calleeBase(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestExtractCallsRustIndexedReceiverAndTurbofish is the P1-A end-to-end
+// composition: the sites extractCalls finds for the bedah probe lines
+// must reduce (via calleeBase, the function --callers matches on) to the
+// invoked name — execute/build/new — never to the receiver or the type.
+func TestExtractCallsRustIndexedReceiverAndTurbofish(t *testing.T) {
+	text := "fn main() {\n    items[0].execute();\n    Boxed::<u32>::build(1);\n    std::vec::Vec::<String>::new();\n}\n"
+	sites, ok := extractCalls("x.rs", text)
+	if !ok {
+		t.Fatal("expected ok for valid Rust")
+	}
+	var got []string
+	for _, s := range sites {
+		got = append(got, calleeBase(s.Callee))
+	}
+	want := []string{"execute", "build", "new"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("calleeBase over sites = %v, want %v (raw callees %v)", got, want, callSummary(sites))
+	}
+}
+
+// TestExtractCallsKotlinIndexedReceiver is the Kotlin half of P1-A:
+// holders[0].getWorker().doWork() yields two sites (getWorker, doWork),
+// m["k"]?.finish() yields finish — never holders or m.
+func TestExtractCallsKotlinIndexedReceiver(t *testing.T) {
+	text := "fun run() {\n    holders[0].getWorker().doWork()\n    m[\"k\"]?.finish()\n}\n"
+	sites, ok := extractCalls("x.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	var got []string
+	for _, s := range sites {
+		got = append(got, calleeBase(s.Callee))
+	}
+	// Both calls on line 2 share the line, so their order is unspecified;
+	// compare as a set.
+	sort.Strings(got)
+	want := []string{"doWork", "finish", "getWorker"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("calleeBase over sites = %v, want %v (raw callees %v)", got, want, callSummary(sites))
 	}
 }
 

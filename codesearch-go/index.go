@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const schemaV = "go13" // go13: JS/TS/JSX/TSX constructor calls (`new_expression`) captured in CallSites/--callers; a go12 index is rejected (stale CallSites); was go12
+const schemaV = "go14" // go14: P1-A calleeBase right-to-left (indexed/turbofish receivers), P1-B Rust --related defs + `pub use` edges, P1-C Kotlin regex fallback always merged, P2 JNI bridge (relJNIDecl + Kind "jni" bridges) persisted in RelJNI; a go13 index is rejected (stale Rel*); was go13
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {
@@ -53,6 +53,7 @@ type diskIndex struct {
 	RelDefs    []relDef
 	RelEdges   []relEdge
 	RelBridges []relBridge
+	RelJNI     []relJNIDecl
 	CallSites  []callSite
 }
 
@@ -78,6 +79,7 @@ type memIndex struct {
 	relDefs    []relDef
 	relEdges   []relEdge
 	relBridges []relBridge
+	relJNI     []relJNIDecl
 	callSites  []callSite
 	relIdx     *relIndex
 }
@@ -237,6 +239,7 @@ func (ix *memIndex) save(path string) error {
 		RelDefs:    ix.relDefs,
 		RelEdges:   ix.relEdges,
 		RelBridges: ix.relBridges,
+		RelJNI:     ix.relJNI,
 		CallSites:  ix.callSites,
 	}
 	tmp := path + ".tmp"
@@ -278,6 +281,7 @@ func memFromDisk(di *diskIndex) *memIndex {
 	ix.relDefs = di.RelDefs
 	ix.relEdges = di.RelEdges
 	ix.relBridges = di.RelBridges
+	ix.relJNI = di.RelJNI
 	ix.callSites = di.CallSites
 	for _, d := range di.Chunks {
 		ix.addChunkDoc(d, tokenize(splitCamel(d.Text)), tokenize(d.Path))
@@ -285,7 +289,7 @@ func memFromDisk(di *diskIndex) *memIndex {
 	return ix
 }
 
-// removeRel drops one file's related rows (defs, edges, bridges).
+// removeRel drops one file's related rows (defs, edges, bridges, JNI decls).
 func (ix *memIndex) removeRel(path string) {
 	ix.relIdx = nil
 	{
@@ -315,6 +319,15 @@ func (ix *memIndex) removeRel(path string) {
 		}
 		ix.relBridges = out
 	}
+	{
+		var out []relJNIDecl
+		for _, d := range ix.relJNI {
+			if d.Path != path {
+				out = append(out, d)
+			}
+		}
+		ix.relJNI = out
+	}
 }
 
 // removeCalls drops one file's cached call sites.
@@ -337,7 +350,7 @@ func (ix *memIndex) relatedFor(name, selfPath string, selfLine int) []relEntry {
 		for rel := range ix.files {
 			files[rel] = true
 		}
-		ix.relIdx = newRelIndex(ix.relDefs, ix.relEdges, ix.relBridges, files)
+		ix.relIdx = newRelIndex(ix.relDefs, ix.relEdges, ix.relBridges, ix.relJNI, files)
 	}
 	rows := ix.relIdx.resolve(name)
 	var out []relEntry
@@ -415,6 +428,7 @@ type fileOutcome struct {
 	relDefs    []relDef
 	relEdges   []relEdge
 	relBridges []relBridge
+	relJNI     []relJNIDecl
 	relOK      bool
 	callSites  []callSite
 	callOK     bool
@@ -449,7 +463,7 @@ func processFile(root, rel string) fileOutcome {
 		ext := extOf(rel)
 		if relJSExts[ext] || ext == ".rs" || ext == ".kt" {
 			_ = runTimed(astTimeout, func() {
-				out.relDefs, out.relEdges, out.relBridges, out.relOK = extractRelated(rel, fr.text)
+				out.relDefs, out.relEdges, out.relBridges, out.relJNI, out.relOK = extractRelated(rel, fr.text)
 			})
 		}
 		if _, ok := getCallSpec(ext); ok {
@@ -491,6 +505,7 @@ func buildFull(root string, cfg *ScanConfig) (*memIndex, buildStats) {
 			ix.relDefs = append(ix.relDefs, r.relDefs...)
 			ix.relEdges = append(ix.relEdges, r.relEdges...)
 			ix.relBridges = append(ix.relBridges, r.relBridges...)
+			ix.relJNI = append(ix.relJNI, r.relJNI...)
 			ix.callSites = append(ix.callSites, r.callSites...)
 			st.content++
 		} else {
@@ -582,6 +597,7 @@ func (ix *memIndex) sync(root string, cfg *ScanConfig) (added, modified, deleted
 				ix.relDefs = append(ix.relDefs, out.relDefs...)
 				ix.relEdges = append(ix.relEdges, out.relEdges...)
 				ix.relBridges = append(ix.relBridges, out.relBridges...)
+				ix.relJNI = append(ix.relJNI, out.relJNI...)
 			}
 			if out.callOK {
 				ix.callSites = append(ix.callSites, out.callSites...)

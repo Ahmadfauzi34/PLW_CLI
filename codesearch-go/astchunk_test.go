@@ -613,6 +613,18 @@ func TestKotlinRegexFallbackDefs(t *testing.T) {
 		t.Errorf("regex defs = %+v, want only [Real]", defs)
 	}
 
+	// One level of nested parens in the annotation args (P1-C, go14):
+	// the annotation shares the line with the modifiers.
+	nested := "package p\n\n@Suppress(names = arrayOf(\"UNUSED\")) internal fun Guarded() {}\nfun ok() {}\n"
+	defs = kotlinRegexDefinitions(nested, lineOf([]byte(nested)))
+	names = map[string]bool{}
+	for _, d := range defs {
+		names[d.name] = true
+	}
+	if !names["Guarded"] || !names["ok"] || len(defs) != 2 {
+		t.Errorf("nested-paren annotation defs = %+v, want [Guarded ok]", defs)
+	}
+
 	// Merge: AST defs are never dropped, regex defs fill the gap.
 	ast := []definition{{startLine: 3, endLine: 3, name: "Ok", sigEnd: 0}}
 	regex := []definition{
@@ -622,5 +634,61 @@ func TestKotlinRegexFallbackDefs(t *testing.T) {
 	merged := mergeKotlinRegexDefs(ast, regex)
 	if len(merged) != 2 {
 		t.Errorf("merge = %+v, want 2 defs (Ok + Broken, no duplicate Ok)", merged)
+	}
+}
+
+// TestKotlinASTAndFallbackDefsSilentGap is the P1-C end-to-end case:
+// a file that parses cleanly (HasError false) and yields other defs,
+// but silently misses zero-arg annotation+visibility functions —
+// `@Composable internal fun Target() {}` degrades to a trailing-lambda
+// call, a valid call expression. The always-on regex merge must
+// recover Target and PreviewCard without duplicating peer, and a
+// healthy file must gain no phantom def from a same-named call.
+func TestKotlinASTAndFallbackDefsSilentGap(t *testing.T) {
+	text := "package demo\n\n" +
+		"import androidx.compose.runtime.Composable\n" +
+		"import androidx.compose.ui.tooling.preview.Preview\n\n" +
+		"@Composable\n" +
+		"internal fun Target() {}\n\n" +
+		"@Preview\n" +
+		"private fun PreviewCard() {}\n\n" +
+		"fun peer() {}\n"
+	chunks, astOK := chunkFile("x.kt", text)
+	if !astOK {
+		t.Fatal("expected AST path for the silent-gap file")
+	}
+	got := map[string]int{}
+	for _, c := range chunks {
+		if c.name == "" {
+			continue
+		}
+		if _, seen := got[c.name]; !seen {
+			got[c.name] = c.startLine
+		}
+	}
+	for name, line := range map[string]int{"Target": 7, "PreviewCard": 10, "peer": 12} {
+		if got[name] != line {
+			t.Errorf("def %s starts at line %d, want %d (got all: %v)", name, got[name], line, got)
+		}
+	}
+
+	// Healthy file: a call to Target() inside peer's body must not
+	// become a def; the only defs are peer and the Target declaration.
+	healthy := "package demo\n\nfun peer() {\n    Target()\n}\n\nfun Target() {}\n"
+	chunks, astOK = chunkFile("x.kt", healthy)
+	if !astOK {
+		t.Fatal("expected AST path for the healthy file")
+	}
+	got = map[string]int{}
+	for _, c := range chunks {
+		if c.name == "" {
+			continue
+		}
+		if _, seen := got[c.name]; !seen {
+			got[c.name] = c.startLine
+		}
+	}
+	if len(got) != 2 || got["peer"] != 3 || got["Target"] != 7 {
+		t.Errorf("healthy file defs = %v, want {peer:3 Target:7}", got)
 	}
 }

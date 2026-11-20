@@ -5,26 +5,26 @@ If this document and the code disagree, the code wins and this
 document must be fixed in the same change — a stale contract is
 worse than none, because the adapter trusts it.
 
-## Current schema: `go13`
+## Current schema: `go14`
 
-`schemaV` (`index.go`) is `go13`. PLW's adapter
+`schemaV` (`index.go`) is `go14`. PLW's adapter
 (`core/codesearch_engine.py`) accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13"}`.
+`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13", "go14"}`.
 
-### What `go13` guarantees
+### What `go14` guarantees
 
 1. **Index format.** A gob index (`diskIndex`) with fields
    `SchemaV`, `Root`, `Chunks`, `Files` (with `FileMeta.Skip`
    carrying `""` / `"oversize"` / `"binary"` / `"overchars"` and
    `FileMeta.Generated` flagging machine-generated/minified/declaration
    assets), `Newest`, the K15 related maps (`RelDefs`, `RelEdges`,
-   `RelBridges`), and `CallSites` (`go11`). An index written by
+   `RelBridges`, `RelJNI` since go14), and `CallSites` (`go11`). An index written by
    another schema is rejected (`loadDiskIndex` returns `ok=false`) and
    rebuilt, never read.
 2. **Cached structural queries (`--cached`).** `--callers` and
    `--related` still scan fresh by default, and accept `--cached` to
    answer from the persisted `CallSites` / `RelDefs` / `RelEdges` /
-   `RelBridges` in the synced gob index instead of re-parsing
+   `RelBridges` / `RelJNI` in the synced gob index instead of re-parsing
    unchanged files (`--cached` is mutually exclusive with `--once` and
    with `--index-*` commands).
 3. **Definition precision and asset exclusion.** `isGeneratedOrMinified`
@@ -114,10 +114,54 @@ worse than none, because the adapter trusts it.
     (fresh and `--cached`). A go12 index lacks constructor `CallSites`
     and is rejected by the schema bump, never silently served.
 
-### What `go13` does NOT guarantee
+14. **Rust/Kotlin/JNI related coverage (go14).**
+    a. **Callers: right-to-left callee base.** `calleeBase` strips
+       balanced `<...>`/`[...]` suffixes from the END of the callee
+       expression and takes the trailing identifier run, so indexed
+       receivers (`items[0].execute()`) and turbofish (`Vec::<T>::new`)
+       resolve to `execute`/`new` instead of the receiver's name. A
+       go13 index is unaffected (CallSites are unchanged), but the
+       query-side reduction changes, so the bump keeps the pair
+       versioned together.
+    b. **Rust `--related` definitions and re-exports.** `RelDefs`
+       covers non-bindgen Rust symbols (top-level fns, impl methods,
+       top-level `const`/`static`); `RelEdges` covers `pub use`
+       re-exports (groups, aliases, globs, nested groups, `self`,
+       `pub(crate)`; private `use` produces no edge), resolved by
+       `resolveRustImport` (`crate::`/`self::`/`super::`/plain,
+       `<mod>.rs` then `<mod>/mod.rs`).
+    c. **Kotlin regex fallback always merged.** The regex def
+       fallback (`kotlinDeclRe`, incl. one level of nested parens in
+       annotation arguments) is merged into the AST defs on every
+       file, not only on parse failure or empty AST defs, so
+       declarations the grammar drops (e.g. `@Composable` before a
+       modifier) are definitions in `--defs-only`, `--related`, and
+       `--callers` alike.
+    d. **JNI bridge (`--related`, two directions).** A Rust fn named
+       `Java_<pkg>_<Class>_<method>[__<sig>]` is a `relBridge` with
+       `Kind: "jni"` (no attribute needed; methods inside `impl` are
+       not JNI entry points), and a Kotlin `external fun` is a
+       `relJNIDecl` (`RelJNI` in the gob index) carrying its JNI base
+       key, arity, and coarse type tokens per parameter (primitives
+       1:1, `String`/primitive arrays fixed, nullable/generic/custom
+       classes wildcard). `--related` matches decls to bridges by
+       base key (Option 3): a Kotlin method query returns one `ffi`
+       row per Rust overload for the base; a Rust JNI-name query
+       returns the Kotlin decls for the base, narrowed by the
+       signature's arity and coarse tokens when the query carries
+       one; survivors that still collide are shown as overload
+       candidates, never dropped. A go13 index lacks `RelJNI` and the
+       new `RelDefs`/`RelEdges` and is rejected by the schema bump,
+       never silently served.
+
+### What `go14` does NOT guarantee
 
 - **Type resolution.** `--callers` and `--related` remain name-based
   on the trailing identifier; rows are leads to verify against source.
+- **JNI overload disambiguation beyond arity + coarse tokens.**
+  Two overloads with the same arity whose parameters differ only in
+  two non-primitive classes are both shown as candidates. `RegisterNatives`
+  and `@JvmName`/`@file:JvmName` are not tracked (v2 scope).
 
 ## Compatibility rule
 
@@ -157,10 +201,17 @@ older).
 
 ## History
 
+- `go14` (2026-11-21): P1-A calleeBase right-to-left (indexed/turbofish
+  receivers), P1-B Rust `--related` defs + `pub use` edges, P1-C Kotlin
+  regex fallback always merged (incl. one level of nested parens in
+  annotation arguments), P2 JNI bridge two directions (base-key
+  grouping, arity + coarse-token narrowing, fail-open candidates) via
+  persisted `RelJNI` + `Kind: "jni"` bridges; `go13` indexes rejected
+  and rebuilt. Still current.
 - `go13` (2026-11-20): JS/TS/JSX/TSX constructor invocations
   (`new_expression`) captured in `CallSites` and `--callers`
   (fresh and `--cached`) via `jsCallQuery`; `go12` indexes rejected and
-  rebuilt. Still current.
+  rebuilt.
 - `go12` (2026-11-20): Kotlin parity — `--related` and `--callers`
   share the AST+regex def helper with `--defs-only` (anchored lines,
   byte spans incl. regex-recovered defs); decl-header false call

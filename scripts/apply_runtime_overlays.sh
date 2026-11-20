@@ -473,6 +473,12 @@ grep -Fq '"go13": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v13"
 grep -Fq '8ae0b08323eb04fedecf5056548e91e368253acfd7fead315e671f80b5828fa9' core/codesearch_engine.py
 grep -Fq '416c70f4e8f5' core/codesearch_engine.py
+apply_reviewable_overlay "engine_state_v6"
+grep -Fq 'KNOWN_SCHEMA = "go14"' core/codesearch_engine.py
+grep -Fq '"go14": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v14"
+grep -Fq '26a05e30cfd9d600b6c47b34b30639636bc92b2feffae7e1fc3959983820412d' core/codesearch_engine.py
+grep -Fq '64727c3f7ed9' core/codesearch_engine.py
 apply_reviewable_overlay "type_only_downstream_consistency_v1"
 grep -Fq 'import shlex' codebase/mermaid_graph.py
 grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
