@@ -460,6 +460,13 @@ grep -Fq 'cfg_test_mod' core/target_topology.py
 grep -Fq '"mod.rs", "__init__.py"' codebase/mermaid_graph.py
 grep -Fq 'match.start("mods")' codebase/topology_analyzers.py
 grep -Fq "f\"topology covers {'/'.join(SOURCE_EXTENSIONS)}.\"" core/portable_agent.py
+apply_reviewable_overlay "rust_mod_cycle_calibration_v1"
+grep -Fq '"semantic_usages": ["rust_use"]' language_semantics.py
+grep -Fq '"rust_path_ref"' language_semantics.py
+grep -Fq 'clean_content = _rust_strip_comments_and_strings(content)' core/shared_graph.py
+grep -Fq 'def _non_cyclic_rust_mod_edges(' codebase/cycle_break.py
+grep -Fq 'or set(ed.get("semantic_usages") or ()) == {"rust_mod"}' core/target_topology.py
+grep -Fq 'non_cyclic_edges=non_cyclic_mod_edges' codebase/hott_analyzers.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
