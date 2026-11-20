@@ -2048,5 +2048,148 @@ class ArchitectureBaselineTests(unittest.TestCase):
                 f"Superseded overlay calibration_ux_v{v} should be consolidated",
             )
 
+    def test_topo_circular_opt_v1_soundness_semantics_and_scale(self) -> None:
+        """Regression tests for topo.circular Iterative Tarjan+Johnson, type_only semantics, and scale."""
+        from codebase.cycle_break import (
+            analyze_cycle_breaks,
+            find_directed_cycles_with_metadata,
+        )
+        from codebase.topology_analyzers import analyze_circular, query_impact
+        from core.target_topology import _cyclic_sccs
+
+        # 1. Overlapping figure-8 cycles: old 3-color DFS missed a->c->a behind BLACK node c
+        fig8 = {
+            "vertices": ["a.ts", "b.ts", "c.ts"],
+            "edges": [("a.ts", "b.ts"), ("b.ts", "c.ts"), ("c.ts", "a.ts"), ("a.ts", "c.ts")],
+            "edge_natures": {
+                "a.ts -> b.ts": "type_only",
+                "b.ts -> c.ts": "type_only",
+                "c.ts -> a.ts": "runtime",
+                "a.ts -> c.ts": "runtime",
+            },
+            "node_metadata": {v: {"fan_in": 1, "fan_out": 1} for v in ["a.ts", "b.ts", "c.ts"]},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        circ1 = analyze_circular(fig8)
+        self.assertEqual(
+            [f["cycle"] for f in circ1["findings"]],
+            [["a.ts", "c.ts", "a.ts"], ["a.ts", "b.ts", "c.ts", "a.ts"]],
+        )
+        self.assertEqual(circ1["findings"][0]["cycle_nature"], "runtime")
+        self.assertEqual(circ1["findings"][0]["severity"], "high")
+        self.assertEqual(circ1["findings"][1]["cycle_nature"], "type_only")
+        self.assertEqual(circ1["findings"][1]["severity"], "low")
+        self.assertEqual(circ1["summary"]["runtime_cycles"], 1)
+        self.assertEqual(circ1["summary"]["type_only_cycles"], 1)
+        self.assertEqual(circ1["summary"]["cyclic_scc_count"], 1)
+        self.assertFalse(circ1["summary"]["truncated"])
+        # Shared single source of truth with analyze_cycle_breaks
+        self.assertEqual(analyze_cycle_breaks(fig8)["summary"], circ1["summary"]["cycle_break_plan"])
+
+        # 2. Mixed runtime + type_only edge breaks runtime circularity (compiler-elided)
+        mixed = {
+            "vertices": ["a.ts", "b.ts"],
+            "edges": [("a.ts", "b.ts"), ("b.ts", "a.ts")],
+            "edge_natures": {"a.ts -> b.ts": "runtime", "b.ts -> a.ts": "type_only"},
+            "node_metadata": {v: {"fan_in": 1, "fan_out": 1} for v in ["a.ts", "b.ts"]},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        circ2 = analyze_circular(mixed)
+        self.assertEqual(len(circ2["findings"]), 1)
+        f2 = circ2["findings"][0]
+        self.assertTrue(f2["is_type_only"])
+        self.assertEqual(f2["cycle_nature"], "type_only")
+        self.assertEqual(f2["severity"], "low")
+        self.assertEqual(f2["type_only_edge_count"], 1)
+        self.assertEqual(f2["runtime_edge_count"], 1)
+
+        # 3. Exact combinatorics on K_4 (20 elementary cycles) and K_5 exact boundary (84)
+        k4v = [f"v{i}.ts" for i in range(4)]
+        k4g = {
+            "vertices": k4v,
+            "edges": [(u, v) for u in k4v for v in k4v if u != v],
+            "edge_natures": {},
+            "node_metadata": {},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        rk4 = analyze_circular(k4g)
+        self.assertEqual(rk4["summary"]["total_cycles"], 20)
+        self.assertFalse(rk4["summary"]["truncated"])
+
+        k5v = [f"v{i}.ts" for i in range(5)]
+        k5g = {
+            "vertices": k5v,
+            "edges": [(u, v) for u in k5v for v in k5v if u != v],
+            "edge_natures": {},
+            "node_metadata": {},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        exact5 = find_directed_cycles_with_metadata(k5g, max_cycles_per_scc=84, max_total_cycles=200)
+        self.assertEqual(len(exact5["cycles"]), 84)
+        self.assertFalse(exact5["truncated"])
+        capped5 = find_directed_cycles_with_metadata(k5g, max_cycles_per_scc=64, max_total_cycles=200)
+        self.assertEqual(len(capped5["cycles"]), 64)
+        self.assertTrue(capped5["truncated"])
+
+        # 4. Bounded dense mega-SCC K_10 prioritizes 2-cycles and preserves exact files_in_cycles
+        k10v = [f"n{i:02d}.ts" for i in range(10)]
+        k10g = {
+            "vertices": k10v,
+            "edges": [(u, v) for u in k10v for v in k10v if u != v],
+            "edge_natures": {},
+            "node_metadata": {},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        rk10 = analyze_circular(k10g)
+        self.assertTrue(rk10["summary"]["truncated"])
+        self.assertEqual(rk10["summary"]["total_cycles"], 64)
+        self.assertEqual(rk10["summary"]["files_in_cycles"], 10)
+        self.assertIn("covers_all_graph_cycles", rk10["summary"])
+        two_cycles = [f for f in rk10["findings"] if f["cycle_length"] == 2]
+        self.assertEqual(len(two_cycles), 45)
+
+        # 5. Deep 1500-node DAG & 1200-node cyclic ring+chord: zero RecursionError in both Tarjan & Johnson
+        dag_v = [f"d{i:04d}.ts" for i in range(1500)]
+        dag_e = [(dag_v[i], dag_v[i + 1]) for i in range(1499)]
+        dag_g = {"vertices": dag_v, "edges": dag_e, "edge_natures": {}, "node_metadata": {}, "file_map": {}, "type_shapes": {}}
+        self.assertEqual(analyze_circular(dag_g)["summary"]["total_cycles"], 0)
+        self.assertEqual(_cyclic_sccs(dag_v, dag_e), [])
+
+        ring_v = [f"r{i:04d}.ts" for i in range(1200)]
+        ring_e = [(ring_v[i], ring_v[(i + 1) % 1200]) for i in range(1200)] + [(ring_v[600], ring_v[0])]
+        ring_g = {"vertices": ring_v, "edges": ring_e, "edge_natures": {}, "node_metadata": {}, "file_map": {}, "type_shapes": {}}
+        r_ring = analyze_circular(ring_g)
+        self.assertEqual([f["cycle_length"] for f in r_ring["findings"]], [601, 1200])
+        self.assertEqual(r_ring["summary"]["files_in_cycles"], 1200)
+        self.assertEqual(len(_cyclic_sccs(ring_v, ring_e)), 1)
+
+        # 6. Self-loop + same_package exclusion + exact target filter in query_impact (a.ts != ba.ts)
+        sl_g = {
+            "vertices": ["a.ts", "ba.ts", "c.ts", "kt1.kt", "kt2.kt"],
+            "edges": [
+                ("a.ts", "a.ts"),
+                ("ba.ts", "c.ts"),
+                ("c.ts", "ba.ts"),
+                ("kt1.kt", "kt2.kt"),
+                ("kt2.kt", "kt1.kt"),
+            ],
+            "edge_natures": {
+                "kt1.kt -> kt2.kt": "same_package",
+                "kt2.kt -> kt1.kt": "same_package",
+            },
+            "node_metadata": {v: {"fan_in": 1, "fan_out": 1} for v in ["a.ts", "ba.ts", "c.ts", "kt1.kt", "kt2.kt"]},
+            "file_map": {},
+            "type_shapes": {},
+        }
+        r_sl = analyze_circular(sl_g)
+        self.assertEqual([f["cycle"] for f in r_sl["findings"]], [["a.ts", "a.ts"], ["ba.ts", "c.ts", "ba.ts"]])
+        imp_a = query_impact(sl_g, "a.ts")
+        self.assertEqual(imp_a["cycle_break_advisory"]["total_cycles"], 1)
+
 if __name__ == "__main__":
     unittest.main()
