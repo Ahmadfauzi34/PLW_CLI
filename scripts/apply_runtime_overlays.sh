@@ -496,9 +496,6 @@ grep -Fq '"go15": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v15"
 grep -Fq '2d5e950b08c7e3ffb3fcba6d77397cc0741a2461802f08708cfc28e55497c63c' core/codesearch_engine.py
 grep -Fq '0fbc4fb4c390' core/codesearch_engine.py
-apply_reviewable_overlay "engine_pin_v15"
-grep -Fq '2d5e950b08c7e3ffb3fcba6d77397cc0741a2461802f08708cfc28e55497c63c' core/codesearch_engine.py
-grep -Fq '0fbc4fb4c390' core/codesearch_engine.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
