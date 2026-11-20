@@ -1,114 +1,167 @@
 #!/usr/bin/env bash
-# check_engine_contract.sh — G13 + G2: the engine's schemaV and the
-# adapter's KNOWN_SCHEMA must agree, ENGINE_CONTRACT.md must name
-# the current schema, and the just-built engine binary's digest must
-# be in the adapter's PINNED_ENGINE_DIGESTS. Run in CI (build-binary
-# workflow, job codesearch-engine-smoke) so a mismatch is caught at
-# push time, not at runtime in a user's hands. If this goes red, the
-# fix is a schema bump (engine), a SUPPORTED_SCHEMAS update
-# (adapter), or a pin update (adapter) — never a change to this
-# script.
+# Check that codesearch-go and the Python adapter agree on the
+# engine contract (G1, G2, G13). Runs before the smoke test in CI
+# and is cheap to run locally.
 #
-# NOTE: the adapter's KNOWN_SCHEMA and PINNED_ENGINE_DIGESTS are
-# read from the overlay patches (runtime_overlay/engine_state_v1/
-# and engine_pin_v4/change.patch), NOT from core/codesearch_engine.py
-# — that file only exists after the capsule is unpacked, and this
-# job runs on the bare repo checkout (a grep of core/ here fails
-# with "No such file", CI run 42868246692). The patches are the
-# repo-resident source of truth for the adapter: post-image lines
-# are '+' (added) and ' ' (context); '-' lines are the pre-image
-# and are excluded. The pin moved from engine_pin_v1 to
-# engine_pin_v2 when F2 rotated the reproducible-build digest (the
-# v1 patch still holds the superseded digest), then to engine_pin_v3
-# when the Kotlin engine (K1-K4) rotated it again, then to
-# engine_pin_v4 when the vendored build (Track 4, K5) rotated it:
-# -mod=vendor drops the dep h1 hash from buildinfo, so the vendored
-# binary can never match the module-mode pin; then to engine_pin_v5
-# when the defs-only opsi 1 fix rotated it (digest b6f0ec48…,
-# commit 9a3db30a5027; local + CI builds agree); then to engine_pin_v6
-# when the SOLID refactor 1-3 rotated it (digest 62b532ec…,
-# commit e88c2e3f11f8; local + CI builds agree); then to
-# engine_state_v2 when the schema moved go9->go10 (interface members
-# are definitions; go9 stays listed because the v0.2.5 release asset
-# is still go9) and to engine_pin_v7 when that engine rotated the
-# digest (828eeeab…, commit b6e9a95c06a9; local + CI builds agree)
-# and to engine_pin_v8 when the G1 defs-only fix rotated the digest
-# (0a3f6179…, commit efff2b7dd3ad; local + CI builds agree), then to
-# engine_state_v3 when go11 added persistent CallSites/Generated in .gob
-# + --cached + filterDefChunks, to engine_pin_v9 when that engine
-# rotated the digest (696333c3…, commit 7900e083dc7c), and to
-# engine_pin_v10 when build.sh added -s -w to strip DWARF/symtab
-# (1a4c4548…, commit 7900e083dc7c), and to engine_pin_v11 when the
-# Kotlin @Composable/internal anchor + regex fallback rotated the
-# digest (42b615b1…, commit 2c213de5f411, go1.27.3), and to
-# engine_state_v4 when the Kotlin parity work (shared def helper for
-# --related/--callers, trailing-comment anchor fix, multi-segment
-# receiver names) moved the schema go11->go12, and to engine_pin_v12
-# when that engine rotated the digest (f471777c…, commit 84bb7eda6dd7,
-# go1.27.3), and to engine_state_v5 (go12->go13 for JS/TS/JSX/TSX
-# new_expression constructor callers) + engine_pin_v13 (8ae0b083…,
-# commit 416c70f4e8f5, go1.27.3), and to engine_state_v6 (go13->go14
-# for P1-A calleeBase right-to-left, P1-B Rust --related defs + pub use
-# edges, P1-C Kotlin regex fallback always merged, P2 JNI bridge two
-# directions) + engine_pin_v14 (26a05e30…, commit 64727c3f7ed9, go1.27.3),
-# and to engine_state_v7 (go14->go15 for Rust pub use/super & JNI polish)
-# + engine_pin_v15 (2d5e950b…, commit 0fbc4fb4c390, go1.27.3).
-# If a later overlay moves either constant again, update the patch
-# paths below — the script then fails closed with "could not read ...".
+# Resolves the effective core/codesearch_engine.py directly from the
+# SHA-256 verified runtime capsule plus any active overlays registered
+# in scripts/apply_runtime_overlays.sh that touch core/codesearch_engine.py,
+# so it works cleanly on both bare checkouts and unpacked trees without
+# hardcoding overlay patch filenames.
+#
+# Fails non-zero on:
+#   - runtime_source/plw-runtime-src.tar.gz digest mismatch
+#   - engine schemaV != adapter KNOWN_SCHEMA
+#   - engine schemaV not listed in adapter SUPPORTED_SCHEMAS
+#   - codesearch-go/ENGINE_CONTRACT.md does not name the current schema
+#   - when an engine binary exists at artifacts/codesearch-go-linux-x86_64
+#     or codesearch-go/codesearch-go, its SHA256 is not in PINNED_ENGINE_DIGESTS
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v7/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v15/change.patch"
-ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
-ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
+CAPSULE="$ROOT/runtime_source/plw-runtime-src.tar.gz"
+MANIFEST="$ROOT/runtime_source/CAPSULE_SHA256"
 
-fail=0
-if [ -z "$ENGINE_SCHEMA" ]; then
-  echo "check_engine_contract: could not read schemaV from codesearch-go/index.go" >&2
-  fail=1
-elif [ -z "$ADAPTER_SCHEMA" ]; then
-  echo "check_engine_contract: could not read KNOWN_SCHEMA from $ADAPTER_PATCH" >&2
-  fail=1
-elif [ "$ENGINE_SCHEMA" != "$ADAPTER_SCHEMA" ]; then
-  echo "check_engine_contract: MISMATCH engine schemaV=$ENGINE_SCHEMA adapter KNOWN_SCHEMA=$ADAPTER_SCHEMA" >&2
-  echo "  Fix: bump schemaV (engine) or update SUPPORTED_SCHEMAS (adapter) — see codesearch-go/ENGINE_CONTRACT.md" >&2
-  fail=1
-else
-  echo "check_engine_contract: schema $ENGINE_SCHEMA agrees (engine == adapter)"
-fi
-
-if ! grep -q "Current schema: \`$ENGINE_SCHEMA\`" "$ROOT/codesearch-go/ENGINE_CONTRACT.md" 2>/dev/null; then
-  echo "check_engine_contract: ENGINE_CONTRACT.md does not name current schema \`$ENGINE_SCHEMA\`" >&2
-  fail=1
-else
-  echo "check_engine_contract: ENGINE_CONTRACT.md names schema $ENGINE_SCHEMA"
-fi
-
-# G2: the just-built engine binary's digest must be pinned. The
-# binary lives at artifacts/ in the smoke job (downloaded artifact)
-# or at codesearch-go/ in the build job (fresh build). If neither
-# exists (e.g. a local run without a build), the pin check is
-# skipped with a visible note — the schema checks above still run.
-BIN=""
-for candidate in "$ROOT/artifacts/codesearch-go-linux-x86_64" "$ROOT/codesearch-go/codesearch-go"; do
-  if [ -f "$candidate" ]; then BIN="$candidate"; break; fi
-done
-if [ -z "$BIN" ]; then
-  echo "check_engine_contract: pin check skipped (no engine binary found at artifacts/ or codesearch-go/)"
-else
-  BIN_DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
-  if grep -qE "^[+ ] *\"$BIN_DIGEST\":" "$PIN_PATCH" 2>/dev/null; then
-    echo "check_engine_contract: binary digest $BIN_DIGEST is pinned ($BIN)"
-  else
-    echo "check_engine_contract: PIN MISSING binary digest $BIN_DIGEST ($BIN) is not in PINNED_ENGINE_DIGESTS ($PIN_PATCH)" >&2
-    echo "  Fix: rebuild with codesearch-go/build.sh and add the digest to PINNED_ENGINE_DIGESTS in the same commit" >&2
-    fail=1
-  fi
-fi
-
-if [ "$fail" -ne 0 ]; then
+if [[ ! -f "$CAPSULE" || ! -f "$MANIFEST" ]]; then
+  echo "check_engine_contract: runtime capsule or CAPSULE_SHA256 missing" >&2
   echo "CHECK_ENGINE_CONTRACT: FAIL" >&2
   exit 1
 fi
-echo "CHECK_ENGINE_CONTRACT: PASS"
+
+EXPECTED_CAPSULE="$(awk '{print $1}' "$MANIFEST")"
+ACTUAL_CAPSULE="$(sha256sum "$CAPSULE" | awk '{print $1}')"
+if [[ "$ACTUAL_CAPSULE" != "$EXPECTED_CAPSULE" ]]; then
+  echo "check_engine_contract: runtime capsule digest mismatch (expected=$EXPECTED_CAPSULE actual=$ACTUAL_CAPSULE)" >&2
+  echo "CHECK_ENGINE_CONTRACT: FAIL" >&2
+  exit 1
+fi
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Extract core/codesearch_engine.py from the verified capsule into an isolated staging dir
+tar --no-same-owner -xzf "$CAPSULE" -C "$TMPDIR" core/codesearch_engine.py
+
+# Apply any active overlays in scripts/apply_runtime_overlays.sh that modify core/codesearch_engine.py
+while IFS= read -r line; do
+  kind=""
+  name=""
+  if [[ "$line" =~ ^apply_reviewable_overlay[[:space:]]+\"([^\"]+)\" ]]; then
+    kind="reviewable"
+    name="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ ^apply_b64_overlay[[:space:]]+\"([^\"]+)\" ]]; then
+    kind="b64"
+    name="${BASH_REMATCH[1]}"
+  else
+    continue
+  fi
+
+  overlay_dir="$ROOT/runtime_overlay/$name"
+  tmp_patch="$TMPDIR/_overlay_${name}.patch"
+  if [[ "$kind" == "reviewable" ]]; then
+    patch_file="$overlay_dir/change.patch"
+    patch_manifest="$overlay_dir/PATCH_SHA256"
+    if [[ ! -f "$patch_file" || ! -f "$patch_manifest" ]]; then
+      echo "check_engine_contract: missing reviewable overlay $name" >&2
+      exit 1
+    fi
+    exp="$(awk '{print $1}' "$patch_manifest")"
+    act="$(sha256sum "$patch_file" | awk '{print $1}')"
+    if [[ "$act" != "$exp" ]]; then
+      echo "check_engine_contract: digest mismatch in overlay $name" >&2
+      exit 1
+    fi
+    cp "$patch_file" "$tmp_patch"
+  else
+    patch_manifest="$overlay_dir/OVERLAY_SHA256"
+    [[ -f "$patch_manifest" ]] || continue
+    cat "$overlay_dir"/part*.b64 | tr -d '\r\n' | base64 --decode > "$tmp_patch"
+    exp="$(awk '{print $1}' "$patch_manifest")"
+    act="$(sha256sum "$tmp_patch" | awk '{print $1}')"
+    if [[ "$act" != "$exp" ]]; then
+      echo "check_engine_contract: digest mismatch in b64 overlay $name" >&2
+      exit 1
+    fi
+  fi
+
+  if grep -qE '^(\+\+\+|---) [ab]/core/codesearch_engine\.py$' "$tmp_patch"; then
+    # Extract any companion files referenced by this patch that exist in the capsule
+    while IFS= read -r target; do
+      [[ -n "$target" && ! -f "$TMPDIR/$target" ]] || continue
+      tar --no-same-owner -xzf "$CAPSULE" -C "$TMPDIR" "$target" 2>/dev/null || true
+    done < <(grep -E '^(\+\+\+|---) [ab]/' "$tmp_patch" | sed -E 's#^(\+\+\+|---) [ab]/##' | sort -u)
+    patch --batch --forward -p1 -d "$TMPDIR" < "$tmp_patch" >/dev/null
+  fi
+  rm -f "$tmp_patch"
+done < "$ROOT/scripts/apply_runtime_overlays.sh"
+
+ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
+
+BIN=""
+for candidate in "$ROOT/artifacts/codesearch-go-linux-x86_64" "$ROOT/codesearch-go/codesearch-go"; do
+  if [[ -f "$candidate" ]]; then BIN="$candidate"; break; fi
+done
+BIN_DIGEST=""
+if [[ -n "$BIN" ]]; then
+  BIN_DIGEST="$(sha256sum "$BIN" | cut -d' ' -f1)"
+fi
+
+python3 - "$TMPDIR/core/codesearch_engine.py" "$ENGINE_SCHEMA" "$ROOT/codesearch-go/ENGINE_CONTRACT.md" "$BIN" "$BIN_DIGEST" << 'PY'
+import ast, pathlib, sys
+
+adapter_path, engine_schema, contract_path, bin_path, bin_digest = sys.argv[1:6]
+tree = ast.parse(pathlib.Path(adapter_path).read_text(encoding="utf-8"), filename=adapter_path)
+
+values = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        name = node.targets[0].id
+        if name in {"KNOWN_SCHEMA", "SUPPORTED_SCHEMAS", "PINNED_ENGINE_DIGESTS"}:
+            values[name] = ast.literal_eval(node.value)
+
+fail = False
+adapter_schema = values.get("KNOWN_SCHEMA")
+supported_schemas = values.get("SUPPORTED_SCHEMAS")
+pinned_digests = values.get("PINNED_ENGINE_DIGESTS")
+
+if not engine_schema:
+    print("check_engine_contract: could not read schemaV from codesearch-go/index.go", file=sys.stderr)
+    fail = True
+elif not isinstance(adapter_schema, str) or not adapter_schema:
+    print("check_engine_contract: could not read KNOWN_SCHEMA from effective core/codesearch_engine.py", file=sys.stderr)
+    fail = True
+elif engine_schema != adapter_schema:
+    print(f"check_engine_contract: MISMATCH engine schemaV={engine_schema} adapter KNOWN_SCHEMA={adapter_schema}", file=sys.stderr)
+    print("  Fix: bump schemaV (engine) or update SUPPORTED_SCHEMAS (adapter) — see codesearch-go/ENGINE_CONTRACT.md", file=sys.stderr)
+    fail = True
+else:
+    print(f"check_engine_contract: schema {engine_schema} agrees (engine == adapter)")
+
+if isinstance(supported_schemas, dict) and engine_schema in supported_schemas:
+    print(f"check_engine_contract: SUPPORTED_SCHEMAS includes {engine_schema}")
+else:
+    print(f"check_engine_contract: SUPPORTED_SCHEMAS does not include {engine_schema}", file=sys.stderr)
+    fail = True
+
+contract_text = pathlib.Path(contract_path).read_text(encoding="utf-8") if pathlib.Path(contract_path).is_file() else ""
+if f"Current schema: `{engine_schema}`" not in contract_text:
+    print(f"check_engine_contract: ENGINE_CONTRACT.md does not name current schema `{engine_schema}`", file=sys.stderr)
+    fail = True
+else:
+    print(f"check_engine_contract: ENGINE_CONTRACT.md names schema {engine_schema}")
+
+if not bin_path:
+    print("check_engine_contract: pin check skipped (no engine binary found at artifacts/ or codesearch-go/)")
+else:
+    if isinstance(pinned_digests, dict) and bin_digest in pinned_digests:
+        print(f"check_engine_contract: binary digest {bin_digest} is pinned ({bin_path})")
+    else:
+        print(f"check_engine_contract: PIN MISSING binary digest {bin_digest} ({bin_path}) is not in PINNED_ENGINE_DIGESTS", file=sys.stderr)
+        print("  Fix: rebuild with codesearch-go/build.sh and add the digest to PINNED_ENGINE_DIGESTS in the same commit", file=sys.stderr)
+        fail = True
+
+if fail:
+    print("CHECK_ENGINE_CONTRACT: FAIL", file=sys.stderr)
+    sys.exit(1)
+print("CHECK_ENGINE_CONTRACT: PASS")
+PY

@@ -2038,15 +2038,35 @@ class ArchitectureBaselineTests(unittest.TestCase):
             payload = json.loads(buf.getvalue())
             self.assertIn("Invalid output mode", payload.get("error", ""))
 
-        # 6. Consolidated overlay integrity: v3..v17 dirs replaced by calibration_ux_consolidated_v1
-        overlay_dir = Path(plw_cli.__file__).resolve().parent / "runtime_overlay"
-        self.assertTrue((overlay_dir / "calibration_ux_consolidated_v1" / "change.patch").is_file())
-        self.assertTrue((overlay_dir / "calibration_ux_consolidated_v1" / "PATCH_SHA256").is_file())
+        # 6. Baked capsule & overlay integrity: superseded calibration overlays stay absent and capsule digest verifies
+        import hashlib
+        import re
+        repo_root = Path(plw_cli.__file__).resolve().parent
+        overlay_dir = repo_root / "runtime_overlay"
+        capsule_path = repo_root / "runtime_source" / "plw-runtime-src.tar.gz"
+        manifest_path = repo_root / "runtime_source" / "CAPSULE_SHA256"
+        self.assertTrue(capsule_path.is_file())
+        self.assertTrue(manifest_path.is_file())
+        expected_sha = manifest_path.read_text(encoding="utf-8").split()[0]
+        actual_sha = hashlib.sha256(capsule_path.read_bytes()).hexdigest()
+        self.assertEqual(actual_sha, expected_sha)
+        self.assertIn(expected_sha, (overlay_dir / "README.md").read_text(encoding="utf-8"))
+        self.assertFalse(
+            (overlay_dir / "calibration_ux_consolidated_v1").exists(),
+            "Baked overlay calibration_ux_consolidated_v1 should be folded into runtime_source capsule",
+        )
         for v in range(3, 18):
             self.assertFalse(
                 (overlay_dir / f"calibration_ux_v{v}").exists(),
-                f"Superseded overlay calibration_ux_v{v} should be consolidated",
+                f"Superseded overlay calibration_ux_v{v} should not exist",
             )
+        # Every overlay directory on disk must be registered in scripts/apply_runtime_overlays.sh
+        apply_script = (repo_root / "scripts" / "apply_runtime_overlays.sh").read_text(encoding="utf-8")
+        registered = set(
+            re.findall(r'^apply_(?:b64|reviewable)_overlay\s+"([^"]+)"', apply_script, re.M)
+        )
+        on_disk = {d.name for d in overlay_dir.iterdir() if d.is_dir()}
+        self.assertEqual(on_disk, registered, "Orphan or missing runtime_overlay directories")
 
     def test_topo_circular_opt_v1_soundness_semantics_and_scale(self) -> None:
         """Regression tests for topo.circular Iterative Tarjan+Johnson, type_only semantics, and scale."""
