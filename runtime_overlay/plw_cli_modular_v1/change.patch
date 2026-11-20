@@ -583,10 +583,10 @@ index 0000000..976d7e7
 +    return 0 if result.get("observation_recorded") or result.get("idempotent_recovery") else 3
 diff --git a/core/cli/agent_cmds.py b/core/cli/agent_cmds.py
 new file mode 100644
-index 0000000..740bf9b
+index 0000000..66e7cc0
 --- /dev/null
 +++ b/core/cli/agent_cmds.py
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,635 @@
 +"""Portable agent orientation, task-chain, target resolution, candidate provenance, and semantic CLI handlers."""
 +
 +import json
@@ -743,7 +743,6 @@ index 0000000..740bf9b
 +
 +def cmd_operation_plan(args: List[str]) -> int:
 +    """Resolve a declarative operation plan without invoking the operation."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw operation-plan")
 +    parser.add_argument("first", nargs="?", default=None)
 +    parser.add_argument("second", nargs="?", default=None)
@@ -824,7 +823,6 @@ index 0000000..740bf9b
 +
 +def cmd_candidate(args: List[str]) -> int:
 +    """Select a discovery candidate and optionally match its internal contract."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw candidate")
 +    parser.add_argument("operation", choices=("select", "list", "capability-match", "match"))
 +    parser.add_argument("task", nargs="?", default=None)
@@ -888,7 +886,6 @@ index 0000000..740bf9b
 +
 +def cmd_doctor(args: List[str]) -> int:
 +    """Verify standalone portable-agent readiness without touching target source."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw doctor")
 +    parser.add_argument("root", nargs="?", default=".")
 +    parser.add_argument("--root", default=None, dest="root_flag")
@@ -901,7 +898,6 @@ index 0000000..740bf9b
 +
 +def cmd_capability(args: List[str]) -> int:
 +    """List or describe the embedded semantic capability registry."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw capability")
 +    parser.add_argument("operation", choices=("list", "describe"))
 +    parser.add_argument("value", nargs="?")
@@ -918,7 +914,6 @@ index 0000000..740bf9b
 +
 +def cmd_skill(args: List[str]) -> int:
 +    """List or read exact version-aligned skill contracts bundled with PLW."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw skill")
 +    parser.add_argument("operation", choices=("list", "show"))
 +    parser.add_argument("value", nargs="?")
@@ -935,7 +930,6 @@ index 0000000..740bf9b
 +
 +def cmd_chain(args: List[str]) -> int:
 +    """Execute the full task-routing pipeline in a single process with HMAC receipt chaining."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw chain")
 +    parser.add_argument("task", nargs="?", default=None)
 +    parser.add_argument("root", nargs="?", default=".")
@@ -995,7 +989,6 @@ index 0000000..740bf9b
 +
 +def cmd_agent(args: List[str]) -> int:
 +    """Official target-first portable-agent orientation and pipeline chain entrypoint."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw agent")
 +    parser.add_argument("operation", choices=("orient", "chain"))
 +    parser.add_argument("root", nargs="?", default=".")
@@ -1118,7 +1111,6 @@ index 0000000..740bf9b
 +
 +def cmd_semantic(args: List[str]) -> int:
 +    """Read-only predictive semantics for agents unfamiliar with PLW vocabulary."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw semantic")
 +    parser.add_argument("operation", nargs="?", default=None)
 +    parser.add_argument("value", nargs="?", default=None)
@@ -1232,10 +1224,10 @@ index 0000000..740bf9b
 +    return code
 diff --git a/core/cli/analysis_cmds.py b/core/cli/analysis_cmds.py
 new file mode 100644
-index 0000000..ce13697
+index 0000000..e7dfede
 --- /dev/null
 +++ b/core/cli/analysis_cmds.py
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,822 @@
 +"""Core kernel analysis, context packing, transitions, Kan, check, and steering CLI handlers."""
 +
 +import json
@@ -1249,7 +1241,6 @@ index 0000000..ce13697
 +from language_semantics import source_extensions
 +from core.cli.common import (
 +    _PlwArgumentParser,
-+    _cli_error,
 +    _parse_cli_args,
 +    _resolve_truth_scope,
 +)
@@ -2061,10 +2052,10 @@ index 0000000..ce13697
 +    return 0 if "error" not in res else 1
 diff --git a/core/cli/ast_cmds.py b/core/cli/ast_cmds.py
 new file mode 100644
-index 0000000..2281d0b
+index 0000000..d9b2dc0
 --- /dev/null
 +++ b/core/cli/ast_cmds.py
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,276 @@
 +"""Tree-sitter / codesearch-go AST CLI command handler and positional argument resolver."""
 +
 +import json
@@ -2132,7 +2123,6 @@ index 0000000..2281d0b
 +    directory, in which case it is the root; --root DIR is always
 +    explicit.
 +    """
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ast", epilog="Argument order: two positionals are always root-first (root, then query); a single positional is the query unless it names a directory, in which case it is the root; --root DIR is always explicit.")
 +    parser.add_argument(
 +        "operation",
@@ -2344,10 +2334,10 @@ index 0000000..2281d0b
 +    return 0 if result.get("ok") else 3
 diff --git a/core/cli/common.py b/core/cli/common.py
 new file mode 100644
-index 0000000..22ef9db
+index 0000000..8c4b4fd
 --- /dev/null
 +++ b/core/cli/common.py
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,377 @@
 +"""Shared CLI parser, output-flag normalization, error reporting, and receipt helpers."""
 +
 +import argparse
@@ -2604,7 +2594,6 @@ index 0000000..22ef9db
 +
 +
 +def _parse_target_task_args(args: List[str], prog: str):
-+    import argparse
 +    parser = _PlwArgumentParser(prog=prog)
 +    parser.add_argument("task", nargs="?", default=None)
 +    parser.add_argument("root", nargs="?", default=".")
@@ -3537,10 +3526,10 @@ index 0000000..2a2cc70
 +    return 0
 diff --git a/core/cli/topology_cmds.py b/core/cli/topology_cmds.py
 new file mode 100644
-index 0000000..98b1b76
+index 0000000..90e3f11
 --- /dev/null
 +++ b/core/cli/topology_cmds.py
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,388 @@
 +"""Codebase topology, Mermaid diagrams, simplification analysis, and Angular anchor CLI handlers."""
 +
 +import json
@@ -3782,7 +3771,6 @@ index 0000000..98b1b76
 +
 +def cmd_topology(args: List[str]) -> int:
 +    """Bounded first-contact file→import→file orientation for a target repository."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw topology")
 +    parser.add_argument("root", nargs="?", default=".")
 +    parser.add_argument("--root", default=None, dest="root_flag")
@@ -3932,10 +3920,10 @@ index 0000000..98b1b76
 +    return code
 diff --git a/core/cli/ui_cmds.py b/core/cli/ui_cmds.py
 new file mode 100644
-index 0000000..68a8fa0
+index 0000000..2a6c3c5
 --- /dev/null
 +++ b/core/cli/ui_cmds.py
-@@ -0,0 +1,962 @@
+@@ -0,0 +1,951 @@
 +"""UI inspection, diagnosis, reproduction, causal probing, bounded fix, static UI reference, and geometric impact CLI handlers."""
 +
 +import json
@@ -4133,7 +4121,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_scenarios(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui scenarios")
 +    parser.add_argument("snapshots", nargs="+")
 +    parser.add_argument("--root", default=".")
@@ -4180,7 +4167,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_diff(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui diff")
 +    parser.add_argument("baseline")
 +    parser.add_argument("candidate")
@@ -4239,7 +4225,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_hunt(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui hunt")
 +    parser.add_argument("candidate")
 +    parser.add_argument("--baseline")
@@ -4301,7 +4286,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_diagnose(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui diagnose")
 +    parser.add_argument("candidate")
 +    parser.add_argument("--root", default=".", help="candidate revision project root")
@@ -4359,7 +4343,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_reproduce(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui reproduce")
 +    parser.add_argument("diagnosis")
 +    parser.add_argument("--root", required=True, help="candidate revision project root")
@@ -4411,7 +4394,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_probe_plan(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui probe-plan")
 +    parser.add_argument("diagnosis")
 +    parser.add_argument("--max-candidates", type=int, default=12)
@@ -4441,7 +4423,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_isolate(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui isolate")
 +    parser.add_argument("diagnosis")
 +    parser.add_argument("probe_plan")
@@ -4492,7 +4473,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_fix_plan(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui fix-plan")
 +    parser.add_argument("diagnosis")
 +    parser.add_argument("isolation")
@@ -4524,7 +4504,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_verify_fix(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui verify-fix")
 +    parser.add_argument("diagnosis")
 +    parser.add_argument("fix_plan")
@@ -4569,7 +4548,6 @@ index 0000000..68a8fa0
 +
 +
 +def cmd_ui_capture_script(args: List[str]) -> int:
-+    import argparse
 +    parser=_PlwArgumentParser(prog="plw ui capture-script")
 +    parser.add_argument("root", nargs="?", default=".")
 +    parser.add_argument("--root", default=None, dest="root_flag")
@@ -4610,7 +4588,6 @@ index 0000000..68a8fa0
 +
 +def cmd_ui_static(args: List[str]) -> int:
 +    """Locate Angular UI source witnesses without a browser or geometry snapshot."""
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw ui static")
 +    parser.add_argument("query")
 +    parser.add_argument("root", nargs="?", default=".")
@@ -4900,10 +4877,10 @@ index 0000000..68a8fa0
 +    return 0
 diff --git a/core/cli/umbrella_cmds.py b/core/cli/umbrella_cmds.py
 new file mode 100644
-index 0000000..da6cbf2
+index 0000000..c2750c0
 --- /dev/null
 +++ b/core/cli/umbrella_cmds.py
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,100 @@
 +"""Namespace alias routers (plw lease, plw proof, plw ledger)."""
 +
 +import argparse
@@ -4932,7 +4909,6 @@ index 0000000..da6cbf2
 +    plw lease validation ... -> plw validation-lease ...
 +    plw lease execution ... -> plw action-lease ...
 +    """
-+    import argparse
 +    parser = _PlwArgumentParser(
 +        prog="plw lease",
 +        formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4954,7 +4930,6 @@ index 0000000..da6cbf2
 +    plw proof obligations ... -> plw validation-coverage ...
 +    plw proof postcondition ... -> plw postcondition-proof ...
 +    """
-+    import argparse
 +    parser = _PlwArgumentParser(
 +        prog="plw proof",
 +        formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4980,7 +4955,6 @@ index 0000000..da6cbf2
 +    plw ledger model ... -> plw transition-model ...
 +    plw ledger reconcile ... -> plw reconcile-outcomes ...
 +    """
-+    import argparse
 +    parser = _PlwArgumentParser(
 +        prog="plw ledger",
 +        formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -5009,10 +4983,10 @@ index 0000000..da6cbf2
 +    return cmd_reconcile_outcomes(opts.rest)
 diff --git a/core/cli/validation_cmds.py b/core/cli/validation_cmds.py
 new file mode 100644
-index 0000000..dd10c7f
+index 0000000..6468a13
 --- /dev/null
 +++ b/core/cli/validation_cmds.py
-@@ -0,0 +1,944 @@
+@@ -0,0 +1,940 @@
 +"""Full-stack validation pipeline CLI handlers (plan, evidence, coverage, request, authorization, lease, attempt, dispatch, runtime, result, proof, state)."""
 +
 +import json
@@ -5655,7 +5629,6 @@ index 0000000..dd10c7f
 +
 +
 +def _validation_boundary_parser(prog: str, operations: tuple[str, ...], identity_name: str):
-+    import argparse
 +    parser = _PlwArgumentParser(prog=prog)
 +    parser.add_argument("operation", choices=operations)
 +    parser.add_argument(identity_name)
@@ -5847,7 +5820,6 @@ index 0000000..dd10c7f
 +
 +
 +def cmd_validation_scenario_bind(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw validation-scenario-bind")
 +    parser.add_argument("acceptance_id")
 +    parser.add_argument("plan_json")
@@ -5876,7 +5848,6 @@ index 0000000..dd10c7f
 +
 +
 +def cmd_postcondition_proof(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw postcondition-proof")
 +    parser.add_argument("binding_json")
 +    parser.add_argument("coverage_json")
@@ -5913,7 +5884,6 @@ index 0000000..dd10c7f
 +
 +
 +def cmd_fullstack_state(args: List[str]) -> int:
-+    import argparse
 +    parser = _PlwArgumentParser(prog="plw fullstack-state")
 +    parser.add_argument("root")
 +    parser.add_argument("--root", default=None, dest="root_flag")
@@ -5958,7 +5928,7 @@ index 0000000..dd10c7f
 +        print("# Boundary: authority composition only; no graph merge, evidence voting, source mutation attestation, stable promotion, or truth commit.")
 +    return code
 diff --git a/plw_cli.py b/plw_cli.py
-index 3d99246..d581cd1 100644
+index 3d99246..18bc507 100644
 --- a/plw_cli.py
 +++ b/plw_cli.py
 @@ -88,15 +88,11 @@ Usage:
@@ -5975,7 +5945,7 @@ index 3d99246..d581cd1 100644
 +import sys
  from pathlib import Path
 -from typing import Any, Dict, List, Optional
-+from typing import Callable, Dict, List
++from typing import Callable, Dict, List, Tuple
  
  # Automatically locate and resolve tools/ai_studio_tool directory
  def _resolve_tool_root() -> Path:
@@ -7774,7 +7744,7 @@ index 3d99246..d581cd1 100644
 +
 +
 +def _build_cli_dispatch() -> Dict[str, Callable[[List[str]], int]]:
-+    routes: List[tuple[tuple[str, ...], Callable[[List[str]], int]]] = [
++    routes: List[Tuple[Tuple[str, ...], Callable[[List[str]], int]]] = [
 +        (("doctor",), cmd_doctor),
 +        (("ast", "codesearch", "tree-sitter", "tree_sitter"), cmd_ast),
 +        (("agent",), cmd_agent),

@@ -2870,6 +2870,74 @@ class ArchitectureBaselineTests(unittest.TestCase):
             adj.setdefault(u, []).append(v)
         sccs = find_cyclic_sccs(vertices, adj)
         self.assertEqual(sccs, [], f"Modular CLI introduced circular dependencies: {sccs}")
+        # 6. Permanent modular hygiene gate: 0 unused top-level imports & 0 unbound globals across core/cli/*.py
+        import builtins
+        import symtable
+        for mod_file in sorted(cli_dir.glob("*.py")):
+            mod_src = mod_file.read_text(encoding="utf-8")
+            mod_tree = ast.parse(mod_src, filename=str(mod_file))
+            imported = {}
+            for node in mod_tree.body:
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        imported[a.asname or a.name.split(".")[0]] = node.lineno
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        imported[a.asname or a.name] = node.lineno
+            used = set()
+            for node in mod_tree.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name):
+                        used.add(sub.id)
+            unused = sorted(n for n in imported if n not in used)
+            self.assertEqual(unused, [], f"Unused imports in {mod_file.name}: {unused}")
+
+            defined = set(dir(builtins)) | {"__name__", "__file__", "__doc__", "__package__", "__spec__"} | set(imported)
+            for node in mod_tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name):
+                            defined.add(tgt.id)
+            st = symtable.symtable(mod_src, str(mod_file), "exec")
+            def _check_scope(tbl, path_label):
+                for sym in tbl.get_symbols():
+                    if sym.is_global() and sym.is_referenced() and not sym.is_assigned():
+                        self.assertIn(sym.get_name(), defined, f"Unbound global {sym.get_name()!r} in {mod_file.name}:{path_label}")
+                for child in tbl.get_children():
+                    _check_scope(child, f"{path_label}.{child.get_name()}")
+            _check_scope(st, "<module>")
+
+        # 7. Live --help and --json error contract gate across all unique dispatch handlers
+        seen_fns = set()
+        for alias, fn in dispatch.items():
+            if fn in seen_fns:
+                continue
+            seen_fns.add(fn)
+            buf_h, err_h = io.StringIO(), io.StringIO()
+            rc_h = None
+            try:
+                with redirect_stdout(buf_h), mock.patch("sys.stderr", new=err_h):
+                    rc_h = fn(["--help"])
+            except SystemExit as se:
+                rc_h = se.code
+            self.assertEqual(rc_h, 0, f"{alias} --help failed: rc={rc_h}")
+            self.assertTrue(buf_h.getvalue().strip(), f"{alias} --help emitted empty stdout")
+
+            buf_e, err_e = io.StringIO(), io.StringIO()
+            rc_e = None
+            try:
+                with redirect_stdout(buf_e), mock.patch("sys.stderr", new=err_e):
+                    rc_e = fn(["--unknown-audit-flag-xyz", "--json"])
+            except SystemExit as se:
+                rc_e = se.code
+            self.assertEqual(rc_e, 2, f"{alias} invalid --json flag should exit 2, got {rc_e}")
+            self.assertEqual(err_e.getvalue().strip(), "", f"{alias} invalid --json flag leaked stderr")
+            err_payload = json.loads(buf_e.getvalue())
+            self.assertIn("error", err_payload, f"{alias} invalid --json payload missing error key")
 
 if __name__ == "__main__":
     unittest.main()
