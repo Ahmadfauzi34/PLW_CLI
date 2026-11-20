@@ -40,14 +40,19 @@
 # engine_pin_v10 when build.sh added -s -w to strip DWARF/symtab
 # (1a4c4548…, commit 7900e083dc7c), and to engine_pin_v11 when the
 # Kotlin @Composable/internal anchor + regex fallback rotated the
-# digest (42b615b1…, commit 2c213de5f411, go1.27.3).
+# digest (42b615b1…, commit 2c213de5f411, go1.27.3), and to
+# engine_state_v4 when the Kotlin parity work (shared def helper for
+# --related/--callers, trailing-comment anchor fix, multi-segment
+# receiver names) moved the schema go11->go12, and to engine_pin_v12
+# when that engine rotated the digest (f471777c…, commit 84bb7eda6dd7,
+# go1.27.3).
 # If a later overlay moves either constant again, update the patch
 # paths below — the script then fails closed with "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v3/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v11/change.patch"
+ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v4/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v12/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 

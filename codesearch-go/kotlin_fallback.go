@@ -2,6 +2,7 @@ package main
 
 import (
 	"regexp"
+	"sort"
 
 	"github.com/odvcencio/gotreesitter"
 )
@@ -59,12 +60,24 @@ func kotlinAnchorStart(def *gotreesitter.Node, lang *gotreesitter.Language) (uin
 			if mc == nil || mc.Type(lang) == "annotation" {
 				continue
 			}
+			// A comment can sit inside the modifiers node too
+			// (e.g. `/* c */ internal fun`); it is not an anchor.
+			if t := mc.Type(lang); t == "line_comment" || t == "block_comment" {
+				continue
+			}
 			return mc.StartByte(), true
 		}
 		// Every modifier is an annotation: the keyword follows the
 		// modifiers node (fun/class/object/typealias/enum token).
+		// Comments can sit between them — tree-sitter attaches a
+		// trailing `// ...` on the annotation line as a child of
+		// the declaration — so skip comment nodes and take the
+		// first remaining child, which is the keyword.
 		for k := i + 1; k < def.ChildCount(); k++ {
 			if nxt := def.Child(k); nxt != nil {
+				if t := nxt.Type(lang); t == "line_comment" || t == "block_comment" {
+					continue
+				}
 				return nxt.StartByte(), true
 			}
 		}
@@ -170,16 +183,29 @@ func stripKotlinCode(src []byte) []byte {
 // (K4, see ktDefQuery) excludes properties: they live in --related,
 // not in defs. The fallback restores what the AST would have found,
 // nothing more.
-var kotlinDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:@[\w.]+(?:\([^)]*\))?[ \t]+)*(?P<mods>(?:(?:public|internal|private|protected|open|abstract|data|sealed|final|expect|actual|inline|value|external|override|crossinline|noinline|tailrec|suspend|operator|infix|lateinit|const|companion|annotation)[ \t]+)*)(?P<kw>class|interface|object|fun|typealias|enum)(?:[ \t]+(?:class|interface))?[ \t]+(?:<[^>]*>[ \t]+)?(?:[\w]+(?:<[^>]*>)?\??\.)?(?P<name>[A-Za-z_][\w]*)`)
+// NOTE (2026-11-20, parity): the receiver group is `*` (all dotted
+// segments), NOT `?` like the Python calibration. With `?`, an
+// extension function with a two-segment receiver
+// (`internal fun TimelineItem.ToolCall.cardText()`) was named after
+// its receiver (`ToolCall`) instead of the function (`cardText`):
+// a phantom def in --related and a wrong caller in --callers
+// (ToolCallSheet.kt:247, OOPBoT differential). The AST names the
+// function correctly, so with `*` the regex def dedups against it.
+// The Python calibration still has the one-segment form; fixing it
+// there is adapter/topology scope, not this engine change.
+var kotlinDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:@[\w.]+(?:\([^)]*\))?[ \t]+)*(?P<mods>(?:(?:public|internal|private|protected|open|abstract|data|sealed|final|expect|actual|inline|value|external|override|crossinline|noinline|tailrec|suspend|operator|infix|lateinit|const|companion|annotation)[ \t]+)*)(?P<kw>class|interface|object|fun|typealias|enum)(?:[ \t]+(?:class|interface))?[ \t]+(?:<[^>]*>[ \t]+)?(?:[\w]+(?:<[^>]*>)?\??\.)*(?P<name>[A-Za-z_][\w]*)`)
 
-// kotlinDeclEnd computes (endLine, sigEnd) for a declaration whose
+// kotlinDeclEnd computes (endLine, sigEnd, endByte) for a declaration whose
 // regex match ends at matchEnd in cleaned text. A `{` at header depth
-// 0 opens a body (sigEnd = its line, endLine = matching `}`); an `=`
-// at depth 0 starts a single-expression body (sigEnd = its line,
-// endLine = the expression's last line); otherwise the declaration
-// ends on its own header line (sigEnd = 0). A `{` on the line right
-// after the header still counts as the body.
-func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine, sigEnd int) {
+// 0 opens a body (sigEnd = its line, endLine = matching `}`, endByte =
+// the `}` byte); an `=` at depth 0 starts a single-expression body
+// (sigEnd = its line, endLine = the expression's last line, endByte =
+// its last non-space byte); otherwise the declaration ends on its own
+// header line (sigEnd = 0, endByte = the header's last non-space byte).
+// A `{` on the line right after the header still counts as the body.
+// endByte lets consumers that only have regex defs (no AST node) run
+// the same byte-range filter as AST defs.
+func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine, sigEnd int, endByte uint32) {
 	n := len(clean)
 	i := matchEnd
 	depth := 0 // ( [ depth in the header; braces are the body signal
@@ -204,9 +230,9 @@ func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine
 				j++
 			}
 			if d == 0 {
-				return lineOf(uint32(j - 1)), lineOf(uint32(i))
+				return lineOf(uint32(j - 1)), lineOf(uint32(i)), uint32(j - 1)
 			}
-			return lineOf(uint32(n - 1)), lineOf(uint32(i))
+			return lineOf(uint32(n - 1)), lineOf(uint32(i)), uint32(n - 1)
 		case c == '=' && depth == 0:
 			d := 0
 			j := i + 1
@@ -221,7 +247,7 @@ func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine
 					}
 				case '\n':
 					if d == 0 {
-						return lineOf(uint32(last)), lineOf(uint32(i))
+						return lineOf(uint32(last)), lineOf(uint32(i)), uint32(last)
 					}
 				}
 				if clean[j] != ' ' && clean[j] != '\t' && clean[j] != '\r' {
@@ -229,7 +255,7 @@ func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine
 				}
 				j++
 			}
-			return lineOf(uint32(n - 1)), lineOf(uint32(i))
+			return lineOf(uint32(n - 1)), lineOf(uint32(i)), uint32(n - 1)
 		case c == '\n' && depth == 0:
 			k := i + 1
 			for k < n && (clean[k] == ' ' || clean[k] == '\t') {
@@ -239,11 +265,21 @@ func kotlinDeclEnd(clean []byte, matchEnd int, lineOf func(uint32) int) (endLine
 				i = k
 				continue
 			}
-			return lineOf(uint32(i)), 0
+			// Header-only declaration: end at the header's last
+			// non-space byte, so a `;`-separated declaration sharing
+			// the line is not swallowed into this def's byte span.
+			e := i - 1
+			for e >= 0 && (clean[e] == ' ' || clean[e] == '\t' || clean[e] == '\r') {
+				e--
+			}
+			if e < matchEnd {
+				e = matchEnd
+			}
+			return lineOf(uint32(i)), 0, uint32(e)
 		}
 		i++
 	}
-	return lineOf(uint32(n - 1)), 0
+	return lineOf(uint32(n - 1)), 0, uint32(n - 1)
 }
 
 // kotlinRegexDefinitions extracts Kotlin definitions from cleaned
@@ -265,12 +301,12 @@ func kotlinRegexDefinitions(norm string, lineOf func(uint32) int) []definition {
 			anchor = modsS
 		}
 		name := string(clean[nameS:nameE])
-		endLine, sigEnd := kotlinDeclEnd(clean, m[1], lineOf)
+		endLine, sigEnd, endByte := kotlinDeclEnd(clean, m[1], lineOf)
 		sl := lineOf(uint32(anchor))
 		if endLine < sl {
 			endLine = sl
 		}
-		defs = append(defs, definition{startLine: sl, endLine: endLine, name: name, sigEnd: sigEnd})
+		defs = append(defs, definition{startLine: sl, endLine: endLine, name: name, sigEnd: sigEnd, startByte: uint32(anchor), endByte: endByte})
 	}
 	return defs
 }
@@ -294,4 +330,82 @@ func mergeKotlinRegexDefs(astDefs, regexDefs []definition) []definition {
 		}
 	}
 	return out
+}
+
+// kotlinASTAndFallbackDefs extracts Kotlin definitions from one parsed
+// tree — the single source of truth shared by --defs-only (astchunk.go),
+// --related (related.go) and --callers (callers.go), so all three agree
+// on names, anchored lines, and byte spans.
+//
+// AST definitions come from query (ktDefQuery: @def/@name/@body captures),
+// anchored on the declaration itself via kotlinAnchorStart (first
+// non-annotation modifier, else the keyword — the Python calibration
+// rule). When the parse is damaged (HasError) or yields nothing, regex
+// definitions are merged in; AST defs are never dropped. Returned defs
+// are sorted by (startLine, endLine, name); byte spans are populated
+// for both paths (regex defs via the anchor byte and kotlinDeclEnd's
+// endByte), so byte-range filters work identically on either path.
+func kotlinASTAndFallbackDefs(tree *gotreesitter.Tree, lang *gotreesitter.Language, query *gotreesitter.Query, src []byte, lineOf func(uint32) int) []definition {
+	cursor := query.Exec(tree.RootNode(), lang, src)
+	var defs []definition
+	for {
+		m, ok := cursor.NextMatch()
+		if !ok {
+			break
+		}
+		var sb, eb uint32
+		var name string
+		var bodyStart uint32
+		var defNode *gotreesitter.Node
+		hasBody := false
+		found := false
+		for _, c := range m.Captures {
+			if c.Name == "def" {
+				sb, eb = c.Node.StartByte(), c.Node.EndByte()
+				defNode = c.Node
+				found = true
+			}
+			if c.Name == "name" {
+				name = string(src[c.Node.StartByte():c.Node.EndByte()])
+			}
+			if c.Name == "body" {
+				bodyStart = c.Node.StartByte()
+				hasBody = true
+			}
+		}
+		if !found {
+			continue
+		}
+		sl, el := lineOf(sb), lineOf(eb)
+		if el < sl {
+			continue
+		}
+		startByte := sb
+		if defNode != nil {
+			if anchor, ok := kotlinAnchorStart(defNode, lang); ok {
+				sl = lineOf(anchor)
+				startByte = anchor
+			}
+		}
+		d := definition{startLine: sl, endLine: el, name: name, startByte: startByte, endByte: eb}
+		if hasBody {
+			d.sigEnd = lineOf(bodyStart)
+		}
+		defs = append(defs, d)
+	}
+	if tree.RootNode().HasError() || len(defs) == 0 {
+		if rd := kotlinRegexDefinitions(string(src), lineOf); len(rd) > 0 {
+			defs = mergeKotlinRegexDefs(defs, rd)
+		}
+	}
+	sort.Slice(defs, func(i, j int) bool {
+		if defs[i].startLine != defs[j].startLine {
+			return defs[i].startLine < defs[j].startLine
+		}
+		if defs[i].endLine != defs[j].endLine {
+			return defs[i].endLine < defs[j].endLine
+		}
+		return defs[i].name < defs[j].name
+	})
+	return defs
 }

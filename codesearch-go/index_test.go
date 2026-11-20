@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,10 +63,10 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected the just-saved go11 index")
+		t.Fatal("loadDiskIndex rejected the just-saved go12 index")
 	}
-	if di.SchemaV != "go11" {
-		t.Errorf("SchemaV = %q, want go11", di.SchemaV)
+	if di.SchemaV != "go12" {
+		t.Errorf("SchemaV = %q, want go12", di.SchemaV)
 	}
 	if got := di.Files["bin.rs"].Skip; got != "binary" {
 		t.Errorf("reloaded bin.rs Skip = %q, want binary", got)
@@ -73,11 +74,11 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 }
 
 func TestOldSchemaRejected(t *testing.T) {
-	// A go10 cache (no CallSites/Generated fields) must not load under
-	// schema go11: stale caches rebuild automatically instead of serving
+	// A go11 cache (pre-parity RelDefs/CallSites) must not load under
+	// schema go12: stale caches rebuild automatically instead of serving
 	// incomplete rows.
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go10", Files: map[string]FileMeta{}}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go11", Files: map[string]FileMeta{}}); err != nil {
 		t.Fatal(err)
 	}
 	db := filepath.Join(t.TempDir(), "old.gob")
@@ -85,8 +86,70 @@ func TestOldSchemaRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := loadDiskIndex(db); ok {
-		t.Error("loadDiskIndex accepted a go10 index, want rejection")
+		t.Error("loadDiskIndex accepted a go11 index, want rejection")
 	}
+}
+
+func TestKotlinParityPersistsAcrossSaveLoad(t *testing.T) {
+	// Parity rows (recovered def, attributed call, no false header)
+	// must survive a gob save/load round-trip, so --cached answers
+	// identically to a fresh scan.
+	root := t.TempDir()
+	kt := "package demo\n\n" +
+		"@Composable internal fun PrimaryChip(label: String) {\n" +
+		"    val localTmp = label.length\n" +
+		"    renderIcon(label)\n" +
+		"}\n\n" +
+		"@Composable fun ScreenView() {\n" +
+		"    PrimaryChip(\"ok\")\n" +
+		"}\n\n" +
+		"@Composable internal fun ChipAlias(x: String) = PrimaryChip(x)\n"
+	if err := os.WriteFile(filepath.Join(root, "Chips.kt"), []byte(kt), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ix, _ := buildFull(root, defaultScanConfig())
+	check := func(tag string, defs []relDef, calls []callSite) {
+		t.Helper()
+		foundDef := false
+		for _, d := range defs {
+			if d.Name == "PrimaryChip" && d.Line == 3 {
+				foundDef = true
+			}
+			if d.Name == "localTmp" {
+				t.Errorf("%s: relDefs contains leaked local val localTmp: %+v", tag, defs)
+			}
+		}
+		if !foundDef {
+			t.Errorf("%s: relDefs = %+v, want PrimaryChip at line 3", tag, defs)
+		}
+		want := map[[3]string]bool{
+			{"renderIcon", "PrimaryChip", "5"}: true,
+			{"PrimaryChip", "ScreenView", "9"}: true,
+			{"PrimaryChip", "ChipAlias", "12"}: true,
+		}
+		got := map[[3]string]bool{}
+		for _, c := range calls {
+			if c.Line == 3 {
+				t.Errorf("%s: callSites contains false header at line 3: %+v", tag, calls)
+			}
+			got[[3]string{c.Callee, c.Caller, strconv.Itoa(c.Line)}] = true
+		}
+		for triple := range want {
+			if !got[triple] {
+				t.Errorf("%s: callSites = %+v, want call %+v", tag, calls, triple)
+			}
+		}
+	}
+	check("fresh", ix.relDefs, ix.callSites)
+	db := filepath.Join(t.TempDir(), "index.gob")
+	if err := ix.save(db); err != nil {
+		t.Fatal(err)
+	}
+	di, ok := loadDiskIndex(db)
+	if !ok {
+		t.Fatal("loadDiskIndex rejected saved go12 index")
+	}
+	check("reloaded", memFromDisk(di).relDefs, memFromDisk(di).callSites)
 }
 
 // G9: cache base dir precedence — explicit flag > CODESEARCH_CACHE_DIR >
@@ -256,7 +319,7 @@ func TestCachedCallsAndGeneratedPersistAcrossSync(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected saved go11 index")
+		t.Fatal("loadDiskIndex rejected saved go12 index")
 	}
 	if !di.Files["src/types.d.ts"].Generated || !di.Files["public/assets/bundle.js"].Generated {
 		t.Errorf("FileMeta.Generated lost across gob save/load: %+v", di.Files)
