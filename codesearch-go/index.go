@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const schemaV = "go14" // go14: P1-A calleeBase right-to-left (indexed/turbofish receivers), P1-B Rust --related defs + `pub use` edges, P1-C Kotlin regex fallback always merged, P2 JNI bridge (relJNIDecl + Kind "jni" bridges) persisted in RelJNI; a go13 index is rejected (stale Rel*); was go13
+const schemaV = "go15" // go15: Rust `pub use` comments/`self as alias`/bare super|crate|self resolution, Kotlin JNI @JvmStatic companion + named companion + comment-safe package, JNI resolve qualified query/coarse detail/#[cfg] lines, explicit Kind:"wasm"; a go14 index is rejected (stale RelEdges/RelBridges/RelJNI); was go14
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {

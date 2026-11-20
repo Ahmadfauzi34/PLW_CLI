@@ -56,7 +56,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v6/change.patch"
+ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v7/change.patch"
 PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v14/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"

@@ -486,13 +486,13 @@ func TestExtractRelatedRust(t *testing.T) {
 	for _, b := range bridges {
 		byRust[b.RustName] = b
 	}
-	if b, ok := byRust["plain_fn"]; !ok || b.JSName != "plainFn" || b.RustLine != 2 {
+	if b, ok := byRust["plain_fn"]; !ok || b.JSName != "plainFn" || b.RustLine != 2 || b.Kind != "wasm" {
 		t.Errorf("plain_fn bridge wrong: %+v", b)
 	}
-	if b, ok := byRust["custom_fn"]; !ok || b.JSName != "renamedFn" {
+	if b, ok := byRust["custom_fn"]; !ok || b.JSName != "renamedFn" || b.Kind != "wasm" {
 		t.Errorf("custom_fn bridge wrong: %+v", b)
 	}
-	if b, ok := byRust["method_fn"]; !ok || b.Class != "Widget" || b.JSName != "methodFn" {
+	if b, ok := byRust["method_fn"]; !ok || b.Class != "Widget" || b.JSName != "methodFn" || b.Kind != "wasm" {
 		t.Errorf("method_fn bridge wrong: %+v", b)
 	}
 	if _, ok := byRust["plain_method"]; ok {
@@ -579,6 +579,18 @@ func TestParseRustUse(t *testing.T) {
 		{"use crate::x::Y;", nil},
 		{"pub fn not_a_use() {}", nil},
 		{"pub use crate::x::Y", []wantEdge{{"crate::x", false, map[string]string{"Y": "Y"}}}},
+		// go15: comments inside multiline use, nested block comments,
+		// whitespace/newline around `as`, and `self as alias`.
+		{"pub use crate::foo::{\n    // main type\n    Bar,\n    /* nested /* block */ comment */ Baz,\n};", []wantEdge{
+			{"crate::foo", false, map[string]string{"Bar": "Bar"}},
+			{"crate::foo", false, map[string]string{"Baz": "Baz"}},
+		}},
+		{"pub use crate::foo::Bar\n\tas\tQux;", []wantEdge{{"crate::foo", false, map[string]string{"Qux": "Bar"}}}},
+		{"pub use crate::a::b::{self as my_b, Item};", []wantEdge{
+			{"crate::a", false, map[string]string{"my_b": "b"}},
+			{"crate::a::b", false, map[string]string{"Item": "Item"}},
+		}},
+		{"pub use a::self as alias_a;", []wantEdge{{"", false, map[string]string{"alias_a": "a"}}}},
 	}
 	for _, c := range cases {
 		got := parseRustUse("f.rs", c.in, 1)
@@ -620,6 +632,13 @@ func TestResolveRustImport(t *testing.T) {
 		{"flat.rs", "crate::flat2", "flat2.rs"},
 		{"src/lib.rs", "crate::missing", ""},
 		{"src/lib.rs", "crate::engine::gone", ""},
+		// go15: bare super / super::super / crate / self targets.
+		{"src/engine/inner.rs", "super", "src/engine.rs"},
+		{"src/engine/inner.rs", "super::super", "src/lib.rs"},
+		{"src/other/util.rs", "super", "src/other/mod.rs"},
+		{"src/engine.rs", "crate", "src/lib.rs"},
+		{"src/lib.rs", "self", "src/lib.rs"},
+		{"src/lib.rs", "super::super::super", ""},
 	}
 	for _, c := range cases {
 		if got := resolveRustImport(c.from, c.spec, files); got != c.want {
@@ -1164,5 +1183,116 @@ func TestExtractRelatedKotlinJNIVararg(t *testing.T) {
 	}
 	if d := byName["both"]; d.Arity != 2 || len(d.Coarse) != 2 || d.Coarse[0] != "I" || d.Coarse[1] != "_3Ljava_lang_String_2" {
 		t.Errorf("both decl = %+v, want arity 2 coarse [I _3Ljava_lang_String_2]", d)
+	}
+}
+
+// TestExtractRelatedKotlinJNICompanionAndComments (go15) checks:
+//   - @JvmStatic inside a companion object binds to the enclosing outer
+//     class (Java_com_example_Outer_staticCreate, no $Companion), while a
+//     plain companion external fun stays on Outer$Companion.
+//   - A named companion object (`companion object Native`) uses its
+//     declared name (Outer$Native), and @JvmStatic inside it still binds
+//     to the enclosing outer class.
+//   - A `package ...` line inside a leading block comment is ignored in
+//     favor of the real package declaration.
+func TestExtractRelatedKotlinJNICompanionAndComments(t *testing.T) {
+	text := "/*\npackage fake.commented\n*/\n" +
+		"package com.example\n\n" +
+		"class Outer {\n" +
+		"    companion object {\n" +
+		"        @JvmStatic\n" +
+		"        external fun staticCreate(n: Int): Long\n" +
+		"        @kotlin.jvm.JvmStatic()\n" +
+		"        external fun fqStatic(): Unit\n" +
+		"        external fun plainCompanion(): Unit\n" +
+		"    }\n" +
+		"}\n\n" +
+		"class NamedHost {\n" +
+		"    companion object Native {\n" +
+		"        external fun namedCreate(): Unit\n" +
+		"        @JvmStatic\n" +
+		"        external fun namedStatic(): Unit\n" +
+		"    }\n" +
+		"}\n"
+	_, _, _, jni, ok := extractRelated("Outer.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	byName := map[string]relJNIDecl{}
+	for _, d := range jni {
+		byName[d.Name] = d
+	}
+	want := map[string]string{
+		"staticCreate":   "Java_com_example_Outer_staticCreate",
+		"fqStatic":       "Java_com_example_Outer_fqStatic",
+		"plainCompanion": "Java_com_example_Outer_00024Companion_plainCompanion",
+		"namedCreate":    "Java_com_example_NamedHost_00024Native_namedCreate",
+		"namedStatic":    "Java_com_example_NamedHost_namedStatic",
+	}
+	for name, wantBase := range want {
+		d, ok := byName[name]
+		if !ok {
+			t.Errorf("missing JNI decl %q (got %+v)", name, jni)
+			continue
+		}
+		if d.Base != wantBase {
+			t.Errorf("decl %q base = %q, want %q", name, d.Base, wantBase)
+		}
+	}
+}
+
+// TestResolveRelatedJNIPolish (go15) locks the three resolve-side JNI
+// fixes: qualified Rust query (`ffi::Java_...`), overloaded rustName
+// preserved in Detail when same-arity bridges coexist (and coarse-filtered
+// on short queries), and two #[cfg] bridges in the same file on different
+// lines both emitted for the Kotlin-side query.
+func TestResolveRelatedJNIPolish(t *testing.T) {
+	defs := []relDef{
+		{Path: "Bridge.kt", Line: 4, Name: "send"},
+		{Path: "native.rs", Line: 10, Name: "Java_com_example_Bridge_send__I"},
+		{Path: "native.rs", Line: 20, Name: "Java_com_example_Bridge_send__Ljava_lang_String_2"},
+		{Path: "native.rs", Line: 30, Name: "Java_com_example_Bridge_ping"},
+		{Path: "native.rs", Line: 40, Name: "Java_com_example_Bridge_ping"},
+	}
+	jni := []relJNIDecl{
+		{Path: "Bridge.kt", Line: 4, Name: "send", Base: "Java_com_example_Bridge_send", Arity: 1, Coarse: []string{"I"}},
+		{Path: "Bridge.kt", Line: 5, Name: "ping", Base: "Java_com_example_Bridge_ping", Arity: 0, Coarse: nil},
+	}
+	bridges := []relBridge{
+		{RustPath: "native.rs", RustLine: 10, RustName: "Java_com_example_Bridge_send__I", Kind: "jni"},
+		{RustPath: "native.rs", RustLine: 20, RustName: "Java_com_example_Bridge_send__Ljava_lang_String_2", Kind: "jni"},
+		{RustPath: "native.rs", RustLine: 30, RustName: "Java_com_example_Bridge_ping", Kind: "jni"},
+		{RustPath: "native.rs", RustLine: 40, RustName: "Java_com_example_Bridge_ping", Kind: "jni"},
+	}
+	files := map[string]bool{"Bridge.kt": true, "native.rs": true}
+
+	// Overloaded query keeps its full Rust JNI name in Detail even though
+	// another 1-arg overload exists for the same base.
+	rows := resolveRelated("Java_com_example_Bridge_send__I", defs, nil, bridges, jni, files)
+	ffi := filterKind(rows, "ffi")
+	if len(ffi) != 1 || !strings.Contains(ffi[0].Detail, "bound to Java_com_example_Bridge_send__I") {
+		t.Errorf("related(send__I) detail = %+v, want bound to Java_com_example_Bridge_send__I", ffi)
+	}
+
+	// Short query also narrows bridge by coarse token: only send__I matches I.
+	rows = resolveRelated("Java_com_example_Bridge_send", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 1 || !strings.Contains(ffi[0].Detail, "bound to Java_com_example_Bridge_send__I") {
+		t.Errorf("related(send short) detail = %+v, want bound to Java_com_example_Bridge_send__I", ffi)
+	}
+
+	// Qualified Rust query (`ffi::Java_...`) still resolves the Kotlin decl.
+	rows = resolveRelated("ffi::Java_com_example_Bridge_send__I", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 1 || ffi[0].Path != "Bridge.kt" || ffi[0].Line != 4 {
+		t.Errorf("related(ffi::send__I) ffi = %+v, want Bridge.kt:4", ffi)
+	}
+
+	// Two #[cfg] Rust bridges with the same name in one file on different
+	// lines must both appear on Kotlin->Rust lookup.
+	rows = resolveRelated("ping", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 2 || ffi[0].Line != 30 || ffi[1].Line != 40 {
+		t.Errorf("related(ping) with #[cfg] variants = %+v, want lines 30 and 40", ffi)
 	}
 }
