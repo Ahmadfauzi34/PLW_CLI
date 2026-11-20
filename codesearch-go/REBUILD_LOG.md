@@ -554,3 +554,31 @@ Biner baru: `codesearch schema=go11 commit=8429131bd83e built=unknown go=go1.27.
 digest `274ca7ec9aa9d6c9f1651b26ec61d94df5aebaee2f44ae4239db27727fa2ca00`
 (`artifacts/codesearch-go-linux-x86_64`). Adapter naik via `engine_state_v3` + `engine_pin_v9`.
 
+## 2026-11-20 — Kotlin def spans: @Composable/internal anchor + regex fallback (PR #26 follow-up, go11)
+**Perubahan.** Akar: grammar tree-sitter-kotlin ter-vendor gagal parse
+total bila anotasi mendahului visibility modifier (`@Composable internal
+fun` → ERROR, `function_declaration` hilang, file jatuh ke fixed windows;
+gotreesitter v0.57.0 terbaru diuji dan TETAP gagal — jalur upgrade dep
+tertutup). Dua lapis di `astchunk.go` + `kotlin_fallback.go` (baru):
+(1) `kotlinAnchorStart` menggeser start span def yang berhasil di-parse
+dari baris anotasi ke anchor mods/kw (aturan kalibrasi Python PR #26);
+(2) `kotlinRegexDefinitions` + `mergeKotlinRegexDefs` memulihkan def
+bila parse `HasError()` atau nol def (regex mencerminkan kalibrasi
+Python; `val`/`var` sengaja dikecualikan seperti model def engine).
+Tes: `TestASTChunkKotlinAnnotations` + `TestKotlinRegexFallbackDefs` di
+`astchunk_test.go`; harness 4-gerbang `kotlin_defs_spec.go` +
+`verify-kotlin-defs.sh` (baru, build tag `verify`).
+**Verifikasi.** `./verify-kotlin-defs.sh` PASS (`READY_TO_COMMIT`,
+42 kasus, 4 perspektif); `./build.sh` lolos semua gerbang (`gofmt`,
+`go vet -mod=vendor ./...`, `go test -mod=vendor ./...` 0.789s);
+black-box `test_codesearch_go.py` 100/100 (2 literal `go10` usang di
+file tes lokal diperbaiki ke `go11` — gagal identik pada biner lama,
+bukan regresi). Korpus OOPBoT (`~/workspace/oopbot-trial`, 623 file):
+`LoadingPill` 16-31 window → 18-18 `[sig]`; AST 569→582 file,
+fallback 54→41; build dingin 22.9 dtk vs 21.5 dtk (biner lama).
+Reproducibility check dari direktori berbeda menghasilkan SHA-256 identik.
+Biner baru: `codesearch schema=go11 commit=b98279f06f72 built=unknown go=go1.27.4`,
+digest `6156ff790ba020c87471b44d93ba5570f7efa716f40133f8ccf40ff3506004fe`.
+Adapter naik via `engine_pin_v11` (digest lama 1a4c4548… keluar pin;
+entri aset v0.2.5 dipertahankan); `check_engine_contract.sh` PASS
+dengan pin terverifikasi. Belum di-push ke PLW_CLI; menunggu kata user.

@@ -498,3 +498,129 @@ func TestIsGeneratedOrMinifiedAssetsAndHeaders(t *testing.T) {
 		}
 	}
 }
+
+// TestASTChunkKotlinAnnotations (PR #26 follow-up, 2026-11-20): a
+// declaration's span anchors on its modifiers/keyword, never on a
+// leading @annotation — and a file the Kotlin grammar cannot parse
+// (@Composable internal fun) still yields def structure via the
+// regex fallback instead of degrading to fixed windows.
+func TestASTChunkKotlinAnnotations(t *testing.T) {
+	// Lines: 1 package, 2 blank, 3 KDoc, 4 @Composable,
+	// 5 internal fun LoadingPill, 6-7 Row{...}, 8 }, 9 blank,
+	// 10 @Composable, 11 fun PlainComposable, 12 }, 13 blank,
+	// 14 internal object OopbotBridge, 15 KDoc, 16 @JvmStatic,
+	// 17 external fun version, 18 blank, 19 @JvmStatic,
+	// 20 external fun engineNew, 21 }.
+	text := "package io.jeph.pipkin.ui.components\n\n" +
+		"/** A pot and [text] in a pill. */\n" +
+		"@Composable\n" +
+		"internal fun LoadingPill(text: String) {\n" +
+		"  Row {\n" +
+		"  }\n" +
+		"}\n\n" +
+		"@Composable\n" +
+		"fun PlainComposable() {\n" +
+		"}\n\n" +
+		"internal object OopbotBridge {\n" +
+		"  /** Version. */\n" +
+		"  @JvmStatic\n" +
+		"  external fun version(): String\n\n" +
+		"  @JvmStatic\n" +
+		"  external fun engineNew(apiKey: String): Long\n" +
+		"}\n"
+	chunks, astOK := chunkFile("x.kt", text)
+	if !astOK {
+		t.Fatal("expected AST path for annotated Kotlin (regex fallback must keep defs)")
+	}
+	want := map[string]int{
+		"LoadingPill":     5,
+		"PlainComposable": 11,
+		"OopbotBridge":    14,
+		"version":         17,
+		"engineNew":       20,
+	}
+	got := map[string]int{}
+	for _, c := range chunks {
+		if c.name == "" {
+			continue
+		}
+		if _, seen := got[c.name]; !seen {
+			got[c.name] = c.startLine
+		}
+	}
+	for name, line := range want {
+		if got[name] != line {
+			t.Errorf("def %s starts at line %d, want %d (got all: %v)", name, got[name], line, got)
+		}
+	}
+	// LoadingPill's signature chunk is exactly its fun line: the
+	// KDoc and the annotation are NOT the def start.
+	var sawSig bool
+	for _, c := range chunks {
+		if c.name == "LoadingPill" && c.kind == kindSig {
+			sawSig = len(c.lines) == 1 && strings.Contains(c.lines[0], "internal fun LoadingPill")
+		}
+	}
+	if !sawSig {
+		t.Errorf("LoadingPill sig chunk missing or not anchored on its fun line")
+	}
+	assertFullCoverage(t, chunks, 21)
+}
+
+// TestKotlinRegexFallbackDefs exercises the regex recovery path
+// directly: broken-only files, mixed files (one parsable def + one
+// grammar-broken def), and declarations that must NOT match (inside
+// strings and doc comments).
+func TestKotlinRegexFallbackDefs(t *testing.T) {
+	lineOf := func(src []byte) func(uint32) int {
+		li := newLineIndex(src)
+		return li.lineOf
+	}
+
+	// Broken-only: the single def is annotation+modifier.
+	broken := "package p\n\n/** Doc. */\n@Composable\ninternal fun Foo(x: Int): String = x.toString()\n"
+	defs := kotlinRegexDefinitions(broken, lineOf([]byte(broken)))
+	if len(defs) != 1 || defs[0].name != "Foo" || defs[0].startLine != 5 {
+		t.Errorf("broken-only fallback defs = %+v, want [{Foo 5}]", defs)
+	}
+	if defs[0].sigEnd != 5 {
+		t.Errorf("broken-only sigEnd = %d, want 5 (the `=` line)", defs[0].sigEnd)
+	}
+
+	// Multi-line header + multi-line single-expression body.
+	multi := "package p\n\n@Composable\ninternal fun Bar(\n  a: Int,\n  b: String,\n): String = baz(\n  a,\n  b,\n)\n"
+	defs = kotlinRegexDefinitions(multi, lineOf([]byte(multi)))
+	if len(defs) != 1 || defs[0].name != "Bar" || defs[0].startLine != 4 {
+		t.Errorf("multi-line fallback defs = %+v, want [{Bar 4}]", defs)
+	}
+	if len(defs) == 1 && (defs[0].endLine != 10 || defs[0].sigEnd != 7) {
+		t.Errorf("multi-line end/sig = %d/%d, want 10/7", defs[0].endLine, defs[0].sigEnd)
+	}
+
+	// Declarations inside strings and doc comments must not match.
+	hidden := "package p\n\n/** fun FakeDoc() {} */\nval s = \"fun FakeStr() {}\"\nfun Real() {}\n"
+	defs = kotlinRegexDefinitions(hidden, lineOf([]byte(hidden)))
+	names := map[string]bool{}
+	for _, d := range defs {
+		names[d.name] = true
+	}
+	if names["FakeDoc"] || names["FakeStr"] {
+		t.Errorf("regex matched declarations inside comments/strings: %+v", defs)
+	}
+	// NOTE: top-level val is NOT a def in the engine model (K4) —
+	// only Real is expected here; `s` is just the string carrier.
+	if !names["Real"] || len(defs) != 1 {
+		t.Errorf("regex defs = %+v, want only [Real]", defs)
+	}
+
+	// Merge: AST defs are never dropped, regex defs fill the gap.
+	ast := []definition{{startLine: 3, endLine: 3, name: "Ok", sigEnd: 0}}
+	regex := []definition{
+		{startLine: 3, endLine: 3, name: "Ok", sigEnd: 0},
+		{startLine: 6, endLine: 9, name: "Broken", sigEnd: 6},
+	}
+	merged := mergeKotlinRegexDefs(ast, regex)
+	if len(merged) != 2 {
+		t.Errorf("merge = %+v, want 2 defs (Ok + Broken, no duplicate Ok)", merged)
+	}
+}
