@@ -14,8 +14,8 @@
 +    # mods/keyword and regex fallback for annotation-before-visibility
 +    # parse failures; supersedes 1a4c4548…. The v0.2.5 release-asset
 +    # entry stays.
-+    "6156ff790ba020c87471b44d93ba5570f7efa716f40133f8ccf40ff3506004fe":
-+        "go11 b98279f06f72 (reproducible build.sh, -s -w, -mod=vendor)",
++    "42b615b1b3f74c26f055f7145839c58cc6ca7c9e9bfc058a9d222d50cb527719":
++        "go11 2c213de5f411 (reproducible build.sh, -s -w, -mod=vendor)",
      "f8bab7d8306d3e0af5be2db061672af597826328c8baa57f8fc041650d447c4a":
          "go9 8c5d6ffe8685 (v0.2.5 release asset)",
  }

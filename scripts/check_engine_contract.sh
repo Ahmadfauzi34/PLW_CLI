@@ -40,7 +40,7 @@
 # engine_pin_v10 when build.sh added -s -w to strip DWARF/symtab
 # (1a4c4548…, commit 7900e083dc7c), and to engine_pin_v11 when the
 # Kotlin @Composable/internal anchor + regex fallback rotated the
-# digest (6156ff79…, commit b98279f06f72).
+# digest (42b615b1…, commit 2c213de5f411, go1.27.3).
 # If a later overlay moves either constant again, update the patch
 # paths below — the script then fails closed with "could not read ...".
 set -euo pipefail

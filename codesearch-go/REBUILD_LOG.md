@@ -577,8 +577,21 @@ bukan regresi). Korpus OOPBoT (`~/workspace/oopbot-trial`, 623 file):
 `LoadingPill` 16-31 window → 18-18 `[sig]`; AST 569→582 file,
 fallback 54→41; build dingin 22.9 dtk vs 21.5 dtk (biner lama).
 Reproducibility check dari direktori berbeda menghasilkan SHA-256 identik.
-Biner baru: `codesearch schema=go11 commit=b98279f06f72 built=unknown go=go1.27.4`,
-digest `6156ff790ba020c87471b44d93ba5570f7efa716f40133f8ccf40ff3506004fe`.
+Biner baru: `codesearch schema=go11 commit=2c213de5f411 built=unknown go=go1.27.3`,
+digest `42b615b1b3f74c26f055f7145839c58cc6ca7c9e9bfc058a9d222d50cb527719`
+(digest biner yang dibangun CI — sama persis dengan rebuild lokal
+`GOTOOLCHAIN=go1.27.3 LC_ALL=C`).
 Adapter naik via `engine_pin_v11` (digest lama 1a4c4548… keluar pin;
 entri aset v0.2.5 dipertahankan); `check_engine_contract.sh` PASS
-dengan pin terverifikasi. Belum di-push ke PLW_CLI; menunggu kata user.
+dengan pin terverifikasi melawan biner CI.
+**Koreksi 2026-11-20 (PR #27, commit ke-2):** pin v11 pertama memakai
+digest build lokal go1.27.4 (`6156ff79…`, commit `b98279f06f72`) — CI
+merah `codesearch-engine-smoke` (exit 3) karena adapter fail-closed:
+digest CI (`42b615b1…`) tak ada di pin. Akar ganda: (1) `sort` di
+`build.sh` sensitif locale — tree identik memberi commit `b98279f06f72`
+(en_US.UTF-8) vs `2c213de5f411` (POSIX); diperbaiki dengan `LC_ALL=C
+sort` (+komentar); (2) toolchain lokal go1.27.4 vs CI go1.27.3.
+Rebuild lokal pasca-perbaikan mereproduksi digest CI byte-for-byte,
+membuktikan klaim reproducible build kini berlaku lintas locale dan
+toolchain yang sama. Didorong sebagai PR #27 (branch
+`fix/kotlin-go-def-spans-v1`, commit `051b95e8` + commit koreksi pin).
