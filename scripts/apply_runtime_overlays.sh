@@ -479,9 +479,6 @@ grep -Fq '"go14": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v14"
 grep -Fq '26a05e30cfd9d600b6c47b34b30639636bc92b2feffae7e1fc3959983820412d' core/codesearch_engine.py
 grep -Fq '64727c3f7ed9' core/codesearch_engine.py
-apply_reviewable_overlay "engine_state_v7"
-grep -Fq 'KNOWN_SCHEMA = "go15"' core/codesearch_engine.py
-grep -Fq '"go15": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 apply_reviewable_overlay "type_only_downstream_consistency_v1"
 grep -Fq 'import shlex' codebase/mermaid_graph.py
 grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
@@ -493,6 +490,9 @@ grep -Fq '"type_only_directed"' codebase/hott_analyzers.py
 grep -Fq 'directed_cycles=len(runtime_cyclic_sccs)' codebase/hott_analyzers.py
 grep -Fq '"type_only_directed_basis_witnesses"' core/synthesizer.py
 grep -Fq 'type-only SCCs:' plw_cli.py
+apply_reviewable_overlay "engine_state_v7"
+grep -Fq 'KNOWN_SCHEMA = "go15"' core/codesearch_engine.py
+grep -Fq '"go15": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
