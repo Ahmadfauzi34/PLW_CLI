@@ -63,10 +63,10 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected the just-saved go14 index")
+		t.Fatal("loadDiskIndex rejected the just-saved go15 index")
 	}
-	if di.SchemaV != "go14" {
-		t.Errorf("SchemaV = %q, want go14", di.SchemaV)
+	if di.SchemaV != "go15" {
+		t.Errorf("SchemaV = %q, want go15", di.SchemaV)
 	}
 	if got := di.Files["bin.rs"].Skip; got != "binary" {
 		t.Errorf("reloaded bin.rs Skip = %q, want binary", got)
@@ -74,11 +74,11 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 }
 
 func TestOldSchemaRejected(t *testing.T) {
-	// A go13 cache (missing RelJNI + P1-B Rust RelDefs/RelEdges) must not load under
-	// schema go14: stale caches rebuild automatically instead of serving
-	// incomplete rows.
+	// A go14 cache (pre-go15 RelEdges/RelBridges/RelJNI) must not load under
+	// schema go15: stale caches rebuild automatically instead of serving
+	// stale rows.
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go13", Files: map[string]FileMeta{}}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go14", Files: map[string]FileMeta{}}); err != nil {
 		t.Fatal(err)
 	}
 	db := filepath.Join(t.TempDir(), "old.gob")
@@ -86,7 +86,7 @@ func TestOldSchemaRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := loadDiskIndex(db); ok {
-		t.Error("loadDiskIndex accepted a go13 index, want rejection")
+		t.Error("loadDiskIndex accepted a go14 index, want rejection")
 	}
 }
 
@@ -147,7 +147,7 @@ func TestKotlinParityPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected saved go14 index")
+		t.Fatal("loadDiskIndex rejected saved go15 index")
 	}
 	check("reloaded", memFromDisk(di).relDefs, memFromDisk(di).callSites)
 }
@@ -319,7 +319,7 @@ func TestCachedCallsAndGeneratedPersistAcrossSync(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected saved go14 index")
+		t.Fatal("loadDiskIndex rejected saved go15 index")
 	}
 	if !di.Files["src/types.d.ts"].Generated || !di.Files["public/assets/bundle.js"].Generated {
 		t.Errorf("FileMeta.Generated lost across gob save/load: %+v", di.Files)

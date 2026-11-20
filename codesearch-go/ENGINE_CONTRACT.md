@@ -5,13 +5,13 @@ If this document and the code disagree, the code wins and this
 document must be fixed in the same change — a stale contract is
 worse than none, because the adapter trusts it.
 
-## Current schema: `go14`
+## Current schema: `go15`
 
-`schemaV` (`index.go`) is `go14`. PLW's adapter
+`schemaV` (`index.go`) is `go15`. PLW's adapter
 (`core/codesearch_engine.py`) accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13", "go14"}`.
+`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13", "go14", "go15"}`.
 
-### What `go14` guarantees
+### What `go15` guarantees
 
 1. **Index format.** A gob index (`diskIndex`) with fields
    `SchemaV`, `Root`, `Chunks`, `Files` (with `FileMeta.Skip`
@@ -154,7 +154,34 @@ worse than none, because the adapter trusts it.
        new `RelDefs`/`RelEdges` and is rejected by the schema bump,
        never silently served.
 
-### What `go14` does NOT guarantee
+15. **Rust `pub use` & JNI polish (go15).**
+    a. **Rust `pub use` comments, `self as alias`, and bare parent/crate/self
+       targets.** `parseRustUse` strips `//` line comments and nested
+       `/* ... */` block comments before splitting, handles tabs/newlines
+       around `as`, and preserves `self as alias` re-export names.
+       `resolveRustImport` resolves bare `super` / `super::super` /
+       `crate` / `self` targets (checking `<parent>.rs`, `mod.rs`,
+       `lib.rs`, `main.rs`) instead of returning empty when no trailing
+       module segment follows.
+    b. **Kotlin JNI companion & package hygiene.** `@JvmStatic` on an
+       `external fun` inside a `companion object` binds its JNI base to
+       the enclosing outer class (omitting `$Companion`); named
+       companion objects (`companion object Native`) use their declared
+       name (`Outer$Native`) when non-`@JvmStatic`. Package extraction
+       runs on `stripKotlinCode(src)` so `package ...` lines inside
+       leading comments cannot hijack the JNI base key.
+    c. **JNI `--related` resolution & explicit wasm bridge kind.**
+       Rust-side JNI lookup runs on `calleeBase(query)` (so qualified
+       Rust queries like `ffi::Java_...` resolve), preserves the exact
+       overloaded Rust symbol in `Detail` (and coarse-filters short
+       queries), clarifies direction wording (`bound to`), and dedups
+       Kotlin→Rust bridges by `(RustPath, RustLine, RustName)` so
+       `#[cfg(...)]` variants in the same file are not dropped.
+       `wasm_bindgen` bridges now persist `Kind: "wasm"` explicitly.
+       A go14 index carries pre-go15 `RelEdges`/`RelBridges`/`RelJNI`
+       and is rejected by the schema bump, never silently served.
+
+### What `go15` does NOT guarantee
 
 - **Type resolution.** `--callers` and `--related` remain name-based
   on the trailing identifier; rows are leads to verify against source.
@@ -162,6 +189,12 @@ worse than none, because the adapter trusts it.
   Two overloads with the same arity whose parameters differ only in
   two non-primitive classes are both shown as candidates. `RegisterNatives`
   and `@JvmName`/`@file:JvmName` are not tracked (v2 scope).
+- **Annotated visibility-modified Kotlin `external fun` (e.g.
+  `@JvmStatic internal external fun`).** Tree-sitter-kotlin drops
+  declarations where an annotation precedes a visibility modifier;
+  the regex fallback recovers their def/anchor lines, while JNI
+  parameter-type extraction relies on the AST `function_declaration`
+  node.
 
 ## Compatibility rule
 
@@ -201,13 +234,20 @@ older).
 
 ## History
 
+- `go15` (2026-11-21): Rust `pub use` comment stripping, `self as alias`,
+  and bare `super`/`crate`/`self` import resolution; Kotlin JNI
+  `@JvmStatic` companion outer-class binding, named companion objects,
+  and comment-safe `package` extraction; JNI `--related` qualified Rust
+  queries, coarse-filtered detail, `#[cfg]` same-file line dedup, and
+  explicit `Kind: "wasm"` on bindgen bridges; `go14` indexes rejected
+  and rebuilt. Still current.
 - `go14` (2026-11-21): P1-A calleeBase right-to-left (indexed/turbofish
   receivers), P1-B Rust `--related` defs + `pub use` edges, P1-C Kotlin
   regex fallback always merged (incl. one level of nested parens in
   annotation arguments), P2 JNI bridge two directions (base-key
   grouping, arity + coarse-token narrowing, fail-open candidates) via
   persisted `RelJNI` + `Kind: "jni"` bridges; `go13` indexes rejected
-  and rebuilt. Still current.
+  and rebuilt.
 - `go13` (2026-11-20): JS/TS/JSX/TSX constructor invocations
   (`new_expression`) captured in `CallSites` and `--callers`
   (fresh and `--cached`) via `jsCallQuery`; `go12` indexes rejected and
