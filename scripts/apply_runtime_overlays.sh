@@ -439,6 +439,18 @@ grep -Fq 'def find_directed_cycles_with_metadata(' codebase/cycle_break.py
 grep -Fq 'type_only_edge_count = sum(1 for n in cycle_edge_natures if n == "type_only")' codebase/topology_analyzers.py
 grep -Fq 'if target in cyc[:-1]' codebase/topology_analyzers.py
 grep -Fq 'call_stack: List[List[Any]] = [[vertex, 0]]' core/target_topology.py
+apply_reviewable_overlay "kotlin_rust_calibration_v1"
+grep -Fq 'def kotlin_aidl_fqns(' language_semantics.py
+grep -Fq 'def rust_pub_reexports(' language_semantics.py
+grep -Fq 'kotlin_aidl_generated' core/shared_graph.py
+grep -Fq 'super_symbol_index' core/shared_graph.py
+grep -Fq 'def _inspect_rust_edge_import(' codebase/cycle_break.py
+grep -Fq 'def _inspect_kotlin_edge_import(' codebase/cycle_break.py
+grep -Fq '"shared_types.rs" if suffix == "types" else "shared.rs"' codebase/cycle_break.py
+grep -Fq 'cfg_test_mod' core/target_topology.py
+grep -Fq '"mod.rs", "__init__.py"' codebase/mermaid_graph.py
+grep -Fq 'match.start("mods")' codebase/topology_analyzers.py
+grep -Fq "f\"topology covers {'/'.join(SOURCE_EXTENSIONS)}.\"" core/portable_agent.py
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
 from core.operation_plan import resolve_operation_plan
