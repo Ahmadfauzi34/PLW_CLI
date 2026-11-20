@@ -2421,5 +2421,173 @@ class ArchitectureBaselineTests(unittest.TestCase):
         dc = dynamic_context(str(repo))
         self.assertNotIn("TS/JS-only", dc.get("reason", ""))
 
+    def test_rust_pure_mod_excluded_from_cycles_v20(self):
+        """Pure Rust `mod <child>;` module-tree declarations stay in the graph for
+        reachability/impact/orphan analysis, but do not fabricate directed cycles."""
+        from codebase.cycle_break import compute_cycle_break_advisory
+        from codebase.hott_analyzers import analyze_manifold
+        from codebase.topology_analyzers import analyze_circular, query_impact
+        from core.shared_graph import build_shared_graph
+        from core.target_topology import build_target_topology_orientation
+
+        root = Path(tempfile.mkdtemp(prefix="plw_rust_mod_cyc_"))
+        self.addCleanup(shutil.rmtree, root, True)
+
+        # Case 1: Pure `mod` impl-split + string literal containing "<mod>.com" +
+        # nested `#[cfg(test)] mod tests;` -> `mod protocol;` -> `use super::*;`
+        pure_repo = root / "pure_repo"
+        (pure_repo / "src" / "llm").mkdir(parents=True)
+        (pure_repo / "src" / "rpc" / "tests").mkdir(parents=True)
+        (pure_repo / "Cargo.toml").write_text('[package]\nname = "pure_demo"\nversion = "0.1.0"\n', encoding="utf-8")
+        (pure_repo / "src" / "lib.rs").write_text("pub mod llm;\npub mod rpc;\n", encoding="utf-8")
+        (pure_repo / "src" / "llm" / "mod.rs").write_text(
+            'mod provider;\n'
+            'pub struct LlmClient { pub host: String }\n'
+            'impl LlmClient {\n'
+            '    pub fn endpoint(&self) -> &str { "provider.com" }\n'
+            '    pub fn unrelated(&self) { let _ = other::provider::noop(); }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        (pure_repo / "src" / "llm" / "provider.rs").write_text(
+            "use super::LlmClient;\n"
+            "impl LlmClient {\n"
+            "    pub fn send(&self) -> usize { self.host.len() }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (pure_repo / "src" / "rpc" / "mod.rs").write_text(
+            "pub struct RpcState;\n"
+            "#[cfg(test)]\n"
+            "mod tests;\n",
+            encoding="utf-8",
+        )
+        (pure_repo / "src" / "rpc" / "tests" / "mod.rs").write_text(
+            "mod protocol;\n"
+            "pub(super) fn helper() {}\n",
+            encoding="utf-8",
+        )
+        (pure_repo / "src" / "rpc" / "tests" / "protocol.rs").write_text(
+            "use super::*;\n"
+            "#[test]\n"
+            "fn ok() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        g_pure = build_shared_graph(str(pure_repo))
+        norm_p = lambda rel: str((pure_repo / rel).resolve()).replace("\\", "/")
+        ed_pure = {(e["source"], e["target"]): e["semantic_usages"] for e in g_pure["edge_details"]}
+
+        # Pure mod edges remain in edges (for reachability/impact/orphan) with exact ["rust_mod"] usage
+        self.assertIn((norm_p("src/llm/mod.rs"), norm_p("src/llm/provider.rs")), set(g_pure["edges"]))
+        self.assertEqual(
+            ed_pure[(norm_p("src/llm/mod.rs"), norm_p("src/llm/provider.rs"))],
+            ["rust_mod"],
+        )
+        self.assertEqual(
+            ed_pure[(norm_p("src/rpc/tests/mod.rs"), norm_p("src/rpc/tests/protocol.rs"))],
+            ["rust_mod"],
+        )
+        self.assertGreaterEqual(g_pure["node_metadata"][norm_p("src/llm/provider.rs")]["fan_in"], 1)
+        self.assertGreaterEqual(g_pure["node_metadata"][norm_p("src/rpc/tests/protocol.rs")]["fan_in"], 1)
+
+        # Zero directed cycles across all cycle-aware consumers
+        circ_pure = analyze_circular(g_pure)
+        self.assertEqual(circ_pure["summary"]["total_cycles"], 0, circ_pure["findings"])
+        self.assertEqual(circ_pure["summary"]["cyclic_scc_count"], 0)
+        topo_pure = build_target_topology_orientation(g_pure)
+        self.assertEqual(topo_pure["inventory"]["cyclic_sccs"], 0)
+        mani_pure = analyze_manifold(g_pure)
+        self.assertEqual(mani_pure["summary"]["cycle_orientation_counts"]["directed"], 0)
+
+        imp_prov = query_impact(g_pure, norm_p("src/llm/provider.rs"))
+        self.assertIn(norm_p("src/llm/mod.rs"), imp_prov["direct_downstream"])
+        self.assertEqual(imp_prov["circular_references"], [])
+        self.assertIsNone(imp_prov["cycle_break_advisory"])
+
+        # Case 2: Genuine cycles MUST still be detected:
+        #   (a) mod + `use` / `pub use` from child while child uses `super::`
+        #   (b) mod + inline `child::fn()` path ref while child uses `super::`
+        #   (c) peer-to-peer `use` cycle (`peer_a <-> peer_b`)
+        real_repo = root / "real_repo"
+        (real_repo / "src" / "use_cyc").mkdir(parents=True)
+        (real_repo / "src" / "path_cyc").mkdir(parents=True)
+        (real_repo / "Cargo.toml").write_text('[package]\nname = "real_demo"\nversion = "0.1.0"\n', encoding="utf-8")
+        (real_repo / "src" / "lib.rs").write_text(
+            "pub mod use_cyc;\npub mod path_cyc;\npub mod peer_a;\npub mod peer_b;\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "use_cyc" / "mod.rs").write_text(
+            "mod runner;\n"
+            "use runner::run_step;\n"
+            "pub struct ParentCtx;\n"
+            "pub fn start() { run_step(); }\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "use_cyc" / "runner.rs").write_text(
+            "use super::ParentCtx;\n"
+            "pub fn run_step() -> ParentCtx { ParentCtx }\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "path_cyc" / "mod.rs").write_text(
+            "mod worker;\n"
+            "pub struct Job;\n"
+            "pub fn go() { let _ = worker::exec(); }\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "path_cyc" / "worker.rs").write_text(
+            "use super::Job;\n"
+            "pub fn exec() -> Job { Job }\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "peer_a.rs").write_text(
+            "use crate::peer_b::Beta;\npub struct Alpha(pub Beta);\n",
+            encoding="utf-8",
+        )
+        (real_repo / "src" / "peer_b.rs").write_text(
+            "use crate::peer_a::Alpha;\npub struct Beta;\npub fn consume(_: Alpha) {}\n",
+            encoding="utf-8",
+        )
+
+        g_real = build_shared_graph(str(real_repo))
+        norm_r = lambda rel: str((real_repo / rel).resolve()).replace("\\", "/")
+        ed_real = {(e["source"], e["target"]): e["semantic_usages"] for e in g_real["edge_details"]}
+
+        self.assertIn("rust_use", ed_real[(norm_r("src/use_cyc/mod.rs"), norm_r("src/use_cyc/runner.rs"))])
+        self.assertIn("rust_mod", ed_real[(norm_r("src/use_cyc/mod.rs"), norm_r("src/use_cyc/runner.rs"))])
+        self.assertIn("rust_path_ref", ed_real[(norm_r("src/path_cyc/mod.rs"), norm_r("src/path_cyc/worker.rs"))])
+
+        circ_real = analyze_circular(g_real)
+        cycle_sets = [set(f["files"]) for f in circ_real["findings"]]
+        self.assertIn({norm_r("src/use_cyc/mod.rs"), norm_r("src/use_cyc/runner.rs")}, cycle_sets)
+        self.assertIn({norm_r("src/path_cyc/mod.rs"), norm_r("src/path_cyc/worker.rs")}, cycle_sets)
+        self.assertIn({norm_r("src/peer_a.rs"), norm_r("src/peer_b.rs")}, cycle_sets)
+        self.assertEqual(circ_real["summary"]["cyclic_scc_count"], 3)
+
+        topo_real = build_target_topology_orientation(g_real)
+        self.assertEqual(topo_real["inventory"]["cyclic_sccs"], 3)
+        mani_real = analyze_manifold(g_real)
+        directed_basis = [
+            set(b["vertices"])
+            for b in mani_real["findings"][0].get("cycle_basis", [])
+            if b.get("orientation") == "directed"
+        ]
+        self.assertIn({norm_r("src/use_cyc/mod.rs"), norm_r("src/use_cyc/runner.rs")}, directed_basis)
+        self.assertIn({norm_r("src/path_cyc/mod.rs"), norm_r("src/path_cyc/worker.rs")}, directed_basis)
+        self.assertEqual(mani_real["summary"]["cycle_orientation_counts"]["directed"], 2)
+
+        # Cycle-break on mod+use edge reports the imported symbol (`run_step`), not the `mod` name (`runner`)
+        cb_use = compute_cycle_break_advisory(
+            g_real,
+            [[norm_r("src/use_cyc/mod.rs"), norm_r("src/use_cyc/runner.rs"), norm_r("src/use_cyc/mod.rs")]],
+        )
+        adv_edges = cb_use["advisories_by_cycle"][0]["candidate_edges"]
+        mod_to_runner = next(
+            e for e in adv_edges
+            if e["source"] == norm_r("src/use_cyc/mod.rs") and e["target"] == norm_r("src/use_cyc/runner.rs")
+        )
+        self.assertIn("run_step", mod_to_runner["rationale"])
+        self.assertNotIn("(runner", mod_to_runner["rationale"])
+
 if __name__ == "__main__":
     unittest.main()
