@@ -86,7 +86,7 @@ func TestResolveRelatedChain(t *testing.T) {
 		{From: "c.mjs", Line: 3, Target: "./b.mjs", Star: true},
 	}
 	files := map[string]bool{"a.mjs": true, "b.mjs": true, "c.mjs": true}
-	rows := resolveRelated("foo", defs, edges, nil, files)
+	rows := resolveRelated("foo", defs, edges, nil, nil, files)
 	kinds := map[string]int{}
 	for _, r := range rows {
 		kinds[r.Kind]++
@@ -105,15 +105,15 @@ func TestResolveRelatedAliasCycleUnresolved(t *testing.T) {
 		{From: "u.mjs", Line: 1, Target: "./gone.mjs", Names: map[string]string{"ghost": "ghost"}},
 	}
 	files := map[string]bool{"a.mjs": true, "b.mjs": true, "x.mjs": true, "y.mjs": true, "u.mjs": true}
-	rows := resolveRelated("alias", defs, edges, nil, files)
+	rows := resolveRelated("alias", defs, edges, nil, nil, files)
 	if len(rows) != 1 || rows[0].Kind != "re-export" || !strings.Contains(rows[0].Detail, "a.mjs:1") {
 		t.Errorf("alias rows = %+v", rows)
 	}
-	rows = resolveRelated("loop", defs, edges, nil, files)
+	rows = resolveRelated("loop", defs, edges, nil, nil, files)
 	if len(rows) != 2 {
 		t.Errorf("cycle rows = %+v, want exactly 2 (no infinite loop)", rows)
 	}
-	rows = resolveRelated("ghost", defs, edges, nil, files)
+	rows = resolveRelated("ghost", defs, edges, nil, nil, files)
 	if len(rows) != 1 || !strings.Contains(rows[0].Detail, "not in index") {
 		t.Errorf("unresolved rows = %+v", rows)
 	}
@@ -133,7 +133,7 @@ func TestResolveRelatedBarrelDeadEnds(t *testing.T) {
 		"rag/index.ts": true, "rag/holographic-memory.ts": true,
 		"rag/base-indexer.ts": true, "rag/chunk-store.ts": true,
 	}
-	rows := resolveRelated("HolographicMemoryField", defs, edges, nil, files)
+	rows := resolveRelated("HolographicMemoryField", defs, edges, nil, nil, files)
 	if len(rows) != 2 {
 		t.Fatalf("barrel rows = %+v, want def + 1 live re-export", rows)
 	}
@@ -161,7 +161,7 @@ func TestResolveRelatedNoDefKeepsTrace(t *testing.T) {
 		{From: "index.ts", Line: 2, Target: "./b", Star: true},
 	}
 	files := map[string]bool{"index.ts": true, "a.ts": true, "b.ts": true}
-	rows := resolveRelated("Missing", defs, edges, nil, files)
+	rows := resolveRelated("Missing", defs, edges, nil, nil, files)
 	if len(rows) != 2 {
 		t.Fatalf("no-def rows = %+v, want the full 2-row trace", rows)
 	}
@@ -179,7 +179,7 @@ func TestExtractRelatedJSTSClass(t *testing.T) {
 	text := "export class HolographicMemoryField {\n  constructor() {}\n}\n\n" +
 		"export interface FieldConfig {\n  dim: number;\n}\n\n" +
 		"export enum Color {\n  Red = 1,\n}\n"
-	defs, _, _, ok := extractRelated("rag/holographic-memory.ts", text)
+	defs, _, _, _, ok := extractRelated("rag/holographic-memory.ts", text)
 	if !ok {
 		t.Fatal("expected ok for valid TS")
 	}
@@ -203,7 +203,7 @@ func TestExtractRelatedKotlin(t *testing.T) {
 		"interface Shape { fun area(): Double }\n\n" +
 		"enum class Color { RED, GREEN }\n\n" +
 		"val appName = \"pipkin\"\n\nfun topLevel() {}\n"
-	defs, _, _, ok := extractRelated("x.kt", text)
+	defs, _, _, _, ok := extractRelated("x.kt", text)
 	if !ok {
 		t.Fatal("expected ok for valid Kotlin")
 	}
@@ -240,7 +240,7 @@ func TestExtractRelatedKotlinAnnotationVisibility(t *testing.T) {
 		"    val flag = 1\n" +
 		"}\n\n" +
 		"const val TOP_LEVEL_FLAG = true\n"
-	defs, _, _, ok := extractRelated("x.kt", text)
+	defs, _, _, _, ok := extractRelated("x.kt", text)
 	if !ok {
 		t.Fatal("expected ok for valid Kotlin")
 	}
@@ -264,7 +264,7 @@ func TestExtractRelatedKotlinAnnotationVisibility(t *testing.T) {
 		}
 	}
 	// resolveRelated returns exactly one row for the recovered def.
-	rows := resolveRelated("PrimaryChip", defs, nil, nil, map[string]bool{})
+	rows := resolveRelated("PrimaryChip", defs, nil, nil, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Line != 3 {
 		t.Errorf("resolveRelated(PrimaryChip) = %+v, want exactly 1 row at line 3", rows)
 	}
@@ -272,7 +272,7 @@ func TestExtractRelatedKotlinAnnotationVisibility(t *testing.T) {
 	// Annotation on its own line before `fun` also defeats the grammar
 	// (probe matrix 2026-11-20); before `class` it parses.
 	sep := "package demo\n\n@Composable\ninternal fun SeparateChip(label: String) {\n    renderIcon(label)\n}\n"
-	sdefs, _, _, ok := extractRelated("x.kt", sep)
+	sdefs, _, _, _, ok := extractRelated("x.kt", sep)
 	if !ok {
 		t.Fatal("expected ok for valid Kotlin")
 	}
@@ -310,7 +310,7 @@ func TestExtractRelatedKotlinAnnotationTrailingComment(t *testing.T) {
 		"  private val lock = Any()\n" +
 		"}\n\n" +
 		"@Composable internal fun BrokenChip(label: String) {}\n"
-	defs, _, _, ok := extractRelated("x.kt", text)
+	defs, _, _, _, ok := extractRelated("x.kt", text)
 	if !ok {
 		t.Fatal("expected ok for valid Kotlin")
 	}
@@ -331,7 +331,7 @@ func TestExtractRelatedKotlinAnnotationTrailingComment(t *testing.T) {
 			t.Errorf("defs = %+v, must not contain %s", defs, no)
 		}
 	}
-	rows := resolveRelated("ChatTimeline", defs, nil, nil, map[string]bool{})
+	rows := resolveRelated("ChatTimeline", defs, nil, nil, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Line != 4 {
 		t.Errorf("resolveRelated(ChatTimeline) = %+v, want exactly 1 row at line 4", rows)
 	}
@@ -353,7 +353,7 @@ func TestExtractRelatedKotlinExtensionReceiver(t *testing.T) {
 		"  return editPairs(args)\n" +
 		"}\n\n" +
 		"@Composable internal fun BrokenChip(label: String) {}\n"
-	defs, _, _, ok := extractRelated("x.kt", text)
+	defs, _, _, _, ok := extractRelated("x.kt", text)
 	if !ok {
 		t.Fatal("expected ok for valid Kotlin")
 	}
@@ -370,7 +370,7 @@ func TestExtractRelatedKotlinExtensionReceiver(t *testing.T) {
 	if got, present := byName["BrokenChip"]; !present || got != 7 {
 		t.Errorf("defs = %+v, want BrokenChip at line 7 (got %d, present=%v)", defs, got, present)
 	}
-	rows := resolveRelated("cardText", defs, nil, nil, map[string]bool{})
+	rows := resolveRelated("cardText", defs, nil, nil, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Line != 3 {
 		t.Errorf("resolveRelated(cardText) = %+v, want exactly 1 row at line 3", rows)
 	}
@@ -382,7 +382,7 @@ func TestResolveRelatedFFI(t *testing.T) {
 		{RustPath: "src/lib.rs", RustLine: 42, RustName: "get_graph_parameters_flat", JSName: "getGraphParametersFlat"},
 		{RustPath: "src/lib.rs", RustLine: 50, RustName: "custom_fn", JSName: "renamedFn"},
 	}
-	rows := resolveRelated("getGraphParametersFlat", defs, nil, bridges, map[string]bool{})
+	rows := resolveRelated("getGraphParametersFlat", defs, nil, bridges, nil, map[string]bool{})
 	found := false
 	for _, r := range rows {
 		if r.Kind == "ffi" && strings.Contains(r.Detail, "bind.mjs:5") {
@@ -393,17 +393,17 @@ func TestResolveRelatedFFI(t *testing.T) {
 		t.Errorf("ffi rows = %+v, want paired js def", rows)
 	}
 	// Query by snake name finds the same bridge; js_name override kept.
-	rows = resolveRelated("custom_fn", nil, nil, bridges, map[string]bool{})
+	rows = resolveRelated("custom_fn", nil, nil, bridges, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Kind != "ffi" || !strings.Contains(rows[0].Detail, "renamedFn") {
 		t.Errorf("js_name rows = %+v", rows)
 	}
 	// Query by the JS name itself (override direction): the bridge must
 	// be found even though "renamedFn" does not round-trip to custom_fn.
-	rows = resolveRelated("renamedFn", nil, nil, bridges, map[string]bool{})
+	rows = resolveRelated("renamedFn", nil, nil, bridges, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Kind != "ffi" || !strings.Contains(rows[0].Detail, "custom_fn") {
 		t.Errorf("js-name query rows = %+v", rows)
 	}
-	rows = resolveRelated("renamed_fn", nil, nil, bridges, map[string]bool{})
+	rows = resolveRelated("renamed_fn", nil, nil, bridges, nil, map[string]bool{})
 	if len(rows) != 1 || rows[0].Kind != "ffi" {
 		t.Errorf("js-name snake query rows = %+v", rows)
 	}
@@ -415,7 +415,7 @@ func TestExtractRelatedJS(t *testing.T) {
 		"export {foo as renamed} from './a.mjs';\n" +
 		"export * from './b.mjs';\n" +
 		"export {bar};\n"
-	defs, edges, _, ok := extractRelated("c.mjs", text)
+	defs, edges, _, _, ok := extractRelated("c.mjs", text)
 	if !ok {
 		t.Fatal("expected ok for valid JS")
 	}
@@ -455,11 +455,29 @@ func TestExtractRelatedRust(t *testing.T) {
 	text := "#[wasm_bindgen]\npub fn plain_fn() {}\n\n" +
 		"#[wasm_bindgen(js_name = \"renamedFn\")]\n#[allow(dead_code)]\npub fn custom_fn() {}\n\n" +
 		"pub fn not_bridged() {}\n\n" +
-		"#[wasm_bindgen]\nimpl Widget {\n    pub fn method_fn(&self) {}\n}\n\n" +
-		"impl Plain {\n    pub fn plain_method(&self) {}\n}\n"
-	_, _, bridges, ok := extractRelated("lib.rs", text)
+		"#[wasm_bindgen]\nimpl Widget {\n    pub fn method_fn(&self) {}\n    pub const KIND: u32 = 1;\n}\n\n" +
+		"impl Plain {\n    pub fn plain_method(&self) {}\n}\n\n" +
+		"pub const LIMIT: u32 = 10;\npub static MODE: &str = \"x\";\n" +
+		"fn with_local() {\n    const INNER: u32 = 1;\n}\n"
+	defs, _, bridges, _, ok := extractRelated("lib.rs", text)
 	if !ok {
 		t.Fatal("expected ok for valid Rust")
+	}
+	// P1-B (go14): non-bindgen symbols are defs now, not nil.
+	names := map[string]int{}
+	for _, d := range defs {
+		names[d.Name]++
+	}
+	for _, want := range []string{"plain_fn", "custom_fn", "not_bridged", "method_fn", "with_local", "LIMIT", "MODE"} {
+		if names[want] != 1 {
+			t.Errorf("def %q count = %d, want 1 (defs %v)", want, names[want], defs)
+		}
+	}
+	// No struct-name duplication from impl_item; no member/local consts.
+	for _, banned := range []string{"Plain", "Widget", "KIND", "INNER"} {
+		if names[banned] != 0 {
+			t.Errorf("def %q count = %d, want 0", banned, names[banned])
+		}
 	}
 	if len(bridges) != 3 {
 		t.Fatalf("bridges = %+v, want plain_fn + custom_fn + Widget::method_fn", bridges)
@@ -482,12 +500,176 @@ func TestExtractRelatedRust(t *testing.T) {
 	}
 }
 
+// TestExtractRelatedRustReexport checks the `pub use` edges from real
+// text: groups, aliases, globs, visibility forms — and that a private
+// `use` produces no edge.
+func TestExtractRelatedRustReexport(t *testing.T) {
+	text := "pub use crate::engine::{Engine, run};\n" +
+		"pub use crate::engine::run as go;\n" +
+		"pub use self::inner::*;\n" +
+		"use crate::secret::hidden;\n" +
+		"pub(crate) use super::sib::Thing;\n"
+	_, edges, _, _, ok := extractRelated("src/lib.rs", text)
+	if !ok {
+		t.Fatal("expected ok for valid Rust")
+	}
+	// 2 (group) + 1 (alias) + 1 (glob) + 0 (private) + 1 (pub(crate)).
+	if len(edges) != 5 {
+		t.Fatalf("edges = %+v, want 5", edges)
+	}
+	byTarget := map[string][]relEdge{}
+	for _, e := range edges {
+		byTarget[e.Target] = append(byTarget[e.Target], e)
+	}
+	if len(byTarget["crate::engine"]) != 3 {
+		t.Errorf("crate::engine edges = %d, want 3 (group x2 + alias)", len(byTarget["crate::engine"]))
+	}
+	star := false
+	for _, e := range edges {
+		if e.Target == "self::inner" && e.Star {
+			star = true
+		}
+	}
+	if !star {
+		t.Errorf("missing self::inner star edge: %+v", edges)
+	}
+	found := false
+	for _, e := range edges {
+		if e.Target == "super::sib" && e.Names["Thing"] == "Thing" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("missing super::sib Thing edge: %+v", edges)
+	}
+}
+
+func TestParseRustUse(t *testing.T) {
+	type wantEdge struct {
+		target string
+		star   bool
+		names  map[string]string
+	}
+	cases := []struct {
+		in   string
+		want []wantEdge
+	}{
+		{"pub use crate::foo::Bar;", []wantEdge{{"crate::foo", false, map[string]string{"Bar": "Bar"}}}},
+		{"pub use crate::foo::{Bar, Baz};", []wantEdge{
+			{"crate::foo", false, map[string]string{"Bar": "Bar"}},
+			{"crate::foo", false, map[string]string{"Baz": "Baz"}},
+		}},
+		{"pub use crate::foo::{Bar as Qux};", []wantEdge{{"crate::foo", false, map[string]string{"Qux": "Bar"}}}},
+		{"pub use crate::foo::*;", []wantEdge{{"crate::foo", true, nil}}},
+		{"pub use self::x;", []wantEdge{{"self", false, map[string]string{"x": "x"}}}},
+		{"pub use super::y::Z;", []wantEdge{{"super::y", false, map[string]string{"Z": "Z"}}}},
+		{"pub use a::{b::c, d};", []wantEdge{
+			{"a::b", false, map[string]string{"c": "c"}},
+			{"a", false, map[string]string{"d": "d"}},
+		}},
+		{"pub use a::{b::{c, d}, e};", []wantEdge{
+			{"a::b", false, map[string]string{"c": "c"}},
+			{"a::b", false, map[string]string{"d": "d"}},
+			{"a", false, map[string]string{"e": "e"}},
+		}},
+		{"pub use a::self;", []wantEdge{{"", false, map[string]string{"a": "a"}}}},
+		{"pub use foo;", []wantEdge{{"", false, map[string]string{"foo": "foo"}}}},
+		{"pub use crate::a::b::{self};", []wantEdge{{"crate::a", false, map[string]string{"b": "b"}}}},
+		{"pub(crate) use crate::x::Y;", []wantEdge{{"crate::x", false, map[string]string{"Y": "Y"}}}},
+		{"use crate::x::Y;", nil},
+		{"pub fn not_a_use() {}", nil},
+		{"pub use crate::x::Y", []wantEdge{{"crate::x", false, map[string]string{"Y": "Y"}}}},
+	}
+	for _, c := range cases {
+		got := parseRustUse("f.rs", c.in, 1)
+		if len(got) != len(c.want) {
+			t.Errorf("parseRustUse(%q) = %+v, want %d edge(s)", c.in, got, len(c.want))
+			continue
+		}
+		for i, w := range c.want {
+			g := got[i]
+			if g.Target != w.target || g.Star != w.star || len(g.Names) != len(w.names) {
+				t.Errorf("parseRustUse(%q)[%d] = %+v, want target=%q star=%v names=%v", c.in, i, g, w.target, w.star, w.names)
+				continue
+			}
+			for k, v := range w.names {
+				if g.Names[k] != v {
+					t.Errorf("parseRustUse(%q)[%d] names = %v, want %v", c.in, i, g.Names, w.names)
+				}
+			}
+		}
+	}
+}
+
+func TestResolveRustImport(t *testing.T) {
+	files := map[string]bool{
+		"src/lib.rs": true, "src/engine.rs": true, "src/engine/inner.rs": true,
+		"src/engine/inner/deep.rs": true, "src/other/mod.rs": true, "src/other/util.rs": true,
+		"flat.rs": true, "flat2.rs": true,
+	}
+	cases := []struct{ from, spec, want string }{
+		{"src/lib.rs", "crate::engine", "src/engine.rs"},
+		{"src/lib.rs", "crate::engine::inner", "src/engine/inner.rs"},
+		{"src/engine.rs", "self::inner", "src/engine/inner.rs"},
+		{"src/engine.rs", "self::inner::deep", "src/engine/inner/deep.rs"},
+		{"src/engine/inner.rs", "super::inner", "src/engine/inner.rs"},
+		{"src/engine/inner.rs", "super::super::other", "src/other/mod.rs"},
+		{"src/lib.rs", "engine", "src/engine.rs"},
+		{"src/other/mod.rs", "self::util", "src/other/util.rs"},
+		{"src/lib.rs", "::engine", "src/engine.rs"},
+		{"flat.rs", "crate::flat2", "flat2.rs"},
+		{"src/lib.rs", "crate::missing", ""},
+		{"src/lib.rs", "crate::engine::gone", ""},
+	}
+	for _, c := range cases {
+		if got := resolveRustImport(c.from, c.spec, files); got != c.want {
+			t.Errorf("resolveRustImport(%q, %q) = %q, want %q", c.from, c.spec, got, c.want)
+		}
+	}
+}
+
+func TestResolveRelatedRustChain(t *testing.T) {
+	defs := []relDef{
+		{Path: "src/engine.rs", Line: 1, Name: "Engine"},
+		{Path: "src/engine.rs", Line: 2, Name: "run"},
+		{Path: "src/engine/inner.rs", Line: 1, Name: "helper"},
+	}
+	edges := []relEdge{
+		{From: "src/lib.rs", Line: 1, Target: "crate::engine", Names: map[string]string{"Engine": "Engine", "run": "run"}},
+		{From: "src/engine.rs", Line: 5, Target: "self::inner", Names: map[string]string{"helper": "helper"}},
+		{From: "src/lib.rs", Line: 2, Target: "crate::engine", Names: map[string]string{"go": "run"}},
+		{From: "src/a.rs", Line: 1, Target: "crate::b", Names: map[string]string{"loop": "loop"}},
+		{From: "src/b.rs", Line: 1, Target: "crate::a", Names: map[string]string{"loop": "loop"}},
+	}
+	files := map[string]bool{"src/lib.rs": true, "src/engine.rs": true, "src/engine/inner.rs": true, "src/a.rs": true, "src/b.rs": true}
+	kinds := func(rows []relEntry) map[string]int {
+		m := map[string]int{}
+		for _, r := range rows {
+			m[r.Kind]++
+		}
+		return m
+	}
+	if k := kinds(resolveRelated("Engine", defs, edges, nil, nil, files)); k["def"] != 1 || k["re-export"] != 1 {
+		t.Errorf("Engine rows kinds = %v, want 1 def + 1 re-export", k)
+	}
+	if k := kinds(resolveRelated("helper", defs, edges, nil, nil, files)); k["def"] != 1 || k["re-export"] != 1 {
+		t.Errorf("helper rows kinds = %v, want 1 def + 1 re-export", k)
+	}
+	rows := resolveRelated("go", defs, edges, nil, nil, files)
+	if len(rows) != 1 || rows[0].Kind != "re-export" || !strings.Contains(rows[0].Detail, "src/engine.rs:2") {
+		t.Errorf("go (alias) rows = %+v, want 1 re-export pointing at run's def", rows)
+	}
+	if rows := resolveRelated("loop", defs, edges, nil, nil, files); len(rows) != 2 {
+		t.Errorf("loop (cycle) rows = %+v, want exactly 2 (no infinite loop)", rows)
+	}
+}
+
 func TestExtractRelatedJSConsts(t *testing.T) {
 	text := "const topLevel = 1;\n" +
 		"export const exported = 2;\n" +
 		"function f() {\n  const local = 3;\n  return local;\n}\n" +
 		"const arrow = () => topLevel;\n"
-	defs, _, _, ok := extractRelated("c.mjs", text)
+	defs, _, _, _, ok := extractRelated("c.mjs", text)
 	if !ok {
 		t.Fatal("expected ok for valid JS")
 	}
@@ -542,12 +724,12 @@ func TestExtractRelatedSkipsGeneratedAssets(t *testing.T) {
 		{"math compesor/burn_research.js", "/* @ts-self-types=\"./burn_research.d.ts\" */\n" + body},
 		{"math compesor/glue.mjs", "function m() { return __wbindgen_malloc(1); }\n" + body},
 	} {
-		if _, _, _, ok := extractRelated(tc.path, tc.text); ok {
+		if _, _, _, _, ok := extractRelated(tc.path, tc.text); ok {
 			t.Errorf("extractRelated(%q) = ok, want skipped", tc.path)
 		}
 	}
 	doc := "// Talks to wasm-bindgen bridge\n" + body
-	defs, _, _, ok := extractRelated("src/bridge.mjs", doc)
+	defs, _, _, _, ok := extractRelated("src/bridge.mjs", doc)
 	if !ok || len(defs) != 1 || defs[0].Name != "foo" {
 		t.Errorf("extractRelated normal JSDoc bridge.mjs = (%+v, %v), want [foo], true", defs, ok)
 	}
@@ -623,5 +805,364 @@ func TestRunRelatedCachedMatchesFresh(t *testing.T) {
 		if f2.Related[i] != c2.Related[i] {
 			t.Errorf("post-sync row[%d] mismatch: fresh=%+v cached=%+v", i, f2.Related[i], c2.Related[i])
 		}
+	}
+}
+
+// --- Batch 4 (go14, P2: JNI bridge, Option 3) ---
+
+func TestParseJNISig(t *testing.T) {
+	cases := []struct {
+		sig    string
+		want   []string
+		wantOK bool
+	}{
+		{"", nil, true},            // zero params
+		{"I", []string{"I"}, true}, // one int
+		{"__I", nil, false},        // __ is not part of a signature
+		{"IJ", []string{"I", "J"}, true},
+		{"_3BI", []string{"_3B", "I"}, true},
+		{"_3B", []string{"_3B"}, true},
+		{"_3_3Ljava_lang_String_2", []string{"_3_3Ljava_lang_String_2"}, true},
+		{"ZBCS", []string{"Z", "B", "C", "S"}, true},
+		{"_3", nil, false},   // dangling array prefix
+		{"Lfoo", nil, false}, // unterminated object
+		{"X", nil, false},    // unknown letter
+		{"_3X", nil, false},
+	}
+	for _, c := range cases {
+		got, ok := parseJNISig(c.sig)
+		if ok != c.wantOK {
+			t.Errorf("parseJNISig(%q) ok = %v, want %v", c.sig, ok, c.wantOK)
+			continue
+		}
+		if !c.wantOK {
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("parseJNISig(%q) = %v, want %v", c.sig, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("parseJNISig(%q)[%d] = %q, want %q", c.sig, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestParseJNIRustName(t *testing.T) {
+	cases := []struct {
+		name       string
+		wantBase   string
+		wantTokens []string
+		wantOver   bool
+		wantOK     bool
+	}{
+		{"Java_com_example_Bridge_send", "Java_com_example_Bridge_send", nil, false, true},
+		{"Java_com_example_Bridge_send__I", "Java_com_example_Bridge_send", []string{"I"}, true, true},
+		{"Java_com_example_Bridge_send___3BI", "Java_com_example_Bridge_send", []string{"_3B", "I"}, true, true},
+		{"Java_com_example_Bridge_send___3B", "Java_com_example_Bridge_send", []string{"_3B"}, true, true},
+		{"Java_com_example_Bridge_send__ZBCS", "Java_com_example_Bridge_send", []string{"Z", "B", "C", "S"}, true, true},
+		{"Java_com_example_Bridge_send___3_3Ljava_lang_String_2", "Java_com_example_Bridge_send", []string{"_3_3Ljava_lang_String_2"}, true, true},
+		{"Java_com_example_My_1Class_send", "Java_com_example_My_1Class_send", nil, false, true},
+		{"Java_com_example_Bridge_send__", "Java_com_example_Bridge_send", nil, true, true}, // empty sig = 0 params
+		{"Java_com_example_Bridge_send__X", "", nil, false, false},                          // malformed sig
+		{"Java_com_example_Bridge_send___3", "", nil, false, false},                         // dangling _3
+		{"plain_fn", "", nil, false, false}, // not a JNI name
+		{"", "", nil, false, false},
+	}
+	for _, c := range cases {
+		base, toks, over, ok := parseJNIRustName(c.name)
+		if ok != c.wantOK || base != c.wantBase || over != c.wantOver {
+			t.Errorf("parseJNIRustName(%q) = (%q, %v, %v, %v), want (%q, %v, %v, %v)",
+				c.name, base, toks, over, ok, c.wantBase, c.wantTokens, c.wantOver, c.wantOK)
+			continue
+		}
+		if len(toks) != len(c.wantTokens) {
+			t.Errorf("parseJNIRustName(%q) tokens = %v, want %v", c.name, toks, c.wantTokens)
+			continue
+		}
+		for i := range toks {
+			if toks[i] != c.wantTokens[i] {
+				t.Errorf("parseJNIRustName(%q) tokens[%d] = %q, want %q", c.name, i, toks[i], c.wantTokens[i])
+			}
+		}
+	}
+}
+
+func TestJNIEscapeAndKotlinBase(t *testing.T) {
+	if got := jniEscape("send_data"); got != "send_1data" {
+		t.Errorf("jniEscape(send_data) = %q, want send_1data", got)
+	}
+	if got := jniEscape("My$Class"); got != "My_00024Class" {
+		t.Errorf("jniEscape(My$Class) = %q, want My_00024Class", got)
+	}
+	if got := jniKotlinBase("com.example", []string{"Bridge"}, "send"); got != "Java_com_example_Bridge_send" {
+		t.Errorf("jniKotlinBase class = %q, want Java_com_example_Bridge_send", got)
+	}
+	if got := jniKotlinBase("com.example", []string{"Outer", "Inner"}, "go"); got != "Java_com_example_Outer_00024Inner_go" {
+		t.Errorf("jniKotlinBase nested = %q, want Java_com_example_Outer_00024Inner_go", got)
+	}
+	if got := jniKotlinBase("", []string{"BridgeKt"}, "main"); got != "Java_BridgeKt_main" {
+		t.Errorf("jniKotlinBase no-pkg = %q, want Java_BridgeKt_main", got)
+	}
+	if got := jniKotlinBase("com.example", []string{"Bridge"}, "send_data"); got != "Java_com_example_Bridge_send_1data" {
+		t.Errorf("jniKotlinBase escaped method = %q, want Java_com_example_Bridge_send_1data", got)
+	}
+}
+
+func TestJniCoarseToken(t *testing.T) {
+	cases := []struct {
+		typ    string
+		vararg bool
+		want   string
+	}{
+		{"Int", false, "I"},
+		{"Long", false, "J"},
+		{"Boolean", false, "Z"},
+		{"Float", false, "F"},
+		{"Double", false, "D"},
+		{"Byte", false, "B"},
+		{"Short", false, "S"},
+		{"Char", false, "C"},
+		{"String", false, "Ljava_lang_String_2"},
+		{"ByteArray", false, "_3B"},
+		{"IntArray", false, "_3I"},
+		{"Int", true, "_3I"}, // vararg Int = [I
+		{"String", true, "_3Ljava_lang_String_2"},
+		{"Int?", false, ""}, // nullable: boxed, wildcard
+		{"String?", false, ""},
+		{"Map<String, Int>", false, ""}, // generic: wildcard
+		{"Widget", false, ""},           // custom class: wildcard
+		{"(Int) -> Unit", false, ""},    // function type: wildcard
+		{"Unit", false, ""},
+	}
+	for _, c := range cases {
+		if got := jniCoarseToken(c.typ, c.vararg); got != c.want {
+			t.Errorf("jniCoarseToken(%q, vararg=%v) = %q, want %q", c.typ, c.vararg, got, c.want)
+		}
+	}
+}
+
+// TestExtractRelatedKotlinJNI covers the Kotlin side of the JNI bridge:
+// class, named object, companion ($Companion), nested class, and the
+// top-level facade <FileStem>Kt — with arity and coarse tokens.
+func TestExtractRelatedKotlinJNI(t *testing.T) {
+	text := "package com.example\n\n" +
+		"class Bridge {\n" +
+		"    external fun send(data: ByteArray, count: Int): Boolean\n" +
+		"    external fun ping(): Unit\n" +
+		"    fun plain() {}\n" +
+		"}\n\n" +
+		"object Holder {\n" +
+		"    external fun store(key: String, value: Long)\n" +
+		"}\n\n" +
+		"class Outer {\n" +
+		"    class Inner {\n" +
+		"        external fun go(x: Int)\n" +
+		"    }\n" +
+		"    companion object {\n" +
+		"        external fun create(name: String?): Widget\n" +
+		"    }\n" +
+		"}\n\n" +
+		"external fun topLevel(flag: Boolean)\n"
+	_, _, _, jni, ok := extractRelated("Bridge.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	byName := map[string]relJNIDecl{}
+	for _, d := range jni {
+		if _, dup := byName[d.Name]; dup {
+			t.Errorf("duplicate JNI decl for %q", d.Name)
+		}
+		byName[d.Name] = d
+	}
+	want := map[string]relJNIDecl{
+		"send":     {Base: "Java_com_example_Bridge_send", Arity: 2, Coarse: []string{"_3B", "I"}},
+		"ping":     {Base: "Java_com_example_Bridge_ping", Arity: 0, Coarse: nil},
+		"store":    {Base: "Java_com_example_Holder_store", Arity: 2, Coarse: []string{"Ljava_lang_String_2", "J"}},
+		"go":       {Base: "Java_com_example_Outer_00024Inner_go", Arity: 1, Coarse: []string{"I"}},
+		"create":   {Base: "Java_com_example_Outer_00024Companion_create", Arity: 1, Coarse: []string{""}},
+		"topLevel": {Base: "Java_com_example_BridgeKt_topLevel", Arity: 1, Coarse: []string{"Z"}},
+	}
+	if len(jni) != len(want) {
+		t.Fatalf("jni decls = %+v, want %d", jni, len(want))
+	}
+	for name, w := range want {
+		d, found := byName[name]
+		if !found {
+			t.Errorf("missing JNI decl %q", name)
+			continue
+		}
+		if d.Base != w.Base {
+			t.Errorf("decl %q base = %q, want %q", name, d.Base, w.Base)
+		}
+		if d.Arity != w.Arity {
+			t.Errorf("decl %q arity = %d, want %d", name, d.Arity, w.Arity)
+		}
+		if len(d.Coarse) != len(w.Coarse) {
+			t.Errorf("decl %q coarse = %v, want %v", name, d.Coarse, w.Coarse)
+			continue
+		}
+		for i := range w.Coarse {
+			if d.Coarse[i] != w.Coarse[i] {
+				t.Errorf("decl %q coarse[%d] = %q, want %q", name, i, d.Coarse[i], w.Coarse[i])
+			}
+		}
+	}
+	if d := byName["send"]; d.Line != 4 {
+		t.Errorf("send decl line = %d, want 4", d.Line)
+	}
+	if d := byName["create"]; d.Line != 18 {
+		t.Errorf("create decl line = %d, want 18", d.Line)
+	}
+	// A non-external fun must not become a JNI decl.
+	if _, found := byName["plain"]; found {
+		t.Errorf("plain fun must not be a JNI decl")
+	}
+}
+
+// TestExtractRelatedRustJNI covers the Rust side: a top-level Java_*
+// fn is a JNI bridge (no attribute needed); a Java_* method inside an
+// impl is not; a normal fn is not.
+func TestExtractRelatedRustJNI(t *testing.T) {
+	text := "pub fn Java_com_example_Bridge_send(data: &[u8], count: i32) -> bool { true }\n" +
+		"pub fn Java_com_example_Bridge_ping() {}\n" +
+		"pub fn plain() {}\n" +
+		"impl Widget {\n    pub fn Java_com_example_Widget_draw(&self) {}\n}\n"
+	_, _, bridges, _, ok := extractRelated("native.rs", text)
+	if !ok {
+		t.Fatal("expected ok for valid Rust")
+	}
+	jni := map[string]relBridge{}
+	for _, b := range bridges {
+		if b.Kind == "jni" {
+			jni[b.RustName] = b
+		}
+	}
+	if len(jni) != 2 {
+		t.Fatalf("jni bridges = %+v, want send + ping", bridges)
+	}
+	if b := jni["Java_com_example_Bridge_send"]; b.RustLine != 1 || b.RustPath != "native.rs" {
+		t.Errorf("send bridge wrong: %+v", b)
+	}
+	if b := jni["Java_com_example_Bridge_ping"]; b.RustLine != 2 {
+		t.Errorf("ping bridge wrong: %+v", b)
+	}
+	for _, b := range bridges {
+		if b.Kind == "jni" && b.JSName != "" {
+			t.Errorf("jni bridge must not carry a JSName: %+v", b)
+		}
+	}
+}
+
+// TestResolveRelatedJNI checks the two directions of the JNI bridge:
+// Kotlin method -> Rust overloads, and Rust JNI name -> Kotlin decls,
+// with arity + coarse-token narrowing and fail-open candidates.
+func TestResolveRelatedJNI(t *testing.T) {
+	defs := []relDef{
+		{Path: "Bridge.kt", Line: 4, Name: "send"},
+		{Path: "Bridge.kt", Line: 5, Name: "ping"},
+		{Path: "native.rs", Line: 1, Name: "Java_com_example_Bridge_send__I"},
+		{Path: "native.rs", Line: 2, Name: "Java_com_example_Bridge_send__Ljava_lang_String_2"},
+		{Path: "native.rs", Line: 3, Name: "Java_com_example_Bridge_ping"},
+	}
+	jni := []relJNIDecl{
+		{Path: "Bridge.kt", Line: 4, Name: "send", Base: "Java_com_example_Bridge_send", Arity: 1, Coarse: []string{"I"}},
+		{Path: "Bridge.kt", Line: 5, Name: "ping", Base: "Java_com_example_Bridge_ping", Arity: 0, Coarse: nil},
+	}
+	bridges := []relBridge{
+		{RustPath: "native.rs", RustLine: 1, RustName: "Java_com_example_Bridge_send__I", Kind: "jni"},
+		{RustPath: "native.rs", RustLine: 2, RustName: "Java_com_example_Bridge_send__Ljava_lang_String_2", Kind: "jni"},
+		{RustPath: "native.rs", RustLine: 3, RustName: "Java_com_example_Bridge_ping", Kind: "jni"},
+	}
+	files := map[string]bool{"Bridge.kt": true, "native.rs": true}
+
+	// Kotlin direction: one row per Rust overload for the base.
+	rows := resolveRelated("send", defs, nil, bridges, jni, files)
+	ffi := filterKind(rows, "ffi")
+	if len(ffi) != 2 {
+		t.Fatalf("related(send) ffi = %+v, want 2 overload rows", ffi)
+	}
+	if ffi[0].Path != "native.rs" || ffi[0].Line != 1 || ffi[1].Line != 2 {
+		t.Errorf("related(send) ffi rows wrong: %+v", ffi)
+	}
+	// Rust direction, overloaded query: arity + coarse narrow to one decl.
+	rows = resolveRelated("Java_com_example_Bridge_send__I", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 1 || ffi[0].Path != "Bridge.kt" || ffi[0].Line != 4 {
+		t.Errorf("related(send__I) ffi = %+v, want exactly the send decl at Bridge.kt:4", ffi)
+	}
+	// Rust direction, String overload: the same decl (its coarse is I,
+	// not the String token) must NOT match — arity is 1 either way, so
+	// the coarse token is what separates them.
+	rows = resolveRelated("Java_com_example_Bridge_send__Ljava_lang_String_2", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 0 {
+		t.Errorf("related(send__String) ffi = %+v, want none (no String decl)", ffi)
+	}
+	// Rust direction, short name: no signature to narrow with, so the
+	// decl appears (fail-open).
+	rows = resolveRelated("Java_com_example_Bridge_send", defs, nil, bridges, jni, files)
+	ffi = filterKind(rows, "ffi")
+	if len(ffi) != 1 || ffi[0].Path != "Bridge.kt" || ffi[0].Line != 4 {
+		t.Errorf("related(send short) ffi = %+v, want the send decl", ffi)
+	}
+	// Zero-arity: ping both ways.
+	rows = resolveRelated("ping", defs, nil, bridges, jni, files)
+	if ffi := filterKind(rows, "ffi"); len(ffi) != 1 || ffi[0].Line != 3 {
+		t.Errorf("related(ping) ffi = %+v, want the ping bridge at native.rs:3", ffi)
+	}
+	rows = resolveRelated("Java_com_example_Bridge_ping", defs, nil, bridges, jni, files)
+	if ffi := filterKind(rows, "ffi"); len(ffi) != 1 || ffi[0].Path != "Bridge.kt" || ffi[0].Line != 5 {
+		t.Errorf("related(ping rust) ffi = %+v, want the ping decl at Bridge.kt:5", ffi)
+	}
+	// A wasm bridge must not leak into JNI rows, and a JNI bridge must
+	// not leak into wasm rows.
+	wasmBridges := append(append([]relBridge{}, bridges...),
+		relBridge{RustPath: "lib.rs", RustLine: 9, RustName: "get_data", JSName: "getData", Kind: "wasm"})
+	rows = resolveRelated("getData", defs, nil, wasmBridges, jni, files)
+	if ffi := filterKind(rows, "ffi"); len(ffi) != 1 || ffi[0].Path != "lib.rs" {
+		t.Errorf("related(getData) ffi = %+v, want only the wasm bridge", ffi)
+	}
+	rows = resolveRelated("send", defs, nil, wasmBridges, jni, files)
+	if ffi := filterKind(rows, "ffi"); len(ffi) != 2 {
+		t.Errorf("related(send) with wasm bridge present = %+v, want still 2 jni rows", ffi)
+	}
+}
+
+func filterKind(rows []relEntry, kind string) []relEntry {
+	var out []relEntry
+	for _, r := range rows {
+		if r.Kind == kind {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestExtractRelatedKotlinJNIVararg locks the harness-found defect
+// (2026-11-21): `vararg` lives in a `parameter_modifiers` SIBLING of
+// the parameter node, not inside it — a vararg Int param must map to
+// the array token _3I, not I.
+func TestExtractRelatedKotlinJNIVararg(t *testing.T) {
+	text := "package com.example\n\n" +
+		"class Bridge {\n" +
+		"    external fun sum(vararg xs: Int): Int\n" +
+		"    external fun both(a: Int, vararg rest: String)\n" +
+		"}\n"
+	_, _, _, jni, ok := extractRelated("Bridge.kt", text)
+	if !ok {
+		t.Fatal("expected ok for valid Kotlin")
+	}
+	byName := map[string]relJNIDecl{}
+	for _, d := range jni {
+		byName[d.Name] = d
+	}
+	if d := byName["sum"]; d.Arity != 1 || len(d.Coarse) != 1 || d.Coarse[0] != "_3I" {
+		t.Errorf("sum decl = %+v, want arity 1 coarse [_3I]", d)
+	}
+	if d := byName["both"]; d.Arity != 2 || len(d.Coarse) != 2 || d.Coarse[0] != "I" || d.Coarse[1] != "_3Ljava_lang_String_2" {
+		t.Errorf("both decl = %+v, want arity 2 coarse [I _3Ljava_lang_String_2]", d)
 	}
 }

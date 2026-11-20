@@ -1,7 +1,9 @@
 // --related: cross-file symbol units. A fresh AST scan (like --callers,
 // no BM25 index) that answers "where does NAME really live": local
 // definitions, JS/TS re-export chains (export ... from, export * from,
-// local export {..} lists), and the Rust<->JS wasm_bindgen bridge.
+// local export {..} lists), Rust re-export chains (pub use, incl.
+// groups, aliases, globs, and crate::/self::/super:: module paths),
+// and the Rust<->JS wasm_bindgen bridge.
 //
 // Design notes (K14, 2026-10-26):
 //   - Export statements are captured whole ((export_statement) @stmt) and
@@ -27,7 +29,15 @@
 //     (classes, functions, objects, type aliases) plus top-level
 //     properties (vals outside any def range). No re-export edges
 //     (Kotlin has no re-export syntax) and no JNI bridge yet
-//     (external fun <-> Java_... is a later stage).
+//     (external fun <-> Java_... is a later stage, go14 P2).
+//   - Rust defs (go14, P1-B): the chunking def query (functions,
+//     trait signatures, structs, enums, traits, type aliases) plus
+//     top-level const/static (outside every def range, mirroring the
+//     JS top-level-var rule). impl_item defs are skipped: the def
+//     query names an impl by its type, which would duplicate the
+//     struct def. Rust re-exports are `pub use` declarations, parsed
+//     from text like JS export statements; resolveRustImport maps
+//     crate::/self::/super:: paths to files (mod.rs / <mod>.rs).
 
 package main
 
@@ -68,13 +78,33 @@ type relEdge struct {
 // relBridge is one #[wasm_bindgen] Rust function and the JS name it
 // generates. Class is "" for top-level functions, or the impl type for
 // methods (v2: an impl block with #[wasm_bindgen] bridges its methods
-// as JS class methods).
+// as JS class methods). Kind is "wasm" (default) or "jni" (go14, P2):
+// a JNI bridge is a Rust fn named Java_<pkg>_<Class>_<method> and its
+// JSName/Class are empty — the Kotlin side lives in relJNIDecl and is
+// matched at resolve time by base key, not stored here.
 type relBridge struct {
 	RustPath string
 	RustLine int
 	RustName string
 	JSName   string
 	Class    string
+	Kind     string // "wasm" or "jni"
+}
+
+// relJNIDecl is one Kotlin `external fun` declaration: the JNI base key
+// it maps to (Java_<pkg>_<Class>_<method>), its arity, and coarse type
+// tokens per parameter ("" = unknown/wildcard: a custom class, a
+// nullable, or anything the static indexer cannot know without a
+// classpath). The Rust side is a relBridge with Kind "jni"; resolve
+// matches decls to bridges by Base, then narrows by arity and coarse
+// tokens (Option 3, go14 P2).
+type relJNIDecl struct {
+	Path   string
+	Line   int
+	Name   string // the Kotlin method name (send)
+	Base   string // Java_com_example_Bridge_send
+	Arity  int
+	Coarse []string
 }
 
 // relEntry is one resolved output row.
@@ -158,6 +188,7 @@ var relRustQuery = `[
 	(attribute_item) @attr
 	(function_item name: (identifier) @name) @fn
 	(impl_item type: (_) @implType) @impl
+	(use_declaration) @use
 ]`
 
 func getRelExportSpec(ext string) (*callSpec, bool) {
@@ -183,6 +214,33 @@ func getRelRustSpec() (*callSpec, bool) {
 			return nil, false
 		}
 		q, err := gotreesitter.NewQuery(relRustQuery, lang)
+		if err != nil {
+			return nil, false
+		}
+		return &callSpec{lang: lang, query: q}, true
+	})
+}
+
+// relRustConstQuery captures top-level const/static items. The chunking
+// def query has no const/static patterns, so this runs as a second
+// cursor; extractRelatedRust keeps only items outside every def range
+// (a const inside a function or impl is a member/local, not a
+// top-level definition — the same range rule as the JS/Kotlin
+// top-level-var filters).
+var relRustConstQuery = `[
+	(const_item name: (identifier) @name) @def
+	(static_item name: (identifier) @name) @def
+]`
+
+var relRustConstSpecStore = newSpecStore[callSpec]()
+
+func getRelRustConstSpec() (*callSpec, bool) {
+	return relRustConstSpecStore.get("", func() (*callSpec, bool) {
+		lang := grammars.RustLanguage()
+		if lang == nil {
+			return nil, false
+		}
+		q, err := gotreesitter.NewQuery(relRustConstQuery, lang)
 		if err != nil {
 			return nil, false
 		}
@@ -295,17 +353,155 @@ func parseExportStmt(from, text string, line int) (relEdge, bool, relDef, bool) 
 	return relEdge{}, false, relDef{}, false
 }
 
+// parseRustUse parses one `use ...;` declaration's text into its
+// re-export edges. Private `use` (no pub) is an import, not a
+// re-export, and returns no edges. Text parsing (like parseExportStmt
+// for JS): the tree-sitter child shapes for use trees vary, but the
+// text form is stable. One statement can yield several edges (nested
+// groups re-export from different modules: `use a::{b::c, d};`).
+func parseRustUse(from, text string, line int) []relEdge {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "pub") {
+		return nil
+	}
+	rest := strings.TrimSpace(t[len("pub"):])
+	if strings.HasPrefix(rest, "(") {
+		end := strings.Index(rest, ")")
+		if end < 0 {
+			return nil
+		}
+		rest = strings.TrimSpace(rest[end+1:])
+	}
+	if !strings.HasPrefix(rest, "use") {
+		return nil
+	}
+	rest = strings.TrimSpace(rest[len("use"):])
+	rest = strings.TrimSpace(strings.TrimSuffix(rest, ";"))
+	if rest == "" {
+		return nil
+	}
+	var edges []relEdge
+	rustUseWalk(from, line, nil, splitUsePath(rest), &edges)
+	return edges
+}
+
+// splitUsePath splits a use path on :: at brace depth 0, so a group
+// {A, B} stays one segment. A leading :: (2015-style absolute path)
+// yields a leading empty segment, treated as crate:: by the resolver.
+func splitUsePath(p string) []string {
+	var segs []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 && i+1 < len(p) && p[i+1] == ':' {
+				segs = append(segs, strings.TrimSpace(p[start:i]))
+				i++
+				start = i + 1
+			}
+		}
+	}
+	segs = append(segs, strings.TrimSpace(p[start:]))
+	return segs
+}
+
+// splitUseGroup splits a group's comma list at brace depth 0, so a
+// nested group {b::{c, d}, e} splits into its two items, not four.
+func splitUseGroup(g string) []string {
+	var items []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(g); i++ {
+		switch g[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				items = append(items, strings.TrimSpace(g[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(g[start:]); tail != "" {
+		items = append(items, tail)
+	}
+	return items
+}
+
+// rustUseWalk expands one use path (already split into segments) into
+// edges, with prefix being the module path accumulated so far. A group
+// recurses per item; a glob yields a star edge; the final segment is a
+// Name, `Name as Alias`, or `self` (which re-exports the module
+// itself: `use a::self;` exports `a` from its parent).
+func rustUseWalk(from string, line int, prefix, segs []string, edges *[]relEdge) {
+	if len(segs) == 0 {
+		return
+	}
+	last := segs[len(segs)-1]
+	head := segs[:len(segs)-1]
+	if strings.HasPrefix(last, "{") && strings.HasSuffix(last, "}") {
+		np := append(append([]string{}, prefix...), head...)
+		for _, item := range splitUseGroup(last[1 : len(last)-1]) {
+			if item == "" {
+				continue
+			}
+			rustUseWalk(from, line, np, splitUsePath(item), edges)
+		}
+		return
+	}
+	if last == "*" {
+		np := append(append([]string{}, prefix...), head...)
+		*edges = append(*edges, relEdge{From: from, Line: line,
+			Target: strings.Join(np, "::"), Star: true})
+		return
+	}
+	name, alias := last, ""
+	if parts := strings.Split(last, " as "); len(parts) == 2 {
+		name, alias = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	if name == "self" {
+		np := append(append([]string{}, prefix...), head...)
+		if len(np) == 0 {
+			return
+		}
+		mod := np[len(np)-1]
+		*edges = append(*edges, relEdge{From: from, Line: line,
+			Target: strings.Join(np[:len(np)-1], "::"),
+			Names:  map[string]string{mod: mod}})
+		return
+	}
+	exported := alias
+	if exported == "" {
+		exported = name
+	}
+	np := append(append([]string{}, prefix...), head...)
+	*edges = append(*edges, relEdge{From: from, Line: line,
+		Target: strings.Join(np, "::"),
+		Names:  map[string]string{exported: name}})
+}
+
 // extractRelated parses one file and returns its defs, re-export edges
 // and bindgen bridges. ok=false when the extension is unsupported, the
 // file is too large, or parsing fails.
-func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, bool) {
+func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, []relJNIDecl, bool) {
 	ext := extOf(relPath)
 	if len(text) > maxASTBytes {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	norm := strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
 	if isGeneratedOrMinified(relPath, norm, maxLineLenOf(norm)) {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	src := []byte(norm)
 	li := newLineIndex(src)
@@ -318,7 +514,7 @@ func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, boo
 	if ext == ".kt" {
 		return extractRelatedKotlin(relPath, src, li)
 	}
-	return nil, nil, nil, false
+	return nil, nil, nil, nil, false
 }
 
 // extractRelatedKotlin returns Kotlin definitions (classes, functions,
@@ -326,16 +522,186 @@ func extractRelated(relPath, text string) ([]relDef, []relEdge, []relBridge, boo
 // properties (vals outside every def range). Kotlin has no re-export
 // syntax, so there are no edges; the Kotlin<->Rust JNI bridge
 // (external fun <-> Java_...) is a later stage, not v1.
-func extractRelatedKotlin(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, bool) {
+// --- Kotlin JNI declarations (go14, P2) ---
+//
+// An `external fun` inside a class/object/companion — or at top level
+// (whose class is the file facade <FileStem>Kt) — is implemented by a
+// Rust fn named Java_<pkg>_<Class>_<method>. The AST gives the package
+// (via a text regex — the package_header node has no capture-friendly
+// shape), the enclosing class chain, the arity, and the coarse type
+// tokens per parameter.
+
+// reKotlinPackage extracts the declared package from Kotlin source
+// text. A file without a package line has the default (empty) package.
+var reKotlinPackage = regexp.MustCompile(`(?m)^package\s+([\w.]+)`)
+
+// relKtJNIQuery captures every function declaration with its parameter
+// list; the external-modifier check is done on the node (modifiers are
+// not a capture target of the def query).
+var relKtJNIQuery = `[
+	(function_declaration (simple_identifier) @name (function_value_parameters) @params) @fn
+]`
+
+// relKtClassQuery captures enclosing declarations: a class or named
+// object (with @name) or a companion_object (no name — it inherits
+// <enclosing>$Companion as its JVM name).
+var relKtClassQuery = `[
+	(class_declaration (type_identifier) @name) @decl
+	(object_declaration (type_identifier) @name) @decl
+	(companion_object) @decl
+]`
+
+var (
+	relKtJNISpecStore   = newSpecStore[callSpec]()
+	relKtClassSpecStore = newSpecStore[callSpec]()
+)
+
+func getRelKtJNISpec() (*callSpec, bool) {
+	return relKtJNISpecStore.get(".kt", func() (*callSpec, bool) {
+		lang := grammars.KotlinLanguage()
+		if lang == nil {
+			return nil, false
+		}
+		q, err := gotreesitter.NewQuery(relKtJNIQuery, lang)
+		if err != nil {
+			return nil, false
+		}
+		return &callSpec{lang: lang, query: q}, true
+	})
+}
+
+func getRelKtClassSpec() (*callSpec, bool) {
+	return relKtClassSpecStore.get(".kt", func() (*callSpec, bool) {
+		lang := grammars.KotlinLanguage()
+		if lang == nil {
+			return nil, false
+		}
+		q, err := gotreesitter.NewQuery(relKtClassQuery, lang)
+		if err != nil {
+			return nil, false
+		}
+		return &callSpec{lang: lang, query: q}, true
+	})
+}
+
+// kotlinFnIsExternal reports whether a function_declaration node
+// carries the `external` modifier (the JNI marker). The modifiers
+// child holds function_modifier nodes; annotations live there too, so
+// the check is on the modifier text, not on a substring of the whole
+// node.
+func kotlinFnIsExternal(fn *gotreesitter.Node, lang *gotreesitter.Language, src []byte) bool {
+	for i := 0; i < fn.ChildCount(); i++ {
+		ch := fn.Child(i)
+		if ch == nil || ch.Type(lang) != "modifiers" {
+			continue
+		}
+		for j := 0; j < ch.NamedChildCount(); j++ {
+			mc := ch.NamedChild(j)
+			if mc != nil && mc.Type(lang) == "function_modifier" && string(src[mc.StartByte():mc.EndByte()]) == "external" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ktClassRange is one enclosing declaration for the JNI chain: a named
+// class/object, or an unnamed companion (name "" — it inherits
+// <enclosing>$Companion).
+type ktClassRange struct {
+	start, end uint32
+	name       string
+	companion  bool
+}
+
+// ktEnclosingChain returns the enclosing class/object names for a byte
+// offset, outermost-first. An unnamed companion contributes
+// "<enclosing>$Companion" (its JVM name); a chain that bottoms out at
+// an unnamed companion with no enclosing class returns nil (no
+// computable base — fail-closed).
+func ktEnclosingChain(classes []ktClassRange, at uint32) []string {
+	var enc []ktClassRange
+	for _, c := range classes {
+		if at >= c.start && at < c.end {
+			enc = append(enc, c)
+		}
+	}
+	if len(enc) == 0 {
+		return nil
+	}
+	// Innermost has the largest start; iterate outermost-first.
+	sort.Slice(enc, func(i, j int) bool { return enc[i].start > enc[j].start })
+	var chain []string
+	for i := len(enc) - 1; i >= 0; i-- {
+		c := enc[i]
+		if c.name != "" {
+			chain = append(chain, c.name)
+			continue
+		}
+		if len(chain) == 0 {
+			return nil
+		}
+		chain[len(chain)-1] += "$Companion"
+	}
+	return chain
+}
+
+// isIdentByte reports whether b can appear inside an identifier
+// (ASCII letter, digit, _, $ — the boundary set for hasWord).
+func isIdentByte(b byte) bool {
+	return b == '_' || b == '$' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// hasWord reports whether text contains word as a whole word (bounded
+// by non-identifier characters on both sides).
+func hasWord(text, word string) bool {
+	for i := 0; i+len(word) <= len(text); i++ {
+		if text[i:i+len(word)] != word {
+			continue
+		}
+		beforeOK := i == 0 || !isIdentByte(text[i-1])
+		afterOK := i+len(word) == len(text) || !isIdentByte(text[i+len(word)])
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
+}
+
+// kotlinParamCoarse maps one parameter node to its JNI coarse token:
+// the type's text through jniCoarseToken, "" when unknown. vararg is
+// passed in by the caller: in the grammar, `vararg` lives in a
+// `parameter_modifiers` node that is a SIBLING of the `parameter`
+// node inside `function_value_parameters`, not inside the parameter
+// itself — so the parameter's own text (`xs: Int`) can never show it.
+// A vararg parameter is an array parameter in the JVM signature.
+func kotlinParamCoarse(p *gotreesitter.Node, lang *gotreesitter.Language, src []byte, vararg bool) string {
+	var typeText string
+	for i := 0; i < p.NamedChildCount(); i++ {
+		ch := p.NamedChild(i)
+		if ch == nil {
+			continue
+		}
+		if strings.HasSuffix(ch.Type(lang), "_type") && typeText == "" {
+			typeText = string(src[ch.StartByte():ch.EndByte()])
+		}
+	}
+	if typeText == "" {
+		return ""
+	}
+	return jniCoarseToken(typeText, vararg)
+}
+
+func extractRelatedKotlin(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, []relJNIDecl, bool) {
 	ext := extOf(relPath)
 	spec, ok := getSpec(ext)
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	parser := gotreesitter.NewParser(spec.lang)
 	tree, err := parser.Parse(src)
 	if err != nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	// Definitions come from the shared helper (kotlin_fallback.go), so
 	// --related agrees with --defs-only on names, anchored lines, and
@@ -403,25 +769,127 @@ func extractRelatedKotlin(relPath string, src []byte, li lineIndex) ([]relDef, [
 		seen[k] = true
 		uniq = append(uniq, d)
 	}
-	return uniq, nil, nil, true
+	// JNI declarations (go14, P2): external funs and their base keys.
+	// Runs on the same parsed tree as the defs above — no second parse.
+	var jniDecls []relJNIDecl
+	pkg := ""
+	if m := reKotlinPackage.FindStringSubmatch(string(src)); m != nil {
+		pkg = m[1]
+	}
+	var classes []ktClassRange
+	if cs, ok := getRelKtClassSpec(); ok {
+		ccursor := cs.query.Exec(tree.RootNode(), cs.lang, src)
+		for {
+			m, ok := ccursor.NextMatch()
+			if !ok {
+				break
+			}
+			var sb, eb uint32
+			var name string
+			var isCompanion bool
+			found := false
+			for _, c := range m.Captures {
+				if c.Name == "decl" {
+					sb, eb = c.Node.StartByte(), c.Node.EndByte()
+					found = true
+					if c.Node.Type(cs.lang) == "companion_object" {
+						isCompanion = true
+					}
+				}
+				if c.Name == "name" {
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				}
+			}
+			if !found {
+				continue
+			}
+			classes = append(classes, ktClassRange{sb, eb, name, isCompanion})
+		}
+	}
+	if js, ok := getRelKtJNISpec(); ok {
+		jcursor := js.query.Exec(tree.RootNode(), js.lang, src)
+		for {
+			m, ok := jcursor.NextMatch()
+			if !ok {
+				break
+			}
+			var fnNode *gotreesitter.Node
+			var name string
+			var paramsNode *gotreesitter.Node
+			for _, c := range m.Captures {
+				switch c.Name {
+				case "fn":
+					fnNode = c.Node
+				case "name":
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				case "params":
+					paramsNode = c.Node
+				}
+			}
+			if fnNode == nil || name == "" || paramsNode == nil {
+				continue
+			}
+			if !kotlinFnIsExternal(fnNode, js.lang, src) {
+				continue
+			}
+			// Arity + coarse tokens from the parameter nodes. A
+			// `parameter_modifiers` sibling (e.g. `vararg`) applies to
+			// the NEXT parameter — it is not inside the parameter node.
+			var coarse []string
+			arity := 0
+			varargNext := false
+			for i := 0; i < paramsNode.NamedChildCount(); i++ {
+				ch := paramsNode.NamedChild(i)
+				if ch == nil {
+					continue
+				}
+				if ch.Type(js.lang) == "parameter_modifiers" {
+					varargNext = hasWord(string(src[ch.StartByte():ch.EndByte()]), "vararg")
+					continue
+				}
+				if ch.Type(js.lang) != "parameter" {
+					continue
+				}
+				arity++
+				coarse = append(coarse, kotlinParamCoarse(ch, js.lang, src, varargNext))
+				varargNext = false
+			}
+			// Enclosing class chain (outermost-first); a top-level
+			// external fun belongs to the file facade <FileStem>Kt.
+			chain := ktEnclosingChain(classes, fnNode.StartByte())
+			if chain == nil {
+				stem := strings.TrimSuffix(path.Base(relPath), ".kt")
+				chain = []string{stem + "Kt"}
+			}
+			anchor := fnNode.StartByte()
+			if a, ok := kotlinAnchorStart(fnNode, js.lang); ok {
+				anchor = a
+			}
+			jniDecls = append(jniDecls, relJNIDecl{
+				Path: relPath, Line: li.lineOf(anchor), Name: name,
+				Base: jniKotlinBase(pkg, chain, name), Arity: arity, Coarse: coarse,
+			})
+		}
+	}
+	return uniq, nil, nil, jniDecls, true
 }
 
-func extractRelatedJS(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, bool) {
+func extractRelatedJS(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, []relJNIDecl, bool) {
 	ext := extOf(relPath)
 	// Defs from the shared def query (functions, methods, classes,
 	// arrows, function expressions).
 	dq, ok := defQueryFor(ext)
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	eq, ok := getRelExportSpec(ext)
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	parser := gotreesitter.NewParser(eq.lang)
 	tree, err := parser.Parse(src)
 	if err != nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	var defs []relDef
 	var defRanges [][2]uint32
@@ -522,7 +990,7 @@ func extractRelatedJS(relPath string, src []byte, li lineIndex) ([]relDef, []rel
 		seen[k] = true
 		uniq = append(uniq, d)
 	}
-	return uniq, edges, nil, true
+	return uniq, edges, nil, nil, true
 }
 
 var reJSName = regexp.MustCompile(`js_name\s*=\s*"([^"]+)"`)
@@ -596,15 +1064,15 @@ func baseTypeName(t string) string {
 	return strings.TrimSpace(t)
 }
 
-func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, bool) {
+func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, []relJNIDecl, bool) {
 	spec, ok := getRelRustSpec()
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	parser := gotreesitter.NewParser(spec.lang)
 	tree, err := parser.Parse(src)
 	if err != nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	type fnRec struct {
 		start, end uint32
@@ -617,6 +1085,7 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 	var attrs [][2]uint32
 	var fns []fnRec
 	var impls []implRec
+	var useTexts [][2]uint32 // (start, end) of each use_declaration
 	cursor := spec.query.Exec(tree.RootNode(), spec.lang, src)
 	for {
 		m, ok := cursor.NextMatch()
@@ -628,6 +1097,7 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 		var implStart, implEnd uint32
 		var implType string
 		var attrStart, attrEnd uint32
+		var useStart, useEnd uint32
 		kind := ""
 		for _, c := range m.Captures {
 			switch c.Name {
@@ -644,6 +1114,9 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 			case "attr":
 				attrStart, attrEnd = c.Node.StartByte(), c.Node.EndByte()
 				kind = "attr"
+			case "use":
+				useStart, useEnd = c.Node.StartByte(), c.Node.EndByte()
+				kind = "use"
 			}
 		}
 		switch kind {
@@ -655,6 +1128,8 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 			impls = append(impls, implRec{start: implStart, end: implEnd, typeName: baseTypeName(implType)})
 		case "attr":
 			attrs = append(attrs, [2]uint32{attrStart, attrEnd})
+		case "use":
+			useTexts = append(useTexts, [2]uint32{useStart, useEnd})
 		}
 	}
 	sort.Slice(attrs, func(i, j int) bool { return attrs[i][0] < attrs[j][0] })
@@ -683,6 +1158,17 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 			continue
 		}
 		isBindgen, jsName := attrChainBindgen(src, attrs, fn.start)
+		// JNI (go14, P2): a top-level fn named Java_<pkg>_<Class>_<method>
+		// is a native implementation — the name IS the convention, no
+		// attribute needed. (A fn can in principle be both bindgen and
+		// JNI-named; both bridge rows are emitted, they never collide:
+		// the wasm section keys on JSName, the JNI section on Base.)
+		if strings.HasPrefix(fn.name, "Java_") {
+			bridges = append(bridges, relBridge{
+				RustPath: relPath, RustLine: li.lineOf(fn.start),
+				RustName: fn.name, Kind: "jni",
+			})
+		}
 		if !isBindgen {
 			continue
 		}
@@ -694,7 +1180,104 @@ func extractRelatedRust(relPath string, src []byte, li lineIndex) ([]relDef, []r
 			RustName: fn.name, JSName: jsName,
 		})
 	}
-	return nil, nil, bridges, true
+	// Definitions: the chunking def query (functions, trait
+	// signatures, structs, enums, traits, type aliases), minus
+	// impl_item defs — the query names an impl by its type, which
+	// would duplicate the struct def at a different line. The ranges
+	// of ALL def nodes (impl ranges included) feed the const/static
+	// filter below, so an associated const inside an impl still
+	// counts as a member, not a top-level definition.
+	var defs []relDef
+	var defRanges [][2]uint32
+	if dq, ok := defQueryFor(".rs"); ok {
+		dcursor := dq.Exec(tree.RootNode(), spec.lang, src)
+		for {
+			m, ok := dcursor.NextMatch()
+			if !ok {
+				break
+			}
+			var sb, eb uint32
+			var name string
+			var isImpl bool
+			found := false
+			for _, c := range m.Captures {
+				if c.Name == "def" {
+					sb, eb = c.Node.StartByte(), c.Node.EndByte()
+					found = true
+					if c.Node.Type(spec.lang) == "impl_item" {
+						isImpl = true
+					}
+				}
+				if c.Name == "name" {
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				}
+			}
+			if !found {
+				continue
+			}
+			defRanges = append(defRanges, [2]uint32{sb, eb})
+			if isImpl || name == "" {
+				continue
+			}
+			defs = append(defs, relDef{Path: relPath, Line: li.lineOf(sb), Name: name})
+		}
+	}
+	// Top-level const/static: items outside every def range.
+	if cs, ok := getRelRustConstSpec(); ok {
+		ccursor := cs.query.Exec(tree.RootNode(), spec.lang, src)
+		for {
+			m, ok := ccursor.NextMatch()
+			if !ok {
+				break
+			}
+			var sb uint32
+			var name string
+			found := false
+			for _, c := range m.Captures {
+				if c.Name == "def" {
+					sb = c.Node.StartByte()
+					found = true
+				}
+				if c.Name == "name" {
+					name = string(src[c.Node.StartByte():c.Node.EndByte()])
+				}
+			}
+			if !found || name == "" {
+				continue
+			}
+			inside := false
+			for _, r := range defRanges {
+				if sb >= r[0] && sb < r[1] {
+					inside = true
+					break
+				}
+			}
+			if inside {
+				continue
+			}
+			defs = append(defs, relDef{Path: relPath, Line: li.lineOf(sb), Name: name})
+		}
+	}
+	// Re-export edges: `pub use` declarations, parsed from text.
+	var edges []relEdge
+	for _, u := range useTexts {
+		edges = append(edges, parseRustUse(relPath, string(src[u[0]:u[1]]), li.lineOf(u[0]))...)
+	}
+	// Dedup: a def can arrive twice (e.g. a function_item matched by
+	// both the def query and the fn capture is only emitted once —
+	// defs come from one cursor — but a const named like a fn would
+	// still collide on path:line:name).
+	seen := map[string]bool{}
+	uniq := defs[:0]
+	for _, d := range defs {
+		k := fmt.Sprintf("%s:%d:%s", d.Path, d.Line, d.Name)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		uniq = append(uniq, d)
+	}
+	return uniq, edges, bridges, nil, true
 }
 
 // --- case conversion (heck-compatible for common names) ---
@@ -764,6 +1347,186 @@ func toSnake(s string) string {
 	return strings.Join(words, "_")
 }
 
+// --- JNI bridge (go14, P2: Option 3, Base-Key Grouping) ---
+//
+// The JNI name mangling is per the JNI spec (docs.oracle.com, "Design
+// Overview"): a native function is named
+// Java_<pkg>_<Class>_<method>[__<mangled signature>], with _ -> _1,
+// / -> _, ; -> _2, [ -> _3, and any other non-alphanumeric rune ->
+// _0wxyz (lowercase hex). Because _ escapes to _1, the literal sequence
+// __ never occurs inside the Java_<pkg>_<Class>_<method> prefix —
+// splitting on the FIRST __ is exact, and the long (overloaded) form
+// carries the full argument signature after it.
+
+// jniEscape escapes one JNI name segment (a package segment, a class
+// name, or a method name) per the spec. Alphanumerics are unchanged;
+// _ -> _1, $ -> _00024 (inner-class separator); any other rune ->
+// _0xxxx. The / -> _ rule never applies here: package separators are
+// handled by joining escaped segments with _.
+func jniEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '_':
+			b.WriteString("_1")
+		case r == '$':
+			b.WriteString("_00024")
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			fmt.Fprintf(&b, "_0%04x", r)
+		}
+	}
+	return b.String()
+}
+
+// jniKotlinBase builds the JNI base key for a Kotlin external fun:
+// Java_<escaped pkg segments joined by _>_<escaped class chain>_<escaped
+// method>. classChain is outermost-first (["Bridge"] or
+// ["Outer", "Inner"]); the chain is joined with $ (the JVM binary
+// name) before escaping, so Outer$Inner becomes Outer_00024Inner. An
+// empty chain means top-level — the caller supplies the file facade
+// <FileStem>Kt as the single element.
+func jniKotlinBase(pkg string, classChain []string, method string) string {
+	var parts []string
+	if pkg != "" {
+		for _, seg := range strings.Split(pkg, ".") {
+			parts = append(parts, jniEscape(seg))
+		}
+	}
+	parts = append(parts, jniEscape(strings.Join(classChain, "$")))
+	parts = append(parts, jniEscape(method))
+	return "Java_" + strings.Join(parts, "_")
+}
+
+// parseJNIRustName splits a Rust JNI function name on the FIRST __
+// (the overload separator). Returns the base, the parsed signature
+// tokens (nil for a short name), and whether the name is an overloaded
+// (long) name. ok=false when the name is not a JNI name or its
+// signature is malformed — the caller treats that as "not a JNI
+// bridge" and skips it (fail-closed for matching, silent for indexing).
+func parseJNIRustName(name string) (base string, tokens []string, overloaded, ok bool) {
+	if !strings.HasPrefix(name, "Java_") {
+		return "", nil, false, false
+	}
+	base, raw, cut := strings.Cut(name, "__")
+	if !cut {
+		return name, nil, false, true
+	}
+	tokens, ok = parseJNISig(raw)
+	if !ok {
+		return "", nil, false, false
+	}
+	return base, tokens, true, true
+}
+
+// parseJNISig parses a mangled JNI argument signature (after __) into
+// one token per parameter. Exact, no classpath: _3 prefixes
+// (repeatable) are array dimensions, primitives (B C D F I J S Z) are
+// one token each, objects run L..._2. Returns ok=false on malformed
+// input (dangling array prefix, unterminated object, unknown letter).
+// An empty signature parses to zero tokens (a zero-arity function).
+func parseJNISig(sig string) ([]string, bool) {
+	var tokens []string
+	for len(sig) > 0 {
+		rest := sig
+		for strings.HasPrefix(sig, "_3") {
+			sig = sig[2:]
+		}
+		if len(sig) == 0 {
+			return nil, false // dangling array prefix
+		}
+		switch sig[0] {
+		case 'B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z':
+			sig = sig[1:]
+		case 'L':
+			end := strings.Index(sig, "_2")
+			if end < 0 {
+				return nil, false
+			}
+			sig = sig[end+2:]
+		default:
+			return nil, false
+		}
+		tokens = append(tokens, rest[:len(rest)-len(sig)])
+	}
+	return tokens, true
+}
+
+// jniCoarseToken maps a Kotlin parameter type to its JNI signature
+// token when that mapping is certain without a classpath, else "".
+// Primitives map 1:1; String and primitive arrays have fixed JVM
+// forms; nullable types, generics, and custom classes are wildcards
+// ("" — the JVM type of Int? is Ljava/lang/Integer;, of Map<..> is
+// Ljava/util/Map;, neither knowable from the source text alone). A
+// vararg parameter is an array parameter in the JVM signature.
+func jniCoarseToken(kotlinType string, vararg bool) string {
+	t := strings.TrimSpace(kotlinType)
+	if strings.HasSuffix(t, "?") {
+		return "" // nullable: boxed — classpath knowledge
+	}
+	var tok string
+	switch t {
+	case "Byte":
+		tok = "B"
+	case "Char":
+		tok = "C"
+	case "Double":
+		tok = "D"
+	case "Float":
+		tok = "F"
+	case "Int":
+		tok = "I"
+	case "Long":
+		tok = "J"
+	case "Short":
+		tok = "S"
+	case "Boolean":
+		tok = "Z"
+	case "String":
+		tok = "Ljava_lang_String_2"
+	case "ByteArray":
+		tok = "_3B"
+	case "CharArray":
+		tok = "_3C"
+	case "DoubleArray":
+		tok = "_3D"
+	case "FloatArray":
+		tok = "_3F"
+	case "IntArray":
+		tok = "_3I"
+	case "LongArray":
+		tok = "_3J"
+	case "ShortArray":
+		tok = "_3S"
+	case "BooleanArray":
+		tok = "_3Z"
+	default:
+		return ""
+	}
+	if vararg {
+		return "_3" + tok
+	}
+	return tok
+}
+
+// jniCoarseCompatible reports whether a Kotlin decl's coarse tokens
+// are compatible with a Rust JNI signature's tokens: same length, and
+// every non-wildcard ("") Kotlin token equals the Rust token at the
+// same position. A wildcard never vetoes — the source text cannot
+// prove that parameter's JVM type.
+func jniCoarseCompatible(coarse, rustTokens []string) bool {
+	if len(coarse) != len(rustTokens) {
+		return false
+	}
+	for i := range coarse {
+		if coarse[i] != "" && coarse[i] != rustTokens[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // --- import resolution ---
 
 var relImportExts = []string{".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx"}
@@ -792,6 +1555,75 @@ func resolveImport(fromFile, spec string, files map[string]bool) string {
 	return ""
 }
 
+// resolveRustImport maps a Rust module path written in fromFile to an
+// indexed file path, or "" when it cannot be resolved. Segments:
+// crate:: (crate root), self:: (current module), super:: (parent
+// module, repeatable), a leading :: (crate root, 2015 style), or a
+// plain path (relative to the current module, like self::). The file
+// is <dir>/<segs>.rs or <dir>/<segs>/mod.rs.
+func resolveRustImport(fromFile, spec string, files map[string]bool) string {
+	segs := splitUsePath(spec)
+	if len(segs) == 0 {
+		return ""
+	}
+	var base string
+	rest := segs
+	switch segs[0] {
+	case "", "crate":
+		base = rustCrateRootDir(fromFile, files)
+		rest = segs[1:]
+	case "self":
+		base = rustModuleDir(fromFile)
+		rest = segs[1:]
+	case "super":
+		base = rustModuleDir(fromFile)
+		for len(rest) > 0 && rest[0] == "super" {
+			base = path.Dir(base)
+			rest = rest[1:]
+		}
+	default:
+		base = rustModuleDir(fromFile)
+	}
+	if len(rest) == 0 {
+		return ""
+	}
+	if f := path.Join(base, strings.Join(rest, "/")+".rs"); files[f] {
+		return f
+	}
+	if f := path.Join(base, strings.Join(rest, "/"), "mod.rs"); files[f] {
+		return f
+	}
+	return ""
+}
+
+// rustModuleDir is the directory holding fromFile's child modules: the
+// file's own directory for mod.rs/lib.rs/main.rs (the module IS that
+// directory), else dir/<stem> (foo.rs -> foo/).
+func rustModuleDir(file string) string {
+	base := path.Base(file)
+	if base == "mod.rs" || base == "lib.rs" || base == "main.rs" {
+		return path.Dir(file)
+	}
+	return path.Join(path.Dir(file), strings.TrimSuffix(base, ".rs"))
+}
+
+// rustCrateRootDir finds the crate root directory for fromFile: the
+// nearest ancestor directory containing lib.rs or main.rs in the
+// index, else fromFile's own directory (a flat single-file crate).
+func rustCrateRootDir(fromFile string, files map[string]bool) string {
+	dir := path.Dir(fromFile)
+	for {
+		if files[path.Join(dir, "lib.rs")] || files[path.Join(dir, "main.rs")] {
+			return dir
+		}
+		parent := path.Dir(dir)
+		if parent == dir {
+			return path.Dir(fromFile)
+		}
+		dir = parent
+	}
+}
+
 // --- resolution ---
 
 // relIndex pre-indexes definitions, re-export edges, FFI bridges, and live
@@ -801,6 +1633,7 @@ type relIndex struct {
 	defs       []relDef
 	edges      []relEdge
 	bridges    []relBridge
+	jni        []relJNIDecl
 	files      map[string]bool
 	defByName  map[string][]relDef
 	defByFile  map[string][]relDef
@@ -810,21 +1643,31 @@ type relIndex struct {
 	liveBase   map[string]bool
 	byRustName map[string][]relBridge
 	byJSName   map[string][]relBridge
+	// JNI (go14, P2): decls by base key and by method name; bridges
+	// (Kind "jni") by base key. The base is the join key between the
+	// Kotlin decl and the Rust fn.
+	jniByBase       map[string][]relJNIDecl
+	jniByName       map[string][]relJNIDecl
+	jniBridgeByBase map[string][]relBridge
 }
 
-func newRelIndex(defs []relDef, edges []relEdge, bridges []relBridge, files map[string]bool) *relIndex {
+func newRelIndex(defs []relDef, edges []relEdge, bridges []relBridge, jni []relJNIDecl, files map[string]bool) *relIndex {
 	ri := &relIndex{
-		defs:       defs,
-		edges:      edges,
-		bridges:    bridges,
-		files:      files,
-		defByName:  make(map[string][]relDef, len(defs)),
-		defByFile:  make(map[string][]relDef),
-		edgesByExp: make(map[string][]relEdge),
-		edgesBySrc: make(map[string][]relEdge),
-		liveBase:   make(map[string]bool, len(defs)),
-		byRustName: make(map[string][]relBridge, len(bridges)),
-		byJSName:   make(map[string][]relBridge, len(bridges)),
+		defs:            defs,
+		edges:           edges,
+		bridges:         bridges,
+		jni:             jni,
+		files:           files,
+		defByName:       make(map[string][]relDef, len(defs)),
+		defByFile:       make(map[string][]relDef),
+		edgesByExp:      make(map[string][]relEdge),
+		edgesBySrc:      make(map[string][]relEdge),
+		liveBase:        make(map[string]bool, len(defs)),
+		byRustName:      make(map[string][]relBridge, len(bridges)),
+		byJSName:        make(map[string][]relBridge, len(bridges)),
+		jniByBase:       make(map[string][]relJNIDecl, len(jni)),
+		jniByName:       make(map[string][]relJNIDecl, len(jni)),
+		jniBridgeByBase: make(map[string][]relBridge),
 	}
 	for _, d := range defs {
 		ri.defByName[d.Name] = append(ri.defByName[d.Name], d)
@@ -846,6 +1689,15 @@ func newRelIndex(defs []relDef, edges []relEdge, bridges []relBridge, files map[
 		if b.JSName != "" {
 			ri.byJSName[b.JSName] = append(ri.byJSName[b.JSName], b)
 		}
+		if b.Kind == "jni" {
+			if base, _, _, ok := parseJNIRustName(b.RustName); ok {
+				ri.jniBridgeByBase[base] = append(ri.jniBridgeByBase[base], b)
+			}
+		}
+	}
+	for _, d := range jni {
+		ri.jniByBase[d.Base] = append(ri.jniByBase[d.Base], d)
+		ri.jniByName[d.Name] = append(ri.jniByName[d.Name], d)
 	}
 	return ri
 }
@@ -861,8 +1713,8 @@ func (ri *relIndex) findDef(file, name string) (relDef, bool) {
 
 // resolveRelated computes every row for query: local defs, the full
 // re-export chain (cycle-safe), and the wasm_bindgen bridge if any.
-func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relBridge, files map[string]bool) []relEntry {
-	return newRelIndex(defs, edges, bridges, files).resolve(query)
+func resolveRelated(query string, defs []relDef, edges []relEdge, bridges []relBridge, jni []relJNIDecl, files map[string]bool) []relEntry {
+	return newRelIndex(defs, edges, bridges, jni, files).resolve(query)
 }
 
 func (ri *relIndex) resolve(query string) []relEntry {
@@ -932,7 +1784,13 @@ func (ri *relIndex) resolve(query string) []relEntry {
 			}
 			target := e.From
 			if e.Target != "" {
-				target = resolveImport(e.From, e.Target, ri.files)
+				// Rust edges carry module paths (crate::/self::/super::),
+				// JS edges carry relative specifiers: different resolvers.
+				if extOf(e.From) == ".rs" {
+					target = resolveRustImport(e.From, e.Target, ri.files)
+				} else {
+					target = resolveImport(e.From, e.Target, ri.files)
+				}
 			}
 			if target == "" {
 				traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
@@ -1035,6 +1893,9 @@ func (ri *relIndex) resolve(query string) []relEntry {
 		camelName := toCamel(query)
 		if len(ri.byRustName[rustName]) > 0 || len(ri.byJSName[query]) > 0 || len(ri.byJSName[camelName]) > 0 {
 			for _, b := range ri.bridges {
+				if b.Kind == "jni" {
+					continue // JNI bridges are matched below, by base key
+				}
 				if b.RustName != rustName && b.JSName != query && b.JSName != camelName {
 					continue
 				}
@@ -1052,6 +1913,73 @@ func (ri *relIndex) resolve(query string) []relEntry {
 					detail += " (js def not in repo: generated binding)"
 				}
 				add(relEntry{Path: b.RustPath, Line: b.RustLine, Kind: "ffi", Detail: detail})
+			}
+		}
+	}
+	// JNI bridge (go14, P2 — Option 3, Base-Key Grouping): a Rust
+	// Java_<pkg>_<Class>_<method> fn implements a Kotlin external fun
+	// of the same base key. Two directions:
+	//   - Rust query (a full JNI name): the Kotlin decls for the base,
+	//     narrowed by the signature's arity and coarse tokens when the
+	//     query carries one; survivors that still collide are shown as
+	//     overload candidates, never dropped (fail-open).
+	//   - Kotlin query (a method name): every Rust overload for each
+	//     decl's base, one row per Rust fn. A bridge shared by several
+	//     overload decls is emitted once.
+	if len(ri.jniByBase) > 0 || len(ri.jniBridgeByBase) > 0 {
+		if qBase, qTokens, qOverloaded, qIsJNI := parseJNIRustName(query); qIsJNI {
+			decls := ri.jniByBase[qBase]
+			if qOverloaded {
+				var f []relJNIDecl
+				for _, d := range decls {
+					if d.Arity == len(qTokens) && jniCoarseCompatible(d.Coarse, qTokens) {
+						f = append(f, d)
+					}
+				}
+				decls = f
+			}
+			ambiguous := len(decls) > 1
+			for _, d := range decls {
+				// The Rust fn this decl implements: the bridge for the
+				// base whose arity matches the decl (a short-name bridge
+				// carries no signature, so it matches any arity).
+				rustName := qBase
+				var matches []relBridge
+				for _, b := range ri.jniBridgeByBase[qBase] {
+					if _, toks, over, ok := parseJNIRustName(b.RustName); ok {
+						if !over || len(toks) == d.Arity {
+							matches = append(matches, b)
+						}
+					}
+				}
+				if len(matches) == 1 {
+					rustName = matches[0].RustName
+				}
+				detail := fmt.Sprintf("jni external fun %s (%d params) implements %s", d.Name, d.Arity, rustName)
+				if ambiguous {
+					detail += " (overload candidate)"
+				}
+				add(relEntry{Path: d.Path, Line: d.Line, Kind: "ffi", Detail: detail})
+			}
+		} else if decls := ri.jniByName[want]; len(decls) > 0 {
+			seenBridge := map[string]bool{}
+			for _, d := range decls {
+				bridges := ri.jniBridgeByBase[d.Base]
+				overloads := len(ri.jniByBase[d.Base])
+				for _, b := range bridges {
+					k := b.RustPath + "\x00" + b.RustName
+					if seenBridge[k] {
+						continue
+					}
+					seenBridge[k] = true
+					detail := fmt.Sprintf("jni %s implements external fun %s", b.RustName, d.Name)
+					if overloads == 1 {
+						detail += fmt.Sprintf(" (%s:%d)", d.Path, d.Line)
+					} else {
+						detail += fmt.Sprintf(" (%d overloads)", overloads)
+					}
+					add(relEntry{Path: b.RustPath, Line: b.RustLine, Kind: "ffi", Detail: detail})
+				}
 			}
 		}
 	}
@@ -1083,6 +2011,7 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 	var defs []relDef
 	var edges []relEdge
 	var bridges []relBridge
+	var jni []relJNIDecl
 	if o.cached {
 		ix, err := loadCachedIndex(o, root, cfg)
 		if err != nil {
@@ -1096,6 +2025,7 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 		defs = ix.relDefs
 		edges = ix.relEdges
 		bridges = ix.relBridges
+		jni = ix.relJNI
 	} else {
 		files := iterFiles(root, cfg)
 		fileSet = map[string]bool{}
@@ -1133,9 +2063,10 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 			var d []relDef
 			var e []relEdge
 			var b []relBridge
+			var j []relJNIDecl
 			var ok bool
 			if !runTimed(astTimeout, func() {
-				d, e, b, ok = extractRelated(rel, fr.text)
+				d, e, b, j, ok = extractRelated(rel, fr.text)
 			}) {
 				timedOut++
 				continue
@@ -1148,12 +2079,13 @@ func runRelated(o options, root string, cfg *ScanConfig) int {
 			defs = append(defs, d...)
 			edges = append(edges, e...)
 			bridges = append(bridges, b...)
+			jni = append(jni, j...)
 		}
 		skipped := unsupported + astOversize + parseFail + timedOut + sourceSkip + unreadable
 		fmt.Fprintf(os.Stderr, "(related: parsed %d files, skipped %d (unsupported %d, ast-oversize %d, parse-fail %d, timeout %d, source-skip %d, unreadable %d) in %s)\n",
 			parsed, skipped, unsupported, astOversize, parseFail, timedOut, sourceSkip, unreadable, time.Since(t0).Round(time.Millisecond))
 	}
-	ri := newRelIndex(defs, edges, bridges, fileSet)
+	ri := newRelIndex(defs, edges, bridges, jni, fileSet)
 	entries := []relEntry{}
 	for _, name := range names {
 		entries = append(entries, ri.resolve(name)...)

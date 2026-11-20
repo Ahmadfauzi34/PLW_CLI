@@ -31,8 +31,8 @@ func TestVersionLine(t *testing.T) {
 
 	buildCommit, buildDate = "unknown", "unknown"
 	line := versionLine()
-	if !strings.Contains(line, "schema=go13") {
-		t.Errorf("versionLine default = %q, want schema=go13", line)
+	if !strings.Contains(line, "schema=go14") {
+		t.Errorf("versionLine default = %q, want schema=go14", line)
 	}
 	if !strings.Contains(line, "commit=unknown") || !strings.Contains(line, "built=unknown") {
 		t.Errorf("versionLine default = %q, want commit=unknown built=unknown", line)

@@ -26,17 +26,23 @@ import (
 //  1. kotlinAnchorStart: for definitions the parser DID produce,
 //     move the span start from the annotation line to the mods/kw
 //     anchor by walking the def node's `modifiers` child.
-//  2. kotlinRegexDefinitions: for files whose parse is damaged
-//     (HasError) or yields no definitions, recover definitions with
-//     a line-anchored regex mirroring the Python calibration, and
-//     merge them with whatever the AST found (AST defs are never
-//     dropped).
+//  2. kotlinRegexDefinitions: regex definitions are ALWAYS merged in
+//     (P1-C, go14), not only when the parse is damaged or yields
+//     nothing. A file can parse cleanly (HasError false) and still
+//     miss declarations: `@Composable internal fun Target() {}` degrades
+//     to a trailing-lambda call — a syntactically valid call
+//     expression, so the tree carries no error and the AST yields the
+//     file's other defs. The merge dedups on (name, startLine) with
+//     AST defs winning, so healthy files gain nothing spurious; the
+//     regex only fills gaps the AST left.
 //
 // Known limits of the regex path (fail-open, documented, not silent):
-//   - An annotation whose arguments contain nested parentheses on the
-//     SAME line as the modifiers (`@Foo(bar(baz)) internal fun`) is
-//     not consumed, so that one declaration is missed when it shares
-//     the line; on its own line it is still found via the mods line.
+//   - An annotation whose arguments nest parentheses TWO levels deep
+//     on the SAME line as the modifiers (`@Foo(bar(baz(qux))) internal
+//     fun`) is not consumed, so that one declaration is missed when it
+//     shares the line; one level (`@Suppress(names = arrayOf("UNUSED"))`)
+//     is supported since go14 (P1-C). On its own line an annotation is
+//     still found via the mods line either way.
 //   - A class supertype on its own line (`class Foo\n : Bar {`)
 //     ends the header early: the def is found with the right anchor
 //     but its body is not attached.
@@ -193,7 +199,7 @@ func stripKotlinCode(src []byte) []byte {
 // function correctly, so with `*` the regex def dedups against it.
 // The Python calibration still has the one-segment form; fixing it
 // there is adapter/topology scope, not this engine change.
-var kotlinDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:@[\w.]+(?:\([^)]*\))?[ \t]+)*(?P<mods>(?:(?:public|internal|private|protected|open|abstract|data|sealed|final|expect|actual|inline|value|external|override|crossinline|noinline|tailrec|suspend|operator|infix|lateinit|const|companion|annotation)[ \t]+)*)(?P<kw>class|interface|object|fun|typealias|enum)(?:[ \t]+(?:class|interface))?[ \t]+(?:<[^>]*>[ \t]+)?(?:[\w]+(?:<[^>]*>)?\??\.)*(?P<name>[A-Za-z_][\w]*)`)
+var kotlinDeclRe = regexp.MustCompile(`(?m)^[ \t]*(?:@[\w.]+(?:\((?:[^()]|\([^()]*\))*\))?[ \t]+)*(?P<mods>(?:(?:public|internal|private|protected|open|abstract|data|sealed|final|expect|actual|inline|value|external|override|crossinline|noinline|tailrec|suspend|operator|infix|lateinit|const|companion|annotation)[ \t]+)*)(?P<kw>class|interface|object|fun|typealias|enum)(?:[ \t]+(?:class|interface))?[ \t]+(?:<[^>]*>[ \t]+)?(?:[\w]+(?:<[^>]*>)?\??\.)*(?P<name>[A-Za-z_][\w]*)`)
 
 // kotlinDeclEnd computes (endLine, sigEnd, endByte) for a declaration whose
 // regex match ends at matchEnd in cleaned text. A `{` at header depth
@@ -340,11 +346,12 @@ func mergeKotlinRegexDefs(astDefs, regexDefs []definition) []definition {
 // AST definitions come from query (ktDefQuery: @def/@name/@body captures),
 // anchored on the declaration itself via kotlinAnchorStart (first
 // non-annotation modifier, else the keyword — the Python calibration
-// rule). When the parse is damaged (HasError) or yields nothing, regex
-// definitions are merged in; AST defs are never dropped. Returned defs
-// are sorted by (startLine, endLine, name); byte spans are populated
-// for both paths (regex defs via the anchor byte and kotlinDeclEnd's
-// endByte), so byte-range filters work identically on either path.
+// rule). Regex definitions are merged in unconditionally (P1-C, go14:
+// a clean parse can still miss declarations — see the header note);
+// AST defs are never dropped. Returned defs are sorted by (startLine,
+// endLine, name); byte spans are populated for both paths (regex defs
+// via the anchor byte and kotlinDeclEnd's endByte), so byte-range
+// filters work identically on either path.
 func kotlinASTAndFallbackDefs(tree *gotreesitter.Tree, lang *gotreesitter.Language, query *gotreesitter.Query, src []byte, lineOf func(uint32) int) []definition {
 	cursor := query.Exec(tree.RootNode(), lang, src)
 	var defs []definition
@@ -393,10 +400,8 @@ func kotlinASTAndFallbackDefs(tree *gotreesitter.Tree, lang *gotreesitter.Langua
 		}
 		defs = append(defs, d)
 	}
-	if tree.RootNode().HasError() || len(defs) == 0 {
-		if rd := kotlinRegexDefinitions(string(src), lineOf); len(rd) > 0 {
-			defs = mergeKotlinRegexDefs(defs, rd)
-		}
+	if rd := kotlinRegexDefinitions(string(src), lineOf); len(rd) > 0 {
+		defs = mergeKotlinRegexDefs(defs, rd)
 	}
 	sort.Slice(defs, func(i, j int) bool {
 		if defs[i].startLine != defs[j].startLine {

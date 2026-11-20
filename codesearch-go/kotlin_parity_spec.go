@@ -64,7 +64,7 @@ type KotlinParityOut struct {
 // STEP 1: Subjek — related + calls untuk satu file .kt.
 func KotlinParitySubject(in string) (KotlinParityOut, error) {
 	rel := []ParityDefSpan{}
-	if defs, _, _, ok := extractRelated("x.kt", in); ok {
+	if defs, _, _, _, ok := extractRelated("x.kt", in); ok {
 		for _, d := range defs {
 			rel = append(rel, ParityDefSpan{Name: d.Name, StartLine: d.Line})
 		}
