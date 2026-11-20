@@ -2191,5 +2191,235 @@ class ArchitectureBaselineTests(unittest.TestCase):
         imp_a = query_impact(sl_g, "a.ts")
         self.assertEqual(imp_a["cycle_break_advisory"]["total_cycles"], 1)
 
+    def test_calibration_kotlin_android_and_rust_v19(self) -> None:
+        """Regression suite for Kotlin Android and Rust graph, cycle-break, outline, mermaid, and topology calibration."""
+        import tempfile
+        import plw_cli
+        from codebase.cycle_break import _suggest_leaf_module, compute_cycle_break_advisory
+        from codebase.topology_analyzers import analyze_circular, query_outline
+        from core.portable_agent import dynamic_context
+        from core.shared_graph import build_shared_graph
+        from core.target_topology import _external_package, build_target_topology_orientation
+        from language_semantics import rust_module_path_of
+
+        tmp_ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_ctx.cleanup)
+        repo = Path(tmp_ctx.name) / "poly_cal_repo"
+        repo.mkdir(parents=True, exist_ok=True)
+
+        # 1. Rust crate layout with nested src/rpc/tests/{mod,protocol}.rs, pub use, private super::, inline mod tests
+        (repo / "Cargo.toml").write_text('[package]\nname = "cal-demo"\nversion = "0.1.0"\n', encoding="utf-8")
+        (repo / "src" / "config").mkdir(parents=True)
+        (repo / "src" / "rpc" / "tests").mkdir(parents=True)
+        (repo / "tests").mkdir(parents=True)
+
+        (repo / "src" / "lib.rs").write_text(
+            "pub mod config;\npub mod fs;\npub mod rpc;\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "fs.rs").write_text(
+            "pub fn read_cfg() {}\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    use super::*;\n"
+            "    #[test]\n"
+            "    fn it_works() { read_cfg(); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "config" / "catalog.rs").write_text(
+            "pub struct ModelCatalog;\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "config" / "helper.rs").write_text(
+            "pub struct LocalOnly;\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "config" / "mod.rs").write_text(
+            "pub mod catalog;\n"
+            "mod helper;\n"
+            "pub use catalog::ModelCatalog;\n"
+            "use helper::LocalOnly;\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "config" / "sub.rs").write_text(
+            "use super::LocalOnly;\n"
+            "pub fn use_local(_v: LocalOnly) {}\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "rpc" / "runtime.rs").write_text(
+            "use serde_json::Value;\n"
+            "pub struct RpcRuntime { pub v: Option<Value> }\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "rpc" / "mod.rs").write_text(
+            "pub mod runtime;\n"
+            "#[cfg(test)]\n"
+            "mod tests;\n"
+            "use crate::config::ModelCatalog;\n"
+            "use crate::config::LocalOnly;\n"
+            "use crate::config::DoesNotExist;\n"
+            "pub fn boot(_c: ModelCatalog, _l: LocalOnly, _d: DoesNotExist) {}\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "rpc" / "tests" / "mod.rs").write_text(
+            "mod protocol;\n"
+            "pub(super) use super::*;\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "rpc" / "tests" / "protocol.rs").write_text(
+            "use super::*;\n"
+            "use crate::rpc::runtime::RpcRuntime;\n"
+            "pub fn check(_r: RpcRuntime) {}\n",
+            encoding="utf-8",
+        )
+        # Genuine sibling cycle for Rust cycle_break inspection
+        (repo / "src" / "cycle_a.rs").write_text(
+            "use crate::cycle_b::BetaType;\npub struct AlphaType;\npub fn make_b(_: BetaType) {}\n",
+            encoding="utf-8",
+        )
+        (repo / "src" / "cycle_b.rs").write_text(
+            "use crate::cycle_a::AlphaType;\npub struct BetaType;\npub fn make_a(_: AlphaType) {}\n",
+            encoding="utf-8",
+        )
+        # Integration test at <pkg>/tests/ remains standalone crate
+        (repo / "tests" / "integration.rs").write_text("use cal_demo::config::ModelCatalog;\n", encoding="utf-8")
+
+        # 2. Android Kotlin + AIDL + @Composable + object members
+        aidl_dir = repo / "android" / "app" / "src" / "main" / "aidl" / "io" / "example" / "app"
+        kt_dir = repo / "android" / "app" / "src" / "main" / "kotlin" / "io" / "example" / "app"
+        aidl_dir.mkdir(parents=True)
+        kt_dir.mkdir(parents=True)
+
+        (aidl_dir / "IEngine.aidl").write_text("package io.example.app;\ninterface IEngine {}\n", encoding="utf-8")
+        (kt_dir / "Client.kt").write_text(
+            "package io.example.app\n"
+            "import androidx.compose.ui.Modifier\n"
+            "import io.example.app.R\n"
+            "import io.example.app.IEngine\n"
+            "import io.example.app.MissingInternal\n"
+            "class Client\n",
+            encoding="utf-8",
+        )
+        (kt_dir / "LoadingPill.kt").write_text(
+            "package io.example.app\n"
+            "import androidx.compose.runtime.Composable\n"
+            "@Composable\n"
+            "internal fun LoadingPill(text: String) {\n"
+            "  val localTmp = text.length\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (kt_dir / "OopbotBridge.kt").write_text(
+            "package io.example.app\n"
+            "internal object OopbotBridge {\n"
+            "  val isAvailable: Boolean = true\n"
+            "  @JvmStatic\n"
+            "  external fun version(): String\n"
+            "  private fun secret(): Unit {}\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        g = build_shared_graph(str(repo))
+        norm = lambda rel: str((repo / rel).resolve()).replace("\\", "/")
+
+        # Rust nested tests path resolution vs standalone root tests/integration.rs
+        all_files_norm = g["vertices"]
+        self.assertEqual(
+            rust_module_path_of(norm("src/rpc/tests/mod.rs"), all_files_norm)[1],
+            ("rpc", "tests"),
+        )
+        self.assertEqual(
+            rust_module_path_of(norm("src/rpc/tests/protocol.rs"), all_files_norm)[1],
+            ("rpc", "tests", "protocol"),
+        )
+        self.assertEqual(
+            rust_module_path_of(norm("tests/integration.rs"), all_files_norm)[1],
+            (),
+        )
+
+        # Rust edges: pub use + super:: private + inline mod tests self-resolve + crate pkg integration test
+        edges_set = set(g["edges"])
+        self.assertIn((norm("src/rpc/mod.rs"), norm("src/config/catalog.rs")), edges_set)
+        self.assertIn((norm("src/config/sub.rs"), norm("src/config/helper.rs")), edges_set)
+        self.assertIn((norm("src/rpc/mod.rs"), norm("src/rpc/tests/mod.rs")), edges_set)
+        self.assertIn((norm("src/rpc/tests/protocol.rs"), norm("src/rpc/tests/mod.rs")), edges_set)
+        self.assertIn((norm("tests/integration.rs"), norm("src/config/catalog.rs")), edges_set)
+        # Inline mod tests { use super::*; } in fs.rs must NOT create self-edge or edge to lib.rs
+        self.assertNotIn((norm("src/fs.rs"), norm("src/lib.rs")), edges_set)
+        self.assertNotIn((norm("src/fs.rs"), norm("src/fs.rs")), edges_set)
+
+        # Fail-closed unresolved checks: private `LocalOnly` and missing `DoesNotExist` remain unresolved via `crate::config::`
+        unres_pairs = {(u["reason"], u["raw_import"]) for u in g["unresolved_imports"]}
+        self.assertNotIn(("rust_glob", "super"), unres_pairs)
+        self.assertNotIn(("rust_mod_unresolved", "tests"), unres_pairs)
+        self.assertIn(("rust_unresolved", "crate::config::DoesNotExist"), unres_pairs)
+        self.assertIn(("rust_unresolved", "crate::config::LocalOnly"), unres_pairs)
+        # Android AIDL resolves cleanly, while non-existent internal Kotlin class still fails closed
+        self.assertIn(("kotlin_unresolved", "io.example.app.MissingInternal"), unres_pairs)
+        self.assertNotIn(("kotlin_unresolved", "io.example.app.IEngine"), unres_pairs)
+        ext_reasons = {(e.get("reason"), e["raw_import"]) for e in g["external_imports"]}
+        self.assertIn(("kotlin_aidl_generated", "io.example.app.IEngine"), ext_reasons)
+        self.assertIn(("kotlin_generated", "io.example.app.R"), ext_reasons)
+
+        # Rust #[cfg(test)] mod tests does NOT produce spurious mod.rs <-> tests.rs cycles
+        circ = analyze_circular(g)
+        cycle_sets = [set(f["files"]) for f in circ["findings"]]
+        self.assertNotIn({norm("src/rpc/mod.rs"), norm("src/rpc/tests/mod.rs")}, cycle_sets)
+        self.assertIn({norm("src/cycle_a.rs"), norm("src/cycle_b.rs")}, cycle_sets)
+
+        # Cycle-break leaf naming and Rust symbols_involved
+        self.assertEqual(_suggest_leaf_module("src/agent/mod.rs", [], False), "src/agent/shared.rs")
+        self.assertEqual(_suggest_leaf_module("src/agent/mod.rs", ["MyType"], True), "src/agent/shared_types.rs")
+        self.assertEqual(_suggest_leaf_module("src/agent/runner.rs", [], False), "src/agent/runner_shared.rs")
+        self.assertEqual(_suggest_leaf_module("src/host/OopbotBridge.kt", [], False), "src/host/OopbotBridgeShared.kt")
+        cb = compute_cycle_break_advisory(g, [[norm("src/cycle_a.rs"), norm("src/cycle_b.rs"), norm("src/cycle_a.rs")]])
+        rec_cut = cb["cycle_break_plan"]["recommended_cuts"][0]
+        self.assertTrue(rec_cut["symbols_involved"], rec_cut)
+
+        # Rust query_outline classifies bare `super` as internal_import
+        out_proto = query_outline(g, norm("src/rpc/tests/protocol.rs"))
+        self.assertIn("super", out_proto["internal_imports"])
+        self.assertNotIn("super", out_proto["external_imports"])
+
+        # Kotlin query_outline fixes @Composable line/sig offset and extracts object members without locals
+        out_lp = query_outline(g, norm("android/app/src/main/kotlin/io/example/app/LoadingPill.kt"))
+        self.assertEqual([d["name"] for d in out_lp["declarations"]], ["LoadingPill"])
+        self.assertEqual(out_lp["declarations"][0]["line"], 4)
+        self.assertTrue(out_lp["declarations"][0]["signature"].startswith("internal fun LoadingPill"))
+
+        out_br = query_outline(g, norm("android/app/src/main/kotlin/io/example/app/OopbotBridge.kt"))
+        self.assertEqual(out_br["exports"], ["OopbotBridge"])
+        br_decls = {d["name"]: d for d in out_br["declarations"]}
+        self.assertIn("isAvailable", br_decls)
+        self.assertIn("version", br_decls)
+        self.assertEqual(br_decls["version"]["kind"], "function")
+        self.assertTrue(br_decls["version"]["exported"])
+        self.assertIn("secret", br_decls)
+        self.assertFalse(br_decls["secret"]["exported"])
+
+        # Target topology external package grouping excludes synthetic R/AIDL
+        self.assertEqual(_external_package("serde_json::Value", "rust_external"), "serde_json")
+        self.assertEqual(_external_package("androidx.compose.ui.Modifier", "kotlin_external"), "androidx.compose.ui")
+        topo = build_target_topology_orientation(g)
+        top_pkgs = {r["package"] for r in topo["import_resolution"]["top_external_packages"]}
+        self.assertNotIn("io.example.app.R", top_pkgs)
+        self.assertNotIn("io.example.app.IEngine", top_pkgs)
+        self.assertIn("androidx.compose.ui", top_pkgs)
+        self.assertIn("serde_json", top_pkgs)
+
+        # Mermaid depth=2 disambiguates mod.rs hubs with parent directory name
+        buf_mm = io.StringIO()
+        with redirect_stdout(buf_mm):
+            rc_mm = plw_cli.cmd_mermaid([str(repo), "--depth", "2", "--json"])
+        self.assertEqual(rc_mm, 0)
+        mm_src = json.loads(buf_mm.getvalue()).get("mermaid_source", "")
+        self.assertIn("config/mod.rs", mm_src)
+
+        # Portable agent dynamic_context reflects polyglot SOURCE_EXTENSIONS
+        dc = dynamic_context(str(repo))
+        self.assertNotIn("TS/JS-only", dc.get("reason", ""))
+
 if __name__ == "__main__":
     unittest.main()
