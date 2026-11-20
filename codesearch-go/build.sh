@@ -71,7 +71,13 @@ echo "== go test =="
 "$GO" test -mod=vendor ./...
 
 echo "== go build =="
-COMMIT="$( (find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' | sort | xargs sha256sum; sha256sum go.mod go.sum) | sha256sum | cut -c1-12 )"
+# LC_ALL=C sort: the commit hash must be locale-independent. A bare
+# `sort` collates by LC_COLLATE, so the same tree hashes differently
+# on different machines (measured 2026-11-20, PR #27: en_US.UTF-8
+# gave commit b98279f06f72, POSIX/C.UTF-8 gave 2c213de5f411 — identical
+# files, different commit, different binary digest, pin mismatch in
+# CI). Pin the collation, or the "reproducible build" is not one.
+COMMIT="$( (find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' | LC_ALL=C sort | xargs sha256sum; sha256sum go.mod go.sum) | sha256sum | cut -c1-12 )"
 # -mod=vendor (Track 4, K5): the build never touches the module
 # proxy — vendor/ is committed, so a build without network works
 # and a vendor/modules.txt mismatch fails loudly instead of

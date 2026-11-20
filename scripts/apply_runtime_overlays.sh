@@ -312,6 +312,9 @@ grep -Fq '7900e083dc7c' core/codesearch_engine.py
 apply_reviewable_overlay "engine_pin_v10"
 grep -Fq '1a4c4548286b336ff76d3493130f69c5255e7754b90e17a997b931a6f6fcb87d' core/codesearch_engine.py
 grep -Fq -- '-s -w' core/codesearch_engine.py
+apply_reviewable_overlay "engine_pin_v11"
+grep -Fq '42b615b1b3f74c26f055f7145839c58cc6ca7c9e9bfc058a9d222d50cb527719' core/codesearch_engine.py
+grep -Fq '2c213de5f411' core/codesearch_engine.py
 apply_reviewable_overlay "topology_resolution_v1"
 grep -Fq 'def kotlin_same_package_declarations(' language_semantics.py
 grep -Fq 'def rust_manifest_entrypoints(' language_semantics.py

@@ -194,11 +194,13 @@ func astDefinitions(relPath, text string) (defs []definition, ok bool) {
 		var sb, eb uint32
 		var name string
 		var bodyStart uint32
+		var defNode *gotreesitter.Node
 		hasBody := false
 		found := false
 		for _, c := range m.Captures {
 			if c.Name == "def" {
 				sb, eb = c.Node.StartByte(), c.Node.EndByte()
+				defNode = c.Node
 				found = true
 			}
 			if c.Name == "name" {
@@ -216,6 +218,15 @@ func astDefinitions(relPath, text string) (defs []definition, ok bool) {
 		if el < sl {
 			continue
 		}
+		// Kotlin: anchor the span on the declaration itself (first
+		// non-annotation modifier, else the keyword), never on a
+		// leading @annotation — the Python calibration rule (PR #26).
+		// Without this, `@Composable` funs report the annotation line.
+		if ext == ".kt" && defNode != nil {
+			if anchor, ok := kotlinAnchorStart(defNode, spec.lang); ok {
+				sl = lineOf(anchor)
+			}
+		}
 		d := definition{sl, el, name, 0}
 		if hasBody {
 			// Signature end: the body's first line for brace languages
@@ -229,6 +240,16 @@ func astDefinitions(relPath, text string) (defs []definition, ok bool) {
 			}
 		}
 		defs = append(defs, d)
+	}
+	// Kotlin: when the parse is damaged (HasError) or yields nothing,
+	// the grammar failed on some declaration (annotation before a
+	// visibility modifier — see kotlin_fallback.go). Recover those
+	// definitions with the regex fallback and merge them with whatever
+	// the AST found; AST defs are never dropped.
+	if ext == ".kt" && (tree.RootNode().HasError() || len(defs) == 0) {
+		if rd := kotlinRegexDefinitions(norm, lineOf); len(rd) > 0 {
+			defs = mergeKotlinRegexDefs(defs, rd)
+		}
 	}
 	if len(defs) == 0 {
 		return nil, false
