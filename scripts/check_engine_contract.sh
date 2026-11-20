@@ -50,14 +50,16 @@
 # commit 416c70f4e8f5, go1.27.3), and to engine_state_v6 (go13->go14
 # for P1-A calleeBase right-to-left, P1-B Rust --related defs + pub use
 # edges, P1-C Kotlin regex fallback always merged, P2 JNI bridge two
-# directions) + engine_pin_v14 (26a05e30…, commit 64727c3f7ed9, go1.27.3).
+# directions) + engine_pin_v14 (26a05e30…, commit 64727c3f7ed9, go1.27.3),
+# and to engine_state_v7 (go14->go15 for Rust pub use/super & JNI polish)
+# + engine_pin_v15 (2d5e950b…, commit 0fbc4fb4c390, go1.27.3).
 # If a later overlay moves either constant again, update the patch
 # paths below — the script then fails closed with "could not read ...".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADAPTER_PATCH="$ROOT/runtime_overlay/engine_state_v7/change.patch"
-PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v14/change.patch"
+PIN_PATCH="$ROOT/runtime_overlay/engine_pin_v15/change.patch"
 ENGINE_SCHEMA="$(grep -E '^const schemaV = ' "$ROOT/codesearch-go/index.go" | sed -E 's/^const schemaV = "([^"]+)".*/\1/')"
 ADAPTER_SCHEMA="$(grep -E '^[+ ]KNOWN_SCHEMA = ' "$ADAPTER_PATCH" | sed -E 's/^[+ ]KNOWN_SCHEMA = "([^"]+)".*/\1/')"
 
