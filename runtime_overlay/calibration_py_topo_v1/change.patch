@@ -1,0 +1,185 @@
+--- a/core/topology_engine.py
++++ b/core/topology_engine.py
+@@ -117,27 +117,32 @@
+     "JSON", "JSONObject", "JSONArray", "Promise", "Array", "Object", "String",
+     "Number", "Boolean", "Error", "Map", "Set", "WeakMap", "WeakSet", "List",
+     "MutableList", "Pair", "Result", "Unit",
++    "TYPE_CHECKING", "annotations",
+ }
+ 
+ # Definition patterns are CANDIDATE generators only: a name found here is
+ # a query for the engine, and only the engine's AST answer becomes a node.
+ _DEFINITION_PATTERNS = {
+     "go": [
+-        re.compile(r"^\s*func\s+(?:\(\s*[^)]*\)\s*)?([A-Za-z_]\w*)\s*\(", re.MULTILINE),
+-        re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+", re.MULTILINE),
++        re.compile(r"^\s*func\s+(?:\(\s*[^)]*\)\s*)?([A-Za-z_]\w*)\s*(?:\[|\()", re.MULTILINE),
++        re.compile(r"^\s*type\s+([A-Za-z_]\w*)(?:\s|\[)", re.MULTILINE),
+     ],
+     "rust": [
+-        re.compile(r"^\s*(?:pub\s+)?fn\s+([A-Za-z_]\w*)\s*[\(<]", re.MULTILINE),
+-        re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)", re.MULTILINE),
++        re.compile(
++            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|const\s+|extern\s+\"[^\"]*\"\s+)*"
++            r"(?:fn|struct|enum|union|trait|type|const|static|mod)\s+([A-Za-z_]\w*)",
++            re.MULTILINE,
++        ),
++        re.compile(r"^\s*macro_rules!\s+([A-Za-z_]\w*)", re.MULTILINE),
+     ],
+     "python": [
+-        re.compile(r"^\s*(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE),
++        re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", re.MULTILINE),
+     ],
+ }
+ 
+ _JS_TS_DECL_PATTERN = re.compile(
+     r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?"
+-    r"(?:function\*?|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)",
++    r"(?:(?:abstract\s+)?class|function\*?|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)",
+     re.MULTILINE,
+ )
+ 
+@@ -250,12 +255,52 @@
+     return dict(sorted(found.items()))
+ 
+ 
++def _go_grouped_type_names(content: str) -> Set[str]:
++    """Extract top-level identifiers declared inside Go `type ( ... )` blocks."""
++    names: Set[str] = set()
++    clean = _strip_js_comments(content)
++    in_type_group = False
++    paren_depth = 0
++    brace_depth = 0
++    for raw_line in clean.splitlines():
++        line = raw_line.strip()
++        if not in_type_group:
++            if brace_depth == 0 and re.match(r"^type\s*\(\s*$", line):
++                in_type_group = True
++                paren_depth = 1
++                continue
++        else:
++            if paren_depth == 1 and brace_depth == 0:
++                m = re.match(r"^([A-Za-z_]\w*)(?:\s*(?:\[|=|\bstruct\b|\binterface\b)|\s+\S)", line)
++                if m and _is_candidate(m.group(1)):
++                    names.add(m.group(1))
++        for ch in line:
++            if ch == "{":
++                brace_depth += 1
++            elif ch == "}" and brace_depth > 0:
++                brace_depth -= 1
++            elif in_type_group:
++                if ch == "(":
++                    paren_depth += 1
++                elif ch == ")":
++                    paren_depth -= 1
++                    if paren_depth <= 0:
++                        in_type_group = False
++                        paren_depth = 0
++                        break
++    return names
++
++
+ def _definition_candidates(content: str, language: str) -> Set[str]:
++    if language == "rust":
++        return {n for n in _rust_top_level_names(content) if _is_candidate(n)}
+     names: Set[str] = set()
+     for pattern in _DEFINITION_PATTERNS.get(language, []):
+         for match in pattern.finditer(content):
+             if _is_candidate(match.group(1)):
+                 names.add(match.group(1))
++    if language == "go":
++        names |= _go_grouped_type_names(content)
+     return names
+ 
+ 
+@@ -325,9 +370,7 @@
+             try:
+                 seen_in_file: Set[str] = set()
+                 for item in parse_imports_with_nature(content_str, fp_str):
+-                    for name in list(item.get("symbols") or []) + list(
+-                        item.get("semantic_usages") or []
+-                    ):
++                    for name in list(item.get("symbols") or []):
+                         if _is_candidate(name):
+                             candidates.add(name)
+                             seen_in_file.add(name)
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -121,10 +121,17 @@
+ 
+ _SEM_IDENT_REGEX = re.compile(r"^[A-Za-z0-9_]+$")
+ _SEM_NEW_REGEX = re.compile(r"\bnew\s+([A-Za-z0-9_]+)\b")
+-_SEM_CALL_REGEX = re.compile(r"\b([A-Za-z0-9_]+)\s*\(")
++_SEM_CALL_REGEX = re.compile(
++    r"\b([A-Za-z0-9_]+)\s*(?:::\s*)?(?:<(?:[^<>\n{}();&]|\|(?!\|))+>\s*)?\("
++)
+ _SEM_DEC_REGEX = re.compile(r"@([A-Za-z0-9_]+)\b")
+ _SEM_COLON_TYPE_REGEX = re.compile(r":\s*([A-Za-z0-9_]+)\b")
+ _SEM_ANGLE_TYPE_REGEX = re.compile(r"<([A-Za-z0-9_]+)>")
++_SEM_MULTI_ANGLE_TYPE_REGEX = re.compile(
++    r"<([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)+)>"
++)
++_SEM_UNION_TYPE_REGEX = re.compile(r"(?:\||&(?!&))\s*([A-Z][A-Za-z0-9_]*)\b")
++_SEM_CAST_TYPE_REGEX = re.compile(r"\b(?:as|satisfies)\s+([A-Z][A-Za-z0-9_]*)\b")
+ _SEM_JSX_REGEX = re.compile(r"<([A-Za-z0-9_]+)\b")
+ _SEM_INH_REGEX = re.compile(r"\b(?:extends|implements)\s+([A-Za-z0-9_]+)\b")
+ _SEM_NS_REGEX = re.compile(r"\b([A-Za-z0-9_]+)\.")
+@@ -133,11 +140,22 @@
+ def _build_semantic_usage_index(
+     content: str,
+ ) -> Tuple[Set[str], Set[str], Set[str], Set[str], Set[str], Set[str], Set[str]]:
++    type_tokens = (
++        set(_SEM_COLON_TYPE_REGEX.findall(content))
++        | set(_SEM_ANGLE_TYPE_REGEX.findall(content))
++        | set(_SEM_UNION_TYPE_REGEX.findall(content))
++        | set(_SEM_CAST_TYPE_REGEX.findall(content))
++    )
++    for group in _SEM_MULTI_ANGLE_TYPE_REGEX.findall(content):
++        for part in group.split(","):
++            tok = part.strip()
++            if tok:
++                type_tokens.add(tok)
+     return (
+         set(_SEM_NEW_REGEX.findall(content)),
+         set(_SEM_CALL_REGEX.findall(content)),
+         set(_SEM_DEC_REGEX.findall(content)),
+-        set(_SEM_COLON_TYPE_REGEX.findall(content)) | set(_SEM_ANGLE_TYPE_REGEX.findall(content)),
++        type_tokens,
+         set(_SEM_JSX_REGEX.findall(content)),
+         set(_SEM_INH_REGEX.findall(content)),
+         set(_SEM_NS_REGEX.findall(content)),
+--- a/core/simplification/python_frontend.py
++++ b/core/simplification/python_frontend.py
+@@ -426,9 +426,20 @@
+                 continue
+             for block in _iter_statement_blocks(fn):
+                 for assign, ret in zip(block, block[1:]):
+-                    if not isinstance(assign, ast.Assign) or len(assign.targets) != 1:
++                    if isinstance(assign, ast.Assign) and len(assign.targets) == 1:
++                        target = assign.targets[0]
++                        rhs_node = assign.value
++                        annotated_assign = False
++                    elif (
++                        isinstance(assign, ast.AnnAssign)
++                        and assign.simple == 1
++                        and assign.value is not None
++                    ):
++                        target = assign.target
++                        rhs_node = assign.value
++                        annotated_assign = True
++                    else:
+                         continue
+-                    target = assign.targets[0]
+                     if not isinstance(target, ast.Name):
+                         continue
+                     if not isinstance(ret, ast.Return) or not isinstance(ret.value, ast.Name):
+@@ -450,7 +461,8 @@
+                         witness={"type": "adjacent_terminal_local_assignment_return", "same_function": True,
+                                  "same_statement_block": True, "adjacent_statements": True, "single_name_assignment": True,
+                                  "returned_name_matches_assignment": True, "local_name": target.id,
+-                                 "rhs_ast": ast.dump(assign.value, include_attributes=False),
++                                 "annotated_assignment": annotated_assign,
++                                 "rhs_ast": ast.dump(rhs_node, include_attributes=False),
+                                  "debug_line_event_equivalence_not_claimed": True,
+                                  "authority": "syntactic_terminal_temporary_witness_only"},
+                         proof_rule="inline only when assignment/return stay adjacent and stable behavior tests remain equivalent",

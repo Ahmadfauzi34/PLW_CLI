@@ -734,5 +734,115 @@ class TopologyAndCyclesTests(ArchitectureBaselineCase):
             self.assertTrue(mani["manifold"]["structural_archetype"].endswith("_cyclic"), mani["manifold"]["structural_archetype"])
 
 
+
+    def test_calibration_polyglot_topology_candidates_and_semantic_usages_v1(self) -> None:
+        from core.topology_engine import (
+            COMMON_NOISE_SYMBOLS,
+            _definition_candidates,
+            _harvest_graph_candidates,
+            _source_top_level_definitions,
+        )
+
+        # 1. Go generic functions/methods/types & grouped type (...) blocks
+        go_src = (
+            "package main\n\n"
+            "type Box[T any] struct { v T }\n"
+            "type AliasID = string\n"
+            "type (\n"
+            "    GroupedAlias = int\n"
+            "    GenericPair[K comparable, V any] struct {\n"
+            "        fieldK K\n"
+            "    }\n"
+            ")\n"
+            "func GenMap[T any, R any](v T) R { var r R; return r }\n"
+            "func (b *Box[T]) Unwrap() T { return b.v }\n"
+        )
+        go_defs = _definition_candidates(go_src, "go")
+        for expected in ("Box", "AliasID", "GroupedAlias", "GenericPair", "GenMap", "Unwrap"):
+            self.assertIn(expected, go_defs, f"missing Go candidate {expected!r} in {go_defs}")
+        self.assertNotIn("fieldK", go_defs)
+
+        # 2. Python async def + TS abstract class + Rust pub(crate)/async/macro_rules!
+        py_src = "async def run_async_job(x: int) -> int:\n    return x\ndef sync_fn():\n    pass\n"
+        py_defs = _definition_candidates(py_src, "python")
+        self.assertEqual(py_defs, {"run_async_job", "sync_fn"})
+
+        ts_src = (
+            "export abstract class AbstractWorker {\n  abstract step(): void;\n}\n"
+            "abstract class LocalAbstract {}\n"
+        )
+        ts_defs = _source_top_level_definitions(ts_src, "src/worker.ts")
+        self.assertEqual(ts_defs, {"AbstractWorker", "LocalAbstract"})
+
+        rs_src = (
+            "pub(crate) struct CrateCfg;\n"
+            "pub(crate) async fn handle_async() {}\n"
+            "macro_rules! emit_log { ($x:expr) => { $x }; }\n"
+        )
+        rs_defs = _definition_candidates(rs_src, "rust")
+        self.assertEqual(rs_defs, {"CrateCfg", "handle_async", "emit_log"})
+
+        # 3. _harvest_graph_candidates must NOT leak semantic_usages metadata tags (`rust_use`, `rust_mod`)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "src").mkdir()
+            (repo / "src" / "lib.rs").write_text(
+                "mod helper;\nuse crate::cfg::Settings;\npub fn entry() {}\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "helper.rs").write_text("pub fn help() {}\n", encoding="utf-8")
+            (repo / "src" / "cfg.rs").write_text("pub struct Settings;\n", encoding="utf-8")
+            (repo / "src" / "app.py").write_text(
+                "from __future__ import annotations\n"
+                "from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    from .dep import Model\n",
+                encoding="utf-8",
+            )
+            g = build_shared_graph(str(repo))
+            cands, _, internal_defined, _, _, _ = _harvest_graph_candidates(
+                g, None, str(repo.resolve()).replace("\\", "/")
+            )
+            for tag in ("rust_use", "rust_mod", "cfg_test_mod", "rust_path_ref"):
+                self.assertNotIn(tag, cands)
+            self.assertIn("Settings", cands)
+            self.assertIn("TYPE_CHECKING", COMMON_NOISE_SYMBOLS)
+            self.assertIn("annotations", COMMON_NOISE_SYMBOLS)
+            self.assertNotIn("TYPE_CHECKING", internal_defined)
+
+            # 4. Semantic usage calibration: TS generic calls, union/cast/satisfies, multi-arg generics
+            (repo / "src" / "ts_types.ts").write_text(
+                "export interface UnionA { a: number }\n"
+                "export interface UnionB { b: string }\n"
+                "export interface GenericArg { ok: boolean }\n"
+                "export interface CastT { v: number }\n"
+                "export interface KeyT { k: string }\n"
+                "export interface ValT { v: string }\n"
+                "export function realFn<T>(x: any): T { return x as T; }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "ts_consumer.ts").write_text(
+                "import { type UnionA, type UnionB, type GenericArg, type CastT, type KeyT, type ValT, realFn } from './ts_types';\n"
+                "export function demo(x: UnionA | UnionB, m: Map<KeyT, ValT>): GenericArg {\n"
+                "  const z = x as CastT;\n"
+                "  return realFn<GenericArg>(z);\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            g_ts = build_shared_graph(str(repo))
+            norm = str((repo / "src" / "ts_consumer.ts").resolve()).replace("\\", "/")
+            norm_t = str((repo / "src" / "ts_types.ts").resolve()).replace("\\", "/")
+            ed_ts = {(e["source"], e["target"]): e["semantic_usages"] for e in g_ts["edge_details"]}
+            usages = set(ed_ts[(norm, norm_t)])
+            for want_usage in (
+                "called(realFn)",
+                "typed(UnionA)",
+                "typed(UnionB)",
+                "typed(CastT)",
+                "typed(KeyT)",
+                "typed(ValT)",
+                "typed(GenericArg)",
+            ):
+                self.assertIn(want_usage, usages, f"missing {want_usage!r} in {usages}")
+
 if __name__ == "__main__":
     unittest.main()
