@@ -71,7 +71,13 @@ apply_reviewable_overlay "engine_pin_v16"
 grep -Fq "b47b9f9f1ca432f161af8fa09bd8d6350755aab5acb65d9987a9f81e1f6d9487" core/codesearch_engine.py
 python3 -m py_compile core/codesearch_engine.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 2 (plw_cli_modular_v1, engine_pin_v16 on baked capsule v0.2.41)"
+apply_reviewable_overlay "solid_architecture_v3"
+grep -Fq "from core.kernel.inspection import" hott_kernel.py
+grep -Fq "from core.kernel.work_policy import" hott_kernel.py
+grep -Fq "from core.simplification.js_frontend import" core/simplification_analyzer.py
+python3 -m py_compile hott_kernel.py core/kernel/*.py core/simplification_analyzer.py core/simplification/*.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 3 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py

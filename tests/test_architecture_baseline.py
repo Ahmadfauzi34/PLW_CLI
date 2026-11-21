@@ -449,5 +449,144 @@ class ArchitectureBaselineTests(ArchitectureBaselineCase):
             self.assertIn("error", err_payload, f"{alias} invalid --json payload missing error key")
 
 
+    def test_solid_architecture_v3_hott_kernel_and_simplification_modular_structure(self) -> None:
+        """Permanent SOLID v3 gate: hott_kernel & simplification_analyzer facades, isolation, zero cycles, hygiene, and hook parity."""
+        import builtins
+        import symtable
+        from core.kernel import runtime as kernel_rt
+        from core import simplification_analyzer as sa_mod
+        from codebase.cycle_break import find_cyclic_sccs
+
+        repo_root = Path(hott_kernel.__file__).resolve().parent
+        kernel_dir = repo_root / "core" / "kernel"
+        simp_dir = repo_root / "core" / "simplification"
+
+        # 1. Facade line budgets & required domain module layout
+        hk_lines = len((repo_root / "hott_kernel.py").read_text(encoding="utf-8").splitlines())
+        sa_lines = len((repo_root / "core" / "simplification_analyzer.py").read_text(encoding="utf-8").splitlines())
+        self.assertLess(hk_lines, 400, f"hott_kernel.py facade grew unexpectedly ({hk_lines} lines)")
+        self.assertLess(sa_lines, 650, f"simplification_analyzer.py facade grew unexpectedly ({sa_lines} lines)")
+
+        expected_kernel_mods = {
+            "__init__.py", "runtime.py", "inspection.py", "memory_ops.py",
+            "receipts.py", "context_pack.py", "work_policy.py", "task_chain.py", "cli_dispatch.py",
+        }
+        expected_simp_mods = {
+            "__init__.py", "common.py", "js_frontend.py",
+            "brace_frontend.py", "python_frontend.py", "adjudication.py",
+        }
+        self.assertEqual({p.name for p in kernel_dir.glob("*.py")}, expected_kernel_mods)
+        self.assertEqual({p.name for p in simp_dir.glob("*.py")}, expected_simp_mods)
+
+        # 2. Strict SOLID isolation: core/kernel/inspection.py must NOT depend on work/policy/memory/cli/hott_kernel
+        insp_tree = ast.parse((kernel_dir / "inspection.py").read_text(encoding="utf-8"))
+        insp_mods = {
+            n.module for n in ast.walk(insp_tree) if isinstance(n, ast.ImportFrom) and n.module
+        } | {
+            a.name for n in ast.walk(insp_tree) if isinstance(n, ast.Import) for a in n.names
+        }
+        for forbidden in ("work_policy", "context_pack", "task_chain", "receipts", "memory_ops", "cli_dispatch", "hott_kernel"):
+            self.assertFalse(
+                any(forbidden in m for m in insp_mods),
+                f"core/kernel/inspection.py violated work/policy isolation by importing {forbidden!r}: {sorted(insp_mods)}",
+            )
+
+        # 3. Sibling simplification frontends must stay decoupled (only depend on common, never each other)
+        sibling_names = ("js_frontend", "brace_frontend", "python_frontend", "adjudication")
+        for fname in sibling_names:
+            stree = ast.parse((simp_dir / f"{fname}.py").read_text(encoding="utf-8"))
+            smods = {n.module for n in ast.walk(stree) if isinstance(n, ast.ImportFrom) and n.module}
+            for other in sibling_names:
+                if other == fname:
+                    continue
+                self.assertFalse(
+                    any(other in m for m in smods),
+                    f"core/simplification/{fname}.py coupled to sibling {other}: {sorted(smods)}",
+                )
+
+        # 4. Hygiene gate: 0 unused top-level imports & 0 unbound globals across core/kernel & core/simplification
+        def _collect_defined(stmts):
+            d = set()
+            for node in stmts:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    d.add(node.name)
+                elif isinstance(node, ast.Import):
+                    for a in node.names:
+                        d.add(a.asname or a.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        d.add(a.asname or a.name)
+                elif isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name):
+                            d.add(tgt.id)
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    d.add(node.target.id)
+                elif isinstance(node, ast.Try):
+                    d |= _collect_defined(node.body)
+                    for h in node.handlers:
+                        d |= _collect_defined(h.body)
+            return d
+
+        check_files = sorted(kernel_dir.glob("*.py")) + sorted(simp_dir.glob("*.py"))
+        for mod_file in check_files:
+            mod_src = mod_file.read_text(encoding="utf-8")
+            mod_tree = ast.parse(mod_src, filename=str(mod_file))
+            if mod_file.name not in ("__init__.py", "runtime.py"):
+                imported = {}
+                for node in mod_tree.body:
+                    if isinstance(node, ast.Import):
+                        for a in node.names:
+                            imported[a.asname or a.name.split(".")[0]] = node.lineno
+                    elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+                        for a in node.names:
+                            imported[a.asname or a.name] = node.lineno
+                used = {
+                    sub.id
+                    for node in mod_tree.body
+                    if not isinstance(node, (ast.Import, ast.ImportFrom))
+                    for sub in ast.walk(node)
+                    if isinstance(sub, ast.Name)
+                }
+                unused = sorted(n for n in imported if n not in used)
+                self.assertEqual(unused, [], f"Unused imports in {mod_file.name}: {unused}")
+
+            defined = (
+                set(dir(builtins))
+                | {"__name__", "__file__", "__doc__", "__package__", "__spec__", "__all__", "__annotations__"}
+                | _collect_defined(mod_tree.body)
+            )
+            st = symtable.symtable(mod_src, str(mod_file), "exec")
+            def _check_scope(tbl, path_label):
+                for sym in tbl.get_symbols():
+                    if sym.is_global() and sym.is_referenced() and not sym.is_assigned():
+                        self.assertIn(sym.get_name(), defined, f"Unbound global {sym.get_name()!r} in {mod_file.name}:{path_label}")
+                for child in tbl.get_children():
+                    _check_scope(child, f"{path_label}.{child.get_name()}")
+            _check_scope(st, "<module>")
+
+        # 5. Runtime state synchronization & mock-hook parity on hott_kernel facade
+        prev_mode = kernel_rt._ACTIVE_GRAPH_CACHE_MODE
+        try:
+            hott_kernel._set_graph_cache_mode("refresh")
+            self.assertEqual(kernel_rt._ACTIVE_GRAPH_CACHE_MODE, "refresh")
+            self.assertEqual(hott_kernel._ACTIVE_GRAPH_CACHE_MODE, "refresh")
+        finally:
+            hott_kernel._set_graph_cache_mode(prev_mode)
+
+        self.assertTrue(callable(sa_mod.analyze_simplification))
+        self.assertTrue(callable(sa_mod.compare_simplification))
+        self.assertIs(sa_mod.analyze_python_simplification, sa_mod.analyze_simplification)
+
+        # 6. Zero circular dependencies across runtime graph including core/kernel and core/simplification
+        graph = build_shared_graph(str(repo_root))
+        vertices = list(graph.get("vertices") or [])
+        edges = list(graph.get("edges") or [])
+        adj = {v: [] for v in vertices}
+        for u, v in edges:
+            adj.setdefault(u, []).append(v)
+        sccs = find_cyclic_sccs(vertices, adj)
+        self.assertEqual(sccs, [], f"solid_architecture_v3 introduced circular dependencies: {sccs}")
+
 if __name__ == "__main__":
     unittest.main()
