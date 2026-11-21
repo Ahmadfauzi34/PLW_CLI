@@ -7,6 +7,7 @@ This file records user-facing changes in published PLW releases. Development wor
 ### Added
 
 - Kotlin extension members now resolve by receiver type (`Modifier.onUnhandledTap`, `ErrorCause.text`, `JSONArray.text`): a member name shared by two files no longer attributes to the first declaring file, an ambiguous import without receiver evidence stays unresolved (`kotlin_ambiguous`), and a build-variant file shadowed by a live twin leaves the orphan list (`variant_shadow`).
+- Review hardening for the same mechanism: a multi-owner import edges to every owner evidenced by use sites; a class member wins over a same-named extension and a chain whose intermediate call is known to change the type gets no edge; `it`/`this` resolve from the lexically enclosing scope function (explicit lambda parameters bind neither); variant shadows require a variant-path pair, so same-FQN files from separate modules stay orphans.
 - Codesearch tree-sitter engine (`codesearch-go`, paired binary, never
   bundled): `plw ast defs|callers|related|search` across Go, Rust,
   Python, JavaScript, and TypeScript, with a fail-closed schema gate

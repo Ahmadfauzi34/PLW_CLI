@@ -438,6 +438,216 @@ class ArchitectureBaselineTests(ArchitectureBaselineCase):
         }
         self.assertEqual(shadows.get(tb_release), tb_debug)
 
+    def test_kotlin_extension_attribution_v1_review_points(self) -> None:
+        """G5b review follow-up: the four PR #39 review points.
+
+        #4: one import name serving same-named extensions on different
+        receiver types edges to EVERY voted owner (not unresolved).
+        #1: a class member wins over a same-named extension, and a
+        chained call whose intermediate call is known to change the
+        type gets no edge — while an SDK chain with no local evidence
+        (Modifier.fillMaxSize) keeps the builder heuristic.
+        #3: `it` comes from the lexically enclosing let/also (an
+        explicit lambda parameter binds neither `it` nor `this`), and
+        `it` inside `run` is not the run receiver.
+        #2: same-FQN files from separate modules are NOT variant
+        shadows of each other.
+        """
+        repo = self._tmp / "g5b_review"
+        ex = repo / "kotlin" / "com" / "example"
+        ex.mkdir(parents=True)
+        (ex / "Types.kt").write_text(
+            "package com.example\n"
+            "class Alpha(val a: String)\n"
+            "class Beta(val b: String)\n"
+            "class Box(val v: String)\n"
+            "class Bar { fun process(): String = \"member\" }\n"
+            "class Foo { fun toBar(): Bar = Bar() }\n"
+            "object Chain { fun toBar(): Bar = Bar(); fun toChain(): Chain = this }\n",
+            encoding="utf-8",
+        )
+        (ex / "AlphaText.kt").write_text(
+            "package com.example\n"
+            "fun Alpha.text(): String = \"a\"\n",
+            encoding="utf-8",
+        )
+        (ex / "BetaText.kt").write_text(
+            "package com.example\n"
+            "fun Beta.text(): String = \"b\"\n",
+            encoding="utf-8",
+        )
+        (ex / "BoxText.kt").write_text(
+            "package com.example\n"
+            "fun Box.text(): String = \"box\"\n",
+            encoding="utf-8",
+        )
+        (ex / "BarExt.kt").write_text(
+            "package com.example\n"
+            "fun Bar.process(): String = \"ext\"\n",
+            encoding="utf-8",
+        )
+        (ex / "FooExt.kt").write_text(
+            "package com.example\n"
+            "fun Foo.process(): String = \"ext\"\n",
+            encoding="utf-8",
+        )
+        (ex / "ChainExt.kt").write_text(
+            "package com.example\n"
+            "fun Chain.process(): String = \"ext\"\n",
+            encoding="utf-8",
+        )
+        (ex / "UseBar.kt").write_text(
+            "package com.example\n"
+            "fun useBar(bar: Bar): String = bar.process()\n",
+            encoding="utf-8",
+        )
+        (ex / "UseChainBreak.kt").write_text(
+            "package com.example\n"
+            "fun useChainBreak(): String = Chain.toBar().process()\n",
+            encoding="utf-8",
+        )
+        (ex / "UseChainKeep.kt").write_text(
+            "package com.example\n"
+            "fun useChainKeep(): String = Chain.toChain().process()\n",
+            encoding="utf-8",
+        )
+        (ex / "UseChainCtor.kt").write_text(
+            "package com.example\n"
+            "fun useChainCtor(): String = Foo().toBar().process()\n",
+            encoding="utf-8",
+        )
+        (ex / "ScopeUse.kt").write_text(
+            "package com.example\n"
+            "fun nested(box: Box, s: String): String {\n"
+            "  return box.let {\n"
+            "    s.let { y -> it.text } ?: \"\"\n"
+            "  } ?: \"\"\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ex / "ScopeRun.kt").write_text(
+            "package com.example\n"
+            "fun runCase(box: Box): String {\n"
+            "  return box.run { it.text } ?: \"\"\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        ui = repo / "kotlin" / "com" / "example" / "ui"
+        ui.mkdir(parents=True)
+        (ui / "UseBoth.kt").write_text(
+            "package com.example.ui\n"
+            "import com.example.text\n"
+            "import com.example.Alpha\n"
+            "import com.example.Beta\n"
+            "fun useBoth(a: Alpha, b: Beta): String = a.text() + b.text()\n",
+            encoding="utf-8",
+        )
+        (ui / "Tap.kt").write_text(
+            "package com.example.ui\n"
+            "fun Modifier.onTap(): Modifier = this\n",
+            encoding="utf-8",
+        )
+        (ui / "UseTap.kt").write_text(
+            "package com.example.ui\n"
+            "fun useTap() {\n"
+            "  Modifier.fillMaxSize().onTap { }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        for mod in ("modA", "modB"):
+            mdir = repo / mod / "src" / "main" / "com" / "example"
+            mdir.mkdir(parents=True)
+            (mdir / "Dup.kt").write_text(
+                "package com.example\n"
+                "class Dup { fun a(): String = \"a\" }\n",
+                encoding="utf-8",
+            )
+        (repo / "modA" / "src" / "main" / "com" / "example" / "UseDup.kt").write_text(
+            "package com.example\n"
+            "import com.example.Dup\n"
+            "fun useDup(): String = Dup().a()\n",
+            encoding="utf-8",
+        )
+
+        def _p(*parts: str) -> str:
+            return str((repo / "/".join(parts)).resolve())
+
+        g_live = build_shared_graph(str(repo))
+        snapshot = {
+            fp: {"content": content, "imports": []}
+            for fp, content in g_live["file_map"].items()
+        }
+        g_snap = build_shared_graph(str(repo), _file_snapshot=snapshot)
+        self.assertEqual(g_live["edges"], g_snap["edges"])
+        self.assertEqual(g_live["edge_natures"], g_snap["edge_natures"])
+
+        alpha_text = _p("kotlin", "com", "example", "AlphaText.kt")
+        beta_text = _p("kotlin", "com", "example", "BetaText.kt")
+        box_text = _p("kotlin", "com", "example", "BoxText.kt")
+        bar_ext = _p("kotlin", "com", "example", "BarExt.kt")
+        foo_ext = _p("kotlin", "com", "example", "FooExt.kt")
+        chain_ext = _p("kotlin", "com", "example", "ChainExt.kt")
+        use_both = _p("kotlin", "com", "example", "ui", "UseBoth.kt")
+        use_bar = _p("kotlin", "com", "example", "UseBar.kt")
+        use_chain_break = _p("kotlin", "com", "example", "UseChainBreak.kt")
+        use_chain_keep = _p("kotlin", "com", "example", "UseChainKeep.kt")
+        use_chain_ctor = _p("kotlin", "com", "example", "UseChainCtor.kt")
+        scope_use = _p("kotlin", "com", "example", "ScopeUse.kt")
+        scope_run = _p("kotlin", "com", "example", "ScopeRun.kt")
+        tap = _p("kotlin", "com", "example", "ui", "Tap.kt")
+        use_tap = _p("kotlin", "com", "example", "ui", "UseTap.kt")
+        dup_a = _p("modA", "src", "main", "com", "example", "Dup.kt")
+        dup_b = _p("modB", "src", "main", "com", "example", "Dup.kt")
+
+        # #4: both voted owners edge; the third owner gets nothing,
+        # and the import is NOT left unresolved.
+        self.assertIn((use_both, alpha_text), g_live["edges"])
+        self.assertIn((use_both, beta_text), g_live["edges"])
+        self.assertNotIn((use_both, box_text), g_live["edges"])
+        self.assertEqual(
+            g_live["edge_natures"].get(f"{use_both} -> {alpha_text}"),
+            "runtime",
+        )
+        ambiguous = [
+            u for u in g_live["unresolved_imports"]
+            if u.get("importer") == use_both
+            and u.get("reason") == "kotlin_ambiguous"
+        ]
+        self.assertEqual(ambiguous, [])
+
+        # #1: class member wins; a chain whose intermediate call is
+        # known to change the type gets no edge, while a chain that
+        # preserves the type still edges — and a constructor-call
+        # chain (unknowable return) gets no edge either.
+        self.assertNotIn((use_bar, bar_ext), g_live["edges"])
+        self.assertNotIn((use_chain_break, chain_ext), g_live["edges"])
+        self.assertIn((use_chain_keep, chain_ext), g_live["edges"])
+        self.assertNotIn((use_chain_ctor, foo_ext), g_live["edges"])
+        self.assertNotIn((use_chain_ctor, bar_ext), g_live["edges"])
+        # ... while the SDK builder chain still edges (no local
+        # evidence against it).
+        self.assertIn((use_tap, tap), g_live["edges"])
+        self.assertEqual(
+            g_live["edge_natures"].get(f"{use_tap} -> {tap}"),
+            "same_package",
+        )
+
+        # #3: `it` is the outer let's receiver despite the inner
+        # explicit-parameter let; `it` inside `run` is not the box.
+        self.assertIn((scope_use, box_text), g_live["edges"])
+        self.assertNotIn((scope_run, box_text), g_live["edges"])
+
+        # #2: exactly one Dup is live, the other stays an orphan and
+        # is NOT suppressed as a variant shadow.
+        orphans = analyze_orphan(g_live)
+        orphan_files = {f["file"] for f in orphans["findings"]}
+        self.assertEqual(len({dup_a, dup_b} & orphan_files), 1)
+        shadows = {
+            s["file"] for s in orphans["summary"]["variant_shadow_suppressed"]
+        }
+        self.assertNotIn(dup_a, shadows)
+        self.assertNotIn(dup_b, shadows)
+
     def test_hott_kernel_cli_dispatch_covers_all_public_modes(self) -> None:
         self.assertEqual(
             set(hott_kernel._KERNEL_CLI_DISPATCH),
