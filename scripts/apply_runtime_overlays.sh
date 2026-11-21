@@ -67,7 +67,11 @@ grep -Fq "_CLI_COMMAND_DISPATCH" plw_cli.py
 grep -Fq "from core.cli.common import" plw_cli.py
 python3 -m py_compile plw_cli.py core/cli/*.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 1 (plw_cli_modular_v1 on baked capsule v0.2.41)"
+apply_reviewable_overlay "engine_pin_v16"
+grep -Fq "b47b9f9f1ca432f161af8fa09bd8d6350755aab5acb65d9987a9f81e1f6d9487" core/codesearch_engine.py
+python3 -m py_compile core/codesearch_engine.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 2 (plw_cli_modular_v1, engine_pin_v16 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py
@@ -78,7 +82,7 @@ grep -Fq '"type_only_cyclic_sccs"' core/target_topology.py
 grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
 grep -Fq 'KNOWN_SCHEMA = "go15"' core/codesearch_engine.py
 grep -Fq '"go15": "plw-codesearch-engine-v1"' core/codesearch_engine.py
-grep -Fq '2d5e950b08c7e3ffb3fcba6d77397cc0741a2461802f08708cfc28e55497c63c' core/codesearch_engine.py
+grep -Fq 'b47b9f9f1ca432f161af8fa09bd8d6350755aab5acb65d9987a9f81e1f6d9487' core/codesearch_engine.py
 
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'
