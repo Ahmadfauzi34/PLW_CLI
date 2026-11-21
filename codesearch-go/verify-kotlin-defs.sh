@@ -20,4 +20,4 @@ else
   exit 1
 fi
 
-"$GO" run harness.go kotlin_defs_spec.go options.go astchunk.go callers.go index.go kotlin_fallback.go related.go scan.go search.go snippet.go specstore.go
+"$GO" run harness.go kotlin_defs_spec.go options.go astchunk.go callers.go index.go kotlin_fallback.go related.go related_jsts.go related_kotlin.go related_rust.go related_jni.go scan.go search.go snippet.go specstore.go
