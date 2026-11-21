@@ -398,6 +398,7 @@ func (ri *relIndex) resolve(query string) []relEntry {
 		}
 		var trace []traceRow
 		succ := map[string][]string{}
+		liveNS := map[string]bool{}
 		nkey := func(file, name string) string { return file + "\x00" + name }
 		// traceSeen is separate from `seen`: a trace row is deduped at
 		// collection time, but must NOT count as already-emitted — phase 2
@@ -447,6 +448,12 @@ func (ri *relIndex) resolve(query string) []relEntry {
 			}
 			node := nkey(target, local)
 			succ[nkey(e.From, exportedName)] = append(succ[nkey(e.From, exportedName)], node)
+			if local == "*" {
+				liveNS[node] = true
+				traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
+					Detail: fmt.Sprintf("re-exports namespace %s from %s", exportedName, target)}, node)
+				return
+			}
 			if d, ok := ri.findDef(target, local); ok {
 				traceAdd(relEntry{Path: e.From, Line: e.Line, Kind: "re-export",
 					Detail: fmt.Sprintf("re-exports %s from %s (defined %s:%d)", exportedName, target, target, d.Line)}, node)
@@ -489,7 +496,7 @@ func (ri *relIndex) resolve(query string) []relEntry {
 		if len(trace) > 0 {
 			live := map[string]bool{}
 			isLive := func(node string) bool {
-				return ri.liveBase[node] || live[node]
+				return ri.liveBase[node] || live[node] || liveNS[node]
 			}
 			for changed := true; changed; {
 				changed = false
@@ -537,14 +544,14 @@ func (ri *relIndex) resolve(query string) []relEntry {
 	// query's snake form) or by its JS name (covers js_name overrides,
 	// whose JS name does not round-trip to the Rust name).
 	if len(ri.bridges) > 0 {
-		rustName := toSnake(query)
-		camelName := toCamel(query)
-		if len(ri.byRustName[rustName]) > 0 || len(ri.byJSName[query]) > 0 || len(ri.byJSName[camelName]) > 0 {
+		rustName := toSnake(want)
+		camelName := toCamel(want)
+		if len(ri.byRustName[rustName]) > 0 || len(ri.byJSName[want]) > 0 || len(ri.byJSName[camelName]) > 0 {
 			for _, b := range ri.bridges {
 				if b.Kind == "jni" {
 					continue // JNI bridges are matched below, by base key
 				}
-				if b.RustName != rustName && b.JSName != query && b.JSName != camelName {
+				if b.RustName != rustName && b.JSName != want && b.JSName != camelName {
 					continue
 				}
 				jsDef := ""

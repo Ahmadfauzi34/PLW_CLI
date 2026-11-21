@@ -89,6 +89,8 @@ var astLangs = []astLang{
 		(function_declaration name: (identifier) @name body: (block)? @body) @def
 		(method_declaration name: (field_identifier) @name body: (block)? @body) @def
 		(type_spec name: (type_identifier) @name) @def
+		(type_alias name: (type_identifier) @name) @def
+		(method_elem name: (field_identifier) @name) @def
 	]`},
 	{".rs", grammars.RustLanguage, `[
 		(function_item name: (identifier) @name body: (block)? @body) @def
@@ -98,6 +100,7 @@ var astLangs = []astLang{
 		(trait_item name: (type_identifier) @name) @def
 		(impl_item type: (_) @name) @def
 		(type_item name: (type_identifier) @name) @def
+		(macro_definition name: (identifier) @name) @def
 	]`},
 	{".py", grammars.PythonLanguage, `[
 		(function_definition name: (identifier) @name body: (block) @body) @def

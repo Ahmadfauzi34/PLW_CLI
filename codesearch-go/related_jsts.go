@@ -63,36 +63,99 @@ func getRelVarSpec(ext string) (*callSpec, bool) {
 }
 
 var (
-	reFromClause = regexp.MustCompile(`from\s+['"]([^'"]+)['"]`)
-	reExportFn   = regexp.MustCompile(`^export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)`)
-	reExportCls  = regexp.MustCompile(`^export\s+(?:default\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	reExportVar  = regexp.MustCompile(`^export\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
+	reFromClause    = regexp.MustCompile(`from\s+['"]([^'"]+)['"]`)
+	reExportStarAs  = regexp.MustCompile(`^export\s+(?:type\s+)?\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"]([^'"]+)['"]`)
+	reExportStar    = regexp.MustCompile(`^export\s+(?:type\s+)?\*\s+from\s+['"]([^'"]+)['"]`)
+	reLocalExport   = regexp.MustCompile(`^export\s+(?:type\s+)?\{`)
+	reExportDefault = regexp.MustCompile(`^export\s+default\b`)
+	reExportVar     = regexp.MustCompile(`^export\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
 )
 
+// stripJSComments removes // line comments and /* ... */ block comments from
+// a JS/TS export statement while preserving single- and double-quoted string
+// literals (such as module specifiers in `from "./mod"`). Each comment is
+// replaced with a single space so adjacent tokens never merge.
+func stripJSComments(s string) string {
+	if !strings.Contains(s, "//") && !strings.Contains(s, "/*") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '"' || s[i] == '\'' {
+			q := s[i]
+			b.WriteByte(q)
+			i++
+			for i < len(s) {
+				b.WriteByte(s[i])
+				if s[i] == '\\' && i+1 < len(s) {
+					i++
+					b.WriteByte(s[i])
+					i++
+					continue
+				}
+				if s[i] == q {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if s[i] == '/' && i+1 < len(s) && s[i+1] == '/' {
+			i += 2
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			b.WriteByte(' ')
+			continue
+		}
+		if s[i] == '/' && i+1 < len(s) && s[i+1] == '*' {
+			i += 2
+			for i+1 < len(s) && !(s[i] == '*' && s[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(s) {
+				i += 2
+			} else {
+				i = len(s)
+			}
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 // parseBraceNames parses the {..} list of an export statement into
-// exported -> local names ("a as b" maps b -> a; "type " prefixes are
-// stripped). Shared by the named re-export and local export-list forms
-// of parseExportStmt — they differed only in the edge Target, never in
-// list parsing. ok=false when the braces are missing/misordered or the
-// list is empty.
+// exported -> local names ("a as b" maps b -> a; "type " prefixes and
+// JS/TS comments are stripped; tabs/newlines around `as` or `type` are
+// supported). ok=false when braces are missing/misordered or empty.
 func parseBraceNames(t string) (map[string]string, bool) {
-	open := strings.Index(t, "{")
-	close := strings.LastIndex(t, "}")
+	clean := stripJSComments(t)
+	open := strings.Index(clean, "{")
+	close := strings.LastIndex(clean, "}")
 	if open < 0 || close < 0 || close < open {
 		return nil, false
 	}
 	names := map[string]string{}
-	for _, item := range strings.Split(t[open+1:close], ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
+	for _, item := range strings.Split(clean[open+1:close], ",") {
+		toks := strings.Fields(item)
+		if len(toks) == 0 {
 			continue
 		}
-		item = strings.TrimPrefix(item, "type ")
-		parts := strings.Split(item, " as ")
-		if len(parts) == 2 {
-			names[strings.TrimSpace(parts[1])] = strings.TrimSpace(parts[0])
+		if len(toks) > 1 && toks[0] == "type" {
+			toks = toks[1:]
+		}
+		if len(toks) == 3 && toks[1] == "as" {
+			names[toks[2]] = toks[0]
+		} else if len(toks) == 1 {
+			names[toks[0]] = toks[0]
 		} else {
-			names[item] = item
+			joined := strings.Join(toks, " ")
+			names[joined] = joined
 		}
 	}
 	if len(names) == 0 {
@@ -102,14 +165,15 @@ func parseBraceNames(t string) (map[string]string, bool) {
 }
 
 // parseExportStmt classifies one export statement's text into an edge
-// and/or a local const def. Returns (edge, edgeOK, def, defOK).
+// and/or a local def (const/let/var or `default`). Returns (edge, edgeOK, def, defOK).
 func parseExportStmt(from, text string, line int) (relEdge, bool, relDef, bool) {
-	t := strings.TrimSpace(text)
-	if strings.HasPrefix(t, "export *") {
-		m := reFromClause.FindStringSubmatch(t)
-		if m == nil {
-			return relEdge{}, false, relDef{}, false
-		}
+	t := strings.TrimSpace(stripJSComments(text))
+	if m := reExportStarAs.FindStringSubmatch(t); m != nil {
+		// Namespace re-export (`export * as NS from "./mod"`): binds NS
+		// to the target module without re-exporting its members at top level.
+		return relEdge{From: from, Line: line, Target: m[2], Names: map[string]string{m[1]: "*"}}, true, relDef{}, false
+	}
+	if m := reExportStar.FindStringSubmatch(t); m != nil {
 		return relEdge{From: from, Line: line, Target: m[1], Star: true}, true, relDef{}, false
 	}
 	if m := reFromClause.FindStringSubmatch(t); m != nil {
@@ -120,13 +184,18 @@ func parseExportStmt(from, text string, line int) (relEdge, bool, relDef, bool) 
 		}
 		return relEdge{From: from, Line: line, Target: m[1], Names: names}, true, relDef{}, false
 	}
-	if strings.HasPrefix(t, "export {") {
-		// Local export list: names defined in this same file.
+	if reLocalExport.MatchString(t) {
+		// Local export list (including `export type { ... }`): names defined in this same file.
 		names, ok := parseBraceNames(t)
 		if !ok {
 			return relEdge{}, false, relDef{}, false
 		}
 		return relEdge{From: from, Line: line, Target: "", Names: names}, true, relDef{}, false
+	}
+	if reExportDefault.MatchString(t) {
+		// Record `"default"` at the export-default line so `export { default as X } from ...`
+		// resolves cleanly to this module without interfering with named defs.
+		return relEdge{}, false, relDef{Path: from, Line: line, Name: "default"}, true
 	}
 	// Declaration form: function/class defs are already captured by the
 	// def query; only const/let/var needs recording here.
@@ -135,10 +204,6 @@ func parseExportStmt(from, text string, line int) (relEdge, bool, relDef, bool) 
 	}
 	return relEdge{}, false, relDef{}, false
 }
-
-// stripRustComments removes // line comments and (possibly nested)
-// /* ... */ block comments from a Rust use statement, replacing each
-// comment with a single space so adjacent tokens never merge.
 
 func extractRelatedJS(relPath string, src []byte, li lineIndex) ([]relDef, []relEdge, []relBridge, []relJNIDecl, bool) {
 	ext := extOf(relPath)

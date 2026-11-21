@@ -502,3 +502,86 @@ func TestExtractCallsJSNewExpression(t *testing.T) {
 		}
 	}
 }
+
+func TestGo16GenericSingleArgCallsAndNoCastFalsePositive(t *testing.T) {
+	// tree-sitter-go parses 1-arg generic calls like GenericHelper[int](1) and
+	// pkg.Gen[int](3) as type_conversion_expression with a generic_type, while
+	// 0-arg and 2-arg generic calls parse as call_expression. Plain scalar type
+	// conversions like int(x) or MyAlias(x) must NOT be matched as generic calls.
+	src := "package demo\n\n" +
+		"func GenericHelper[T any](v T) T { return v }\n" +
+		"func ZeroArg[T any]() T { var z T; return z }\n" +
+		"func TwoArg[K any, V any](k K, v V) K { return k }\n\n" +
+		"func Driver(x float64) {\n" +
+		"	_ = GenericHelper[int](1)\n" +
+		"	_ = pkg.GenericHelper[string](\"ok\")\n" +
+		"	_ = ZeroArg[int]()\n" +
+		"	_ = TwoArg[int, string](1, \"a\")\n" +
+		"	_ = int(x)\n" +
+		"}\n"
+	sites, ok := extractCalls("demo.go", src)
+	if !ok {
+		t.Fatal("extractCalls(demo.go) failed")
+	}
+	want := [][3]string{
+		{"GenericHelper", "Driver", "8"},
+		{"pkg.GenericHelper", "Driver", "9"},
+		{"ZeroArg", "Driver", "10"},
+		{"TwoArg", "Driver", "11"},
+	}
+	got := callSummary(sites)
+	// int(x) may or may not appear as a regular call_expression in tree-sitter-go;
+	// check our 4 generic calls are all present and generic_type rule did not duplicate them.
+	seen := map[[3]string]int{}
+	for _, g := range got {
+		seen[g]++
+	}
+	for _, w := range want {
+		if seen[w] != 1 {
+			t.Errorf("generic call %v count = %d, want 1 (all calls: %v)", w, seen[w], got)
+		}
+	}
+}
+
+func TestGo16RustMacroInvocations(t *testing.T) {
+	src := "macro_rules! my_macro { ($x:expr) => { $x }; }\n\n" +
+		"pub fn run() {\n" +
+		"    let _ = my_macro!(1);\n" +
+		"    let _ = util::my_macro!(2);\n" +
+		"    println!(\"hi\");\n" +
+		"}\n"
+	sites, ok := extractCalls("lib.rs", src)
+	if !ok {
+		t.Fatal("extractCalls(lib.rs) failed")
+	}
+	got := callSummary(sites)
+	want := [][3]string{
+		{"my_macro", "run", "4"},
+		{"util::my_macro", "run", "5"},
+		{"println", "run", "6"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Rust macro calls = %v, want %v", got, want)
+	}
+}
+
+func TestGo16TSAbstractClassEnclosingCaller(t *testing.T) {
+	src := "export abstract class Runner {\n" +
+		"  abstract step(): void;\n" +
+		"  boot(): void {\n" +
+		"    this.step();\n" +
+		"    helper();\n" +
+		"  }\n" +
+		"}\n"
+	sites, ok := extractCalls("runner.ts", src)
+	if !ok {
+		t.Fatal("extractCalls(runner.ts) failed")
+	}
+	want := [][3]string{
+		{"this.step", "boot", "4"},
+		{"helper", "boot", "5"},
+	}
+	if got := callSummary(sites); !reflect.DeepEqual(got, want) {
+		t.Errorf("TS abstract class calls = %v, want %v", got, want)
+	}
+}

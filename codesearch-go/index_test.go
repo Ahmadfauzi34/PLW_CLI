@@ -63,10 +63,10 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected the just-saved go15 index")
+		t.Fatal("loadDiskIndex rejected the just-saved go16 index")
 	}
-	if di.SchemaV != "go15" {
-		t.Errorf("SchemaV = %q, want go15", di.SchemaV)
+	if di.SchemaV != "go16" {
+		t.Errorf("SchemaV = %q, want go16", di.SchemaV)
 	}
 	if got := di.Files["bin.rs"].Skip; got != "binary" {
 		t.Errorf("reloaded bin.rs Skip = %q, want binary", got)
@@ -74,11 +74,11 @@ func TestSkipPersistsAcrossSaveLoad(t *testing.T) {
 }
 
 func TestOldSchemaRejected(t *testing.T) {
-	// A go14 cache (pre-go15 RelEdges/RelBridges/RelJNI) must not load under
-	// schema go15: stale caches rebuild automatically instead of serving
+	// A go15 cache (pre-go16 Chunks/CallSites/RelDefs/RelEdges) must not load under
+	// schema go16: stale caches rebuild automatically instead of serving
 	// stale rows.
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go14", Files: map[string]FileMeta{}}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(diskIndex{SchemaV: "go15", Files: map[string]FileMeta{}}); err != nil {
 		t.Fatal(err)
 	}
 	db := filepath.Join(t.TempDir(), "old.gob")
@@ -86,7 +86,7 @@ func TestOldSchemaRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := loadDiskIndex(db); ok {
-		t.Error("loadDiskIndex accepted a go14 index, want rejection")
+		t.Error("loadDiskIndex accepted a go15 index, want rejection")
 	}
 }
 
@@ -147,7 +147,7 @@ func TestKotlinParityPersistsAcrossSaveLoad(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected saved go15 index")
+		t.Fatal("loadDiskIndex rejected saved go16 index")
 	}
 	check("reloaded", memFromDisk(di).relDefs, memFromDisk(di).callSites)
 }
@@ -319,7 +319,7 @@ func TestCachedCallsAndGeneratedPersistAcrossSync(t *testing.T) {
 	}
 	di, ok := loadDiskIndex(db)
 	if !ok {
-		t.Fatal("loadDiskIndex rejected saved go15 index")
+		t.Fatal("loadDiskIndex rejected saved go16 index")
 	}
 	if !di.Files["src/types.d.ts"].Generated || !di.Files["public/assets/bundle.js"].Generated {
 		t.Errorf("FileMeta.Generated lost across gob save/load: %+v", di.Files)
@@ -364,5 +364,89 @@ func TestCachedCallsAndGeneratedPersistAcrossSync(t *testing.T) {
 		if rd.Path == "src/app.ts" || rd.Path == "src/extra.jsx" {
 			t.Errorf("stale relDef survived sync: %+v", rd)
 		}
+	}
+}
+
+func TestGo16CalibrationPersistsAcrossSaveLoad(t *testing.T) {
+	// All go16-calibrated rows (Go type_alias/method_elem/1-arg generic call,
+	// TS abstract class/method + export * as NS, Rust macro_rules!/invocation)
+	// must survive gob save/load so --cached answers identically to a fresh scan.
+	root := t.TempDir()
+	files := map[string]string{
+		"pkg.go":    "package p\n\ntype Alias = int\n\ntype Worker interface {\n\tDoWork(x int) error\n}\n\nfunc Gen[T any](v T) T { return v }\n\nfunc Run() int {\n\treturn Gen[int](42)\n}\n",
+		"mod.ts":    "export abstract class BaseService {\n\tabstract execute(): void;\n\trun(): void { this.execute(); }\n}\n",
+		"barrel.ts": "export * as SvcNS from './mod';\n",
+		"lib.rs":    "macro_rules! make_val {\n\t($x:expr) => { $x + 1 };\n}\n\npub fn use_macro() -> i32 {\n\tmake_val!(5)\n}\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ix, _ := buildFull(root, defaultScanConfig())
+	db := filepath.Join(t.TempDir(), "index.gob")
+	if err := ix.save(db); err != nil {
+		t.Fatal(err)
+	}
+	di, ok := loadDiskIndex(db)
+	if !ok {
+		t.Fatal("loadDiskIndex rejected saved go16 index")
+	}
+	ix2 := memFromDisk(di)
+
+	// Verify chunks (defs) survived
+	haveDef := map[string]bool{}
+	for _, c := range ix2.chunks {
+		if c.Name != "" {
+			haveDef[c.Path+":"+c.Name] = true
+		}
+	}
+	for _, want := range []string{
+		"pkg.go:Alias",
+		"pkg.go:DoWork",
+		"mod.ts:BaseService",
+		"mod.ts:execute",
+		"lib.rs:make_val",
+	} {
+		if !haveDef[want] {
+			t.Errorf("reloaded chunks missing def %q (got: %v)", want, haveDef)
+		}
+	}
+
+	// Verify callers survived
+	haveCall := map[string]bool{}
+	for _, cs := range ix2.callSites {
+		haveCall[cs.Path+":"+calleeBase(cs.Callee)+"@"+cs.Caller] = true
+	}
+	for _, want := range []string{
+		"pkg.go:Gen@Run",
+		"lib.rs:make_val@use_macro",
+		"mod.ts:execute@run",
+	} {
+		if !haveCall[want] {
+			t.Errorf("reloaded callSites missing %q (got: %v)", want, haveCall)
+		}
+	}
+
+	// Verify namespace re-export survived without false positive on BaseService
+	fileSet := map[string]bool{}
+	for p := range ix2.files {
+		fileSet[p] = true
+	}
+	rowsBase := resolveRelated("BaseService", ix2.relDefs, ix2.relEdges, ix2.relBridges, ix2.relJNI, fileSet)
+	for _, r := range rowsBase {
+		if r.Path == "barrel.ts" {
+			t.Errorf("barrel.ts falsely listed for BaseService via export * as SvcNS: %+v", r)
+		}
+	}
+	rowsNS := resolveRelated("SvcNS", ix2.relDefs, ix2.relEdges, ix2.relBridges, ix2.relJNI, fileSet)
+	foundNS := false
+	for _, r := range rowsNS {
+		if r.Path == "barrel.ts" && r.Kind == "re-export" && strings.Contains(r.Detail, "namespace SvcNS") {
+			foundNS = true
+		}
+	}
+	if !foundNS {
+		t.Errorf("reloaded --related SvcNS missing namespace reexport row: %+v", rowsNS)
 	}
 }

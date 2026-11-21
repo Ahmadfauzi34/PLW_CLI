@@ -5,13 +5,13 @@ If this document and the code disagree, the code wins and this
 document must be fixed in the same change — a stale contract is
 worse than none, because the adapter trusts it.
 
-## Current schema: `go15`
+## Current schema: `go16`
 
-`schemaV` (`index.go`) is `go15`. PLW's adapter
+`schemaV` (`index.go`) is `go16`. PLW's adapter
 (`core/codesearch_engine.py`) accepts exactly the schemas listed in
-`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13", "go14", "go15"}`.
+`SUPPORTED_SCHEMAS` there; today that is `{"go9", "go10", "go11", "go12", "go13", "go14", "go15", "go16"}`.
 
-### What `go15` guarantees
+### What `go16` guarantees
 
 1. **Index format.** A gob index (`diskIndex`) with fields
    `SchemaV`, `Root`, `Chunks`, `Files` (with `FileMeta.Skip`
@@ -181,7 +181,37 @@ worse than none, because the adapter trusts it.
        A go14 index carries pre-go15 `RelEdges`/`RelBridges`/`RelJNI`
        and is rejected by the schema bump, never silently served.
 
-### What `go15` does NOT guarantee
+16. **Multi-language AST/callers/related calibration (go16).**
+    a. **Go generic calls, type aliases, and interface methods.**
+       `--callers` captures single-type-argument generic calls
+       (`Fn[T](x)` / `pkg.Fn[T](x)`), which `tree-sitter-go` parses as
+       `type_conversion_expression` with a `generic_type` target, without
+       matching plain scalar type conversions. `--defs-only` and AST
+       chunking capture Go `type_alias` (`type A = B`) and interface
+       `method_elem` declarations (`DoWork(x int) error`).
+    b. **TypeScript abstract declarations.**
+       `tsDefQuery` captures `abstract_class_declaration` and
+       `abstract_method_signature`, surfacing them in `--defs-only`,
+       `--callers` enclosing-caller attribution, and `--related`.
+    c. **Rust macros (`macro_rules!` & invocations).**
+       `--defs-only` and `--related` capture `macro_definition`
+       (`macro_rules!`), and `--callers` captures `macro_invocation`
+       (both bare `m!(...)` and scoped `pkg::m!(...)`).
+    d. **JS/TS re-export precision & qualified `wasm_bindgen` queries.**
+       `export * as NS from './mod'` records a namespace re-export edge
+       (`Names: {NS: "*"}`) rather than a wildcard star edge, eliminating
+       false-positive top-level re-export rows while resolving `NS` as a
+       live namespace re-export. `parseExportStmt`/`parseBraceNames`
+       strip JS `//`/`/*...*/` comments (preserving quoted strings),
+       handle whitespace/newlines around `type` and `as`, handle local
+       `export type { ... }` lists, and record `export default ...` so
+       `export { default as X } from './mod'` resolves. `wasm_bindgen`
+       lookup in `resolveRelated` runs on `calleeBase(query)` so qualified
+       Rust/JS queries (`wasm::parse_doc`, `api.parseDoc`) resolve.
+       A `go15` index carries pre-go16 `Chunks`/`CallSites`/`RelDefs`/`RelEdges`
+       and is rejected by the schema bump, never silently served.
+
+### What `go16` does NOT guarantee
 
 - **Type resolution.** `--callers` and `--related` remain name-based
   on the trailing identifier; rows are leads to verify against source.
@@ -234,13 +264,21 @@ older).
 
 ## History
 
+- `go16` (2026-11-21): Multi-language calibration — Go 1-arg generic
+  calls (`type_conversion_expression` with `generic_type`), Go
+  `type_alias` & interface `method_elem` defs; TS `abstract class` &
+  `abstract` method defs; Rust `macro_rules!` defs & `macro_invocation`
+  callers; JS/TS `export * as NS` namespace re-export (eliminating star
+  false positives), comment/multiline/type/default export edges;
+  qualified `wasm_bindgen` queries via `calleeBase`; `go15` indexes
+  rejected and rebuilt. Still current.
 - `go15` (2026-11-21): Rust `pub use` comment stripping, `self as alias`,
   and bare `super`/`crate`/`self` import resolution; Kotlin JNI
   `@JvmStatic` companion outer-class binding, named companion objects,
   and comment-safe `package` extraction; JNI `--related` qualified Rust
   queries, coarse-filtered detail, `#[cfg]` same-file line dedup, and
   explicit `Kind: "wasm"` on bindgen bridges; `go14` indexes rejected
-  and rebuilt. Still current.
+  and rebuilt.
 - `go14` (2026-11-21): P1-A calleeBase right-to-left (indexed/turbofish
   receivers), P1-B Rust `--related` defs + `pub use` edges, P1-C Kotlin
   regex fallback always merged (incl. one level of nested parens in
