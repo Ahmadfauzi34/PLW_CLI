@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const schemaV = "go15" // go15: Rust `pub use` comments/`self as alias`/bare super|crate|self resolution, Kotlin JNI @JvmStatic companion + named companion + comment-safe package, JNI resolve qualified query/coarse detail/#[cfg] lines, explicit Kind:"wasm"; a go14 index is rejected (stale RelEdges/RelBridges/RelJNI); was go14
+const schemaV = "go16" // go16: Go 1-arg generic calls + type_alias/interface method_elem, TS abstract class/method defs, Rust macro_rules!/macro_invocation, JS/TS export * as NS + comment/multiline/type/default export edges, wasm_bindgen qualified query; a go15 index is rejected (stale Chunks/CallSites/RelDefs/RelEdges); was go15
 
 // FileMeta is one manifest row: (path -> mtime, size, AST-chunked?).
 type FileMeta struct {

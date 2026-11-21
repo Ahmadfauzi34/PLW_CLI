@@ -77,7 +77,16 @@ grep -Fq "from core.kernel.work_policy import" hott_kernel.py
 grep -Fq "from core.simplification.js_frontend import" core/simplification_analyzer.py
 python3 -m py_compile hott_kernel.py core/kernel/*.py core/simplification_analyzer.py core/simplification/*.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 3 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3 on baked capsule v0.2.41)"
+apply_reviewable_overlay "engine_state_v8"
+grep -Fq 'KNOWN_SCHEMA = "go16"' core/codesearch_engine.py
+grep -Fq '"go16": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+python3 -m py_compile core/codesearch_engine.py
+
+apply_reviewable_overlay "engine_pin_v17"
+grep -Fq "4ace319063b87e3c120ad5d971ea2aa12e0a3c94f009550ca48193982bdb78b3" core/codesearch_engine.py
+python3 -m py_compile core/codesearch_engine.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 5 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py
@@ -86,9 +95,9 @@ grep -Fq 'def _non_cyclic_rust_mod_edges(' codebase/cycle_break.py
 grep -Fq '"optional_type_only_cuts"' codebase/cycle_break.py
 grep -Fq '"type_only_cyclic_sccs"' core/target_topology.py
 grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
-grep -Fq 'KNOWN_SCHEMA = "go15"' core/codesearch_engine.py
-grep -Fq '"go15": "plw-codesearch-engine-v1"' core/codesearch_engine.py
-grep -Fq 'b47b9f9f1ca432f161af8fa09bd8d6350755aab5acb65d9987a9f81e1f6d9487' core/codesearch_engine.py
+grep -Fq 'KNOWN_SCHEMA = "go16"' core/codesearch_engine.py
+grep -Fq '"go16": "plw-codesearch-engine-v1"' core/codesearch_engine.py
+grep -Fq '4ace319063b87e3c120ad5d971ea2aa12e0a3c94f009550ca48193982bdb78b3' core/codesearch_engine.py
 
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'

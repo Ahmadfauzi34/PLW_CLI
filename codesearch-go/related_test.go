@@ -1296,3 +1296,105 @@ func TestResolveRelatedJNIPolish(t *testing.T) {
 		t.Errorf("related(ping) with #[cfg] variants = %+v, want lines 30 and 40", ffi)
 	}
 }
+
+func TestGo16JSTSNamespaceCommentsTypeAndDefaultExports(t *testing.T) {
+	// 1. export * as MyNS from './mod' must NOT falsely attribute helper to barrel.ts,
+	//    and MUST resolve MyNS as a namespace re-export of './mod'.
+	// 2. Comments + multiline/tabs around `as` / `type` in export { ... }.
+	// 3. `export type { LocalCfg as ExportedCfg }` local export list.
+	// 4. `export default ...` + `export { default as RenamedDefault } from './defexp'`.
+	filesSrc := map[string]string{
+		"src/mod.ts":        "export function helper() { return 1; }\nexport abstract class BaseSvc { abstract run(): void; }\n",
+		"src/barrel.ts":     "export * as MyNS from './mod';\nexport * as OuterNS from './barrel_mid';\n",
+		"src/barrel_mid.ts": "export * from './mod';\n",
+		"src/comments.ts":   "export {\n  /* leading comment */\n  type\n    helper\t// inline comment\n    as\n    AliasedHelper,\n} from './mod';\n",
+		"src/direct.ts":     "export {\n  /* direct */\n  helper, // trailing\n} from './mod';\n",
+		"src/local_type.ts": "interface LocalCfg { ok: boolean }\nexport type { LocalCfg as ExportedCfg };\n",
+		"src/defexp.ts":     "export default function implDefault() { return 42; }\n",
+		"src/redef.ts":      "export { default as RenamedDefault } from './defexp';\n",
+	}
+	var defs []relDef
+	var edges []relEdge
+	fileSet := map[string]bool{}
+	for path, body := range filesSrc {
+		fileSet[path] = true
+		d, e, _, _, _ := extractRelated(path, body)
+		defs = append(defs, d...)
+		edges = append(edges, e...)
+	}
+
+	// helper: must NOT appear in barrel.ts (export * as MyNS), MUST appear in mod.ts, barrel_mid.ts, & direct.ts
+	rowsHelper := resolveRelated("helper", defs, edges, nil, nil, fileSet)
+	for _, r := range rowsHelper {
+		if r.Path == "src/barrel.ts" {
+			t.Errorf("helper falsely resolved through export * as MyNS in barrel.ts: %+v", r)
+		}
+	}
+	if !hasRow(rowsHelper, "def", "src/mod.ts") || !hasRow(rowsHelper, "re-export", "src/direct.ts") {
+		t.Errorf("helper rows = %+v, want def src/mod.ts + re-export src/direct.ts", rowsHelper)
+	}
+
+	// AliasedHelper: comment + multiline type/as re-export resolves to defined src/mod.ts:1
+	rowsAlias := resolveRelated("AliasedHelper", defs, edges, nil, nil, fileSet)
+	if len(rowsAlias) != 1 || rowsAlias[0].Path != "src/comments.ts" || rowsAlias[0].Kind != "re-export" || !strings.Contains(rowsAlias[0].Detail, "(defined src/mod.ts:1)") {
+		t.Errorf("AliasedHelper rows = %+v, want re-export src/comments.ts -> defined src/mod.ts:1", rowsAlias)
+	}
+
+	// MyNS & OuterNS: resolve as live namespace re-exports (including to a barrel file)
+	rowsNS := resolveRelated("MyNS", defs, edges, nil, nil, fileSet)
+	if len(rowsNS) != 1 || rowsNS[0].Path != "src/barrel.ts" || rowsNS[0].Kind != "re-export" || !strings.Contains(rowsNS[0].Detail, "namespace MyNS from src/mod.ts") {
+		t.Errorf("MyNS rows = %+v, want namespace re-export from src/mod.ts", rowsNS)
+	}
+	rowsOuter := resolveRelated("OuterNS", defs, edges, nil, nil, fileSet)
+	if len(rowsOuter) != 1 || rowsOuter[0].Path != "src/barrel.ts" || !strings.Contains(rowsOuter[0].Detail, "namespace OuterNS from src/barrel_mid.ts") {
+		t.Errorf("OuterNS rows = %+v, want namespace re-export from src/barrel_mid.ts", rowsOuter)
+	}
+
+	// BaseSvc: abstract class in TS must be found as def
+	rowsAbs := resolveRelated("BaseSvc", defs, edges, nil, nil, fileSet)
+	if !hasRow(rowsAbs, "def", "src/mod.ts") {
+		t.Errorf("BaseSvc rows = %+v, want def in src/mod.ts", rowsAbs)
+	}
+
+	// ExportedCfg: `export type { LocalCfg as ExportedCfg }` local type alias edge resolves back to LocalCfg:1
+	rowsLocal := resolveRelated("ExportedCfg", defs, edges, nil, nil, fileSet)
+	if len(rowsLocal) != 1 || rowsLocal[0].Path != "src/local_type.ts" || rowsLocal[0].Kind != "re-export" || !strings.Contains(rowsLocal[0].Detail, "(defined src/local_type.ts:1)") {
+		t.Errorf("ExportedCfg rows = %+v, want re-export src/local_type.ts -> defined src/local_type.ts:1", rowsLocal)
+	}
+
+	// RenamedDefault: `export { default as RenamedDefault } from './defexp'` resolves to defined src/defexp.ts:1
+	rowsDef := resolveRelated("RenamedDefault", defs, edges, nil, nil, fileSet)
+	if len(rowsDef) != 1 || rowsDef[0].Path != "src/redef.ts" || rowsDef[0].Kind != "re-export" || !strings.Contains(rowsDef[0].Detail, "(defined src/defexp.ts:1)") {
+		t.Errorf("RenamedDefault rows = %+v, want re-export src/redef.ts -> defined src/defexp.ts:1", rowsDef)
+	}
+}
+
+func TestGo16WasmBindgenQualifiedQueryAndRustMacroDef(t *testing.T) {
+	rsSrc := "#[wasm_bindgen(js_name = parseDoc)]\npub fn parse_doc() {}\n\nmacro_rules! emit_err { () => {}; }\n"
+	defs, edges, bridges, jni, _ := extractRelated("src/wasm.rs", rsSrc)
+	files := map[string]bool{"src/wasm.rs": true}
+
+	// Qualified Rust path and qualified JS call must both hit the wasm_bindgen bridge.
+	for _, q := range []string{"wasm::parse_doc", "api.parseDoc"} {
+		rows := resolveRelated(q, defs, edges, bridges, jni, files)
+		ffi := filterKind(rows, "ffi")
+		if len(ffi) != 1 || ffi[0].Path != "src/wasm.rs" {
+			t.Errorf("related(%q) ffi = %+v, want 1 wasm_bindgen row in src/wasm.rs", q, ffi)
+		}
+	}
+
+	// Rust macro_rules! must appear in related defs.
+	rowsMacro := resolveRelated("emit_err", defs, edges, bridges, jni, files)
+	if !hasRow(rowsMacro, "def", "src/wasm.rs") {
+		t.Errorf("related(emit_err) = %+v, want def in src/wasm.rs", rowsMacro)
+	}
+}
+
+func hasRow(rows []relEntry, kind, path string) bool {
+	for _, r := range rows {
+		if r.Kind == kind && r.Path == path {
+			return true
+		}
+	}
+	return false
+}

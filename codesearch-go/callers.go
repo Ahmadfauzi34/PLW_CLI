@@ -65,9 +65,11 @@ const ktCallQuery = `[
 var callLangs = []callLang{
 	{".go", grammars.GoLanguage, `[
 		(call_expression function: (_) @callee) @call
+		(type_conversion_expression type: (generic_type type: (_) @callee)) @call
 	]`},
 	{".rs", grammars.RustLanguage, `[
 		(call_expression function: (_) @callee) @call
+		(macro_invocation macro: (_) @callee) @call
 	]`},
 	{".py", grammars.PythonLanguage, `[
 		(call function: (_) @callee) @call
@@ -157,7 +159,9 @@ const jsDefQuery = `[
 var tsDefQuery = strings.TrimSuffix(strings.Replace(jsDefQuery,
 	"(class_declaration name: (identifier) @name)",
 	"(class_declaration name: [(identifier) (type_identifier)] @name)", 1), "]") +
-	"\n\t(method_signature name: (property_identifier) @name) @def\n]"
+	"\n\t(abstract_class_declaration name: [(identifier) (type_identifier)] @name) @def" +
+	"\n\t(method_signature name: (property_identifier) @name) @def" +
+	"\n\t(abstract_method_signature name: (property_identifier) @name) @def\n]"
 
 var callerDefLangs = []callLang{
 	{".js", grammars.JavascriptLanguage, jsDefQuery},

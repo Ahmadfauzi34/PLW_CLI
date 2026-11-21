@@ -692,3 +692,61 @@ func TestKotlinASTAndFallbackDefsSilentGap(t *testing.T) {
 		t.Errorf("healthy file defs = %v, want {peer:3 Target:7}", got)
 	}
 }
+
+func TestGo16DefsGoAliasInterfaceTSAbstractRustMacro(t *testing.T) {
+	// Go type_alias and interface method_elem
+	goSrc := "package p\n\ntype UserID = string\n\ntype Runner interface {\n\tDoWork(x int) error\n\tStop()\n}\n"
+	chunks, ok := chunkFile("runner.go", goSrc)
+	if !ok {
+		t.Fatal("expected AST chunking for runner.go")
+	}
+	gotGo := map[string]int{}
+	for _, c := range chunks {
+		if c.name != "" {
+			gotGo[c.name] = c.startLine
+		}
+	}
+	for name, line := range map[string]int{"UserID": 3, "Runner": 5, "DoWork": 6, "Stop": 7} {
+		if gotGo[name] != line {
+			t.Errorf("Go def %s line = %d, want %d (all=%v)", name, gotGo[name], line, gotGo)
+		}
+	}
+
+	// TypeScript abstract class and abstract method signature
+	tsSrc := "export abstract class BaseWorker {\n  abstract runTask(id: number): Promise<void>;\n  stop(): void {}\n}\n"
+	for _, ext := range []string{".ts", ".tsx"} {
+		chunks, ok := chunkFile("worker"+ext, tsSrc)
+		if !ok {
+			t.Fatalf("expected AST chunking for worker%s", ext)
+		}
+		gotTS := map[string]int{}
+		for _, c := range chunks {
+			if c.name != "" {
+				gotTS[c.name] = c.startLine
+			}
+		}
+		for name, line := range map[string]int{"BaseWorker": 1, "runTask": 2, "stop": 3} {
+			if gotTS[name] != line {
+				t.Errorf("TS%s def %s line = %d, want %d (all=%v)", ext, name, gotTS[name], line, gotTS)
+			}
+		}
+	}
+
+	// Rust macro_rules!
+	rsSrc := "macro_rules! log_event {\n    ($msg:expr) => { println!(\"{}\", $msg); };\n}\n\npub fn helper() {}\n"
+	chunks, ok = chunkFile("macros.rs", rsSrc)
+	if !ok {
+		t.Fatal("expected AST chunking for macros.rs")
+	}
+	gotRS := map[string]int{}
+	for _, c := range chunks {
+		if c.name != "" {
+			gotRS[c.name] = c.startLine
+		}
+	}
+	for name, line := range map[string]int{"log_event": 1, "helper": 5} {
+		if gotRS[name] != line {
+			t.Errorf("Rust def %s line = %d, want %d (all=%v)", name, gotRS[name], line, gotRS)
+		}
+	}
+}

@@ -1,0 +1,19 @@
+--- a/core/codesearch_engine.py
++++ b/core/codesearch_engine.py
+@@ -84,7 +84,7 @@
+ 
+ CODESEARCH_ENGINE_VERSION = "codesearch-engine-v1"
+ SCHEMA_VERSION = "plw-codesearch-engine-v1"
+-KNOWN_SCHEMA = "go15"
++KNOWN_SCHEMA = "go16"
+ # G13: the adapter accepts exactly these schemas. The value names the
+ # contract each schema implements (see ENGINE_CONTRACT.md); a schema
+ # bump means a new entry here AND a new contract section, plus the
+@@ -98,6 +98,7 @@
+     "go13": "plw-codesearch-engine-v1",
+     "go14": "plw-codesearch-engine-v1",
+     "go15": "plw-codesearch-engine-v1",
++    "go16": "plw-codesearch-engine-v1",
+ }
+ # G2: digest pin. Keys are SHA256 hex digests of engine binaries PLW
+ # trusts, values name what each digest is. A binary whose digest is
