@@ -92,7 +92,13 @@ grep -Fq "_SEM_MULTI_ANGLE_TYPE_REGEX" core/shared_graph.py
 grep -Fq "annotated_assignment" core/simplification/python_frontend.py
 python3 -m py_compile core/topology_engine.py core/shared_graph.py core/simplification/python_frontend.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 6 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1 on baked capsule v0.2.41)"
+apply_reviewable_overlay "kotlin_extension_attribution_v1"
+grep -Fq "_kotlin_receiver_type" core/shared_graph.py
+grep -Fq "kotlin_extension_declarations" language_semantics.py
+grep -Fq "variant_shadow_suppressed" core/analyzer_registry.py
+python3 -m py_compile language_semantics.py core/shared_graph.py core/analyzer_registry.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 7 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1, kotlin_extension_attribution_v1 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py

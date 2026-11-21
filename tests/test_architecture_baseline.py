@@ -13,6 +13,7 @@ from codebase import cycle_break as cycle_break_mod
 from codebase.cycle_break import analyze_cycle_breaks, compute_cycle_break_advisory
 from codebase.mermaid_graph import generate_mermaid_diagram
 from codebase.topology_analyzers import analyze_circular
+from core.analyzer_registry import analyze_orphan
 from core.shared_graph import _LANGUAGE_IMPORT_RESOLVERS, build_shared_graph
 import fullstack
 import hott_kernel
@@ -245,6 +246,197 @@ class ArchitectureBaselineTests(ArchitectureBaselineCase):
         rs_lib = str((poly / "rust_pkg" / "src" / "lib.rs").resolve())
         rs_helper = str((poly / "rust_pkg" / "src" / "helper.rs").resolve())
         self.assertIn((rs_lib, rs_helper), g_live["edges"])
+
+    def test_kotlin_extension_attribution_v1_orphan_accuracy(self) -> None:
+        """G5b A'+B: extension members resolve by receiver type, never name.
+
+        Miniature of the OOPBoT `text` / `onUnhandledTap` / `TermuxBuild`
+        cases: a member name shared by two files (`text` in TimelineText
+        and MessageContent) must edge to the owner matching the receiver
+        type, a dead multi-owner import stays `kotlin_ambiguous`, a
+        name-only lookalike (`draft.text`) gets no edge, and a build
+        variant shadowed by a live twin leaves the orphan list.
+        """
+        repo = self._tmp / "g5b_repo"
+        ex = repo / "kotlin" / "com" / "example"
+        ex.mkdir(parents=True)
+        (ex / "Models.kt").write_text(
+            "package com.example\n"
+            "sealed interface TimelineItem {\n"
+            "  data class Error(val key: String, val cause: ErrorCause) : TimelineItem\n"
+            "  data class Notice(val kind: NoticeKind) : TimelineItem\n"
+            "  data class ExtensionNotice(val appNotice: AppNotice? = null) : TimelineItem\n"
+            "  data class User(val text: String) : TimelineItem\n"
+            "}\n"
+            "class ErrorCause(val message: String?)\n"
+            "enum class NoticeKind { Retrying }\n"
+            "class AppNotice\n",
+            encoding="utf-8",
+        )
+        (ex / "TimelineText.kt").write_text(
+            "package com.example\n"
+            "val NoticeKind.text: Int\n"
+            "  get() = 1\n"
+            "val AppNotice.text: Int\n"
+            "  get() = 2\n"
+            "fun ErrorCause.text(resources: String): String = \"e\"\n",
+            encoding="utf-8",
+        )
+        (ex / "MessageContent.kt").write_text(
+            "package com.example\n"
+            "internal fun JSONArray?.text(): String = \"j\"\n"
+            "internal fun JSONArray?.images(): String = \"i\"\n",
+            encoding="utf-8",
+        )
+        (ex / "ChatTimeline.kt").write_text(
+            "package com.example\n"
+            "fun userItem(message: JSONObject): String {\n"
+            "  val blocks = message.optJSONArray(\"content\")\n"
+            "  return blocks.text()\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ex / "TurnNotifications.kt").write_text(
+            "package com.example\n"
+            "fun lastReply(item: TimelineItem): String? {\n"
+            "  return when (item) {\n"
+            "    is TimelineItem.Error -> item.cause.text(\"r\")\n"
+            "    else -> null\n"
+            "  }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ex / "Trap.kt").write_text(
+            "package com.example\n"
+            "fun trap() {\n"
+            "  val draft: String = \"x\"\n"
+            "  println(draft.text)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ex / "App.kt").write_text(
+            "package com.example\n"
+            "import com.example.host.TermuxBuild\n"
+            "fun build(): String = TermuxBuild().build()\n",
+            encoding="utf-8",
+        )
+        ui = repo / "kotlin" / "com" / "example" / "ui"
+        ui.mkdir(parents=True)
+        (ui / "UnhandledTap.kt").write_text(
+            "package com.example.ui\n"
+            "internal fun Modifier.onUnhandledTap(onTap: () -> Unit): Modifier = this\n",
+            encoding="utf-8",
+        )
+        (ui / "ChatScreen.kt").write_text(
+            "package com.example.ui\n"
+            "fun screen() {\n"
+            "  Modifier.onUnhandledTap { }\n"
+            "  Modifier.fillMaxSize().onUnhandledTap { }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ui / "ExtensionMessage.kt").write_text(
+            "package com.example.ui\n"
+            "import com.example.text\n"
+            "import com.example.TimelineItem\n"
+            "fun render(item: TimelineItem): String {\n"
+            "  return item.appNotice?.let { it.text } ?: \"\"\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (ui / "DeadImport.kt").write_text(
+            "package com.example.ui\n"
+            "import com.example.text\n"
+            "import com.example.TimelineItem\n"
+            "fun show(item: TimelineItem.User) {\n"
+            "  println(item.text)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        host = repo / "kotlin" / "com" / "example" / "host"
+        host.mkdir(parents=True)
+        (host / "Bridge.kt").write_text(
+            "package com.example.host\n"
+            "class OopbotBridge {\n"
+            "  external fun start(): Int\n"
+            "  external fun stop()\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        for variant in ("debug", "release"):
+            vdir = repo / "kotlin" / variant / "com" / "example" / "host"
+            vdir.mkdir(parents=True)
+            (vdir / "TermuxBuild.kt").write_text(
+                "package com.example.host\n"
+                f"class TermuxBuild {{ fun build(): String = \"{variant}\" }}\n",
+                encoding="utf-8",
+            )
+
+        def _p(*parts: str) -> str:
+            return str((repo / "kotlin" / "/".join(parts)).resolve())
+
+        g_live = build_shared_graph(str(repo))
+        snapshot = {
+            fp: {"content": content, "imports": []}
+            for fp, content in g_live["file_map"].items()
+        }
+        g_snap = build_shared_graph(str(repo), _file_snapshot=snapshot)
+        self.assertEqual(g_live["edges"], g_snap["edges"])
+        self.assertEqual(g_live["edge_natures"], g_snap["edge_natures"])
+
+        tt = _p("com", "example", "TimelineText.kt")
+        mc = _p("com", "example", "MessageContent.kt")
+        ut = _p("com", "example", "ui", "UnhandledTap.kt")
+        tn = _p("com", "example", "TurnNotifications.kt")
+        ct = _p("com", "example", "ChatTimeline.kt")
+        trap = _p("com", "example", "Trap.kt")
+        em = _p("com", "example", "ui", "ExtensionMessage.kt")
+        di = _p("com", "example", "ui", "DeadImport.kt")
+        cs = _p("com", "example", "ui", "ChatScreen.kt")
+        bridge = _p("com", "example", "host", "Bridge.kt")
+        tb_debug = _p("debug", "com", "example", "host", "TermuxBuild.kt")
+        tb_release = _p("release", "com", "example", "host", "TermuxBuild.kt")
+
+        incoming = {}
+        for src, tgt in g_live["edges"]:
+            incoming.setdefault(tgt, set()).add(src)
+        self.assertEqual(incoming.get(tt), {tn, em})
+        self.assertEqual(incoming.get(mc), {ct})
+        self.assertEqual(incoming.get(ut), {cs})
+        self.assertEqual(
+            g_live["edge_natures"].get(f"{tn} -> {tt}"), "same_package"
+        )
+        self.assertEqual(
+            g_live["edge_natures"].get(f"{em} -> {tt}"), "runtime"
+        )
+        self.assertEqual(
+            g_live["edge_natures"].get(f"{cs} -> {ut}"), "same_package"
+        )
+        self.assertNotIn((trap, tt), g_live["edges"])
+        self.assertNotIn((di, tt), g_live["edges"])
+        self.assertNotIn((di, mc), g_live["edges"])
+        ambiguous = [
+            u for u in g_live["unresolved_imports"]
+            if u.get("importer") == di and u.get("reason") == "kotlin_ambiguous"
+        ]
+        self.assertEqual(len(ambiguous), 1)
+        self.assertEqual(
+            set(ambiguous[0].get("candidates", [])), {mc, tt}
+        )
+
+        orphans = analyze_orphan(g_live)
+        orphan_files = {f["file"] for f in orphans["findings"]}
+        self.assertIn(bridge, orphan_files)
+        self.assertNotIn(tb_release, orphan_files)
+        self.assertNotIn(tb_debug, orphan_files)
+        self.assertNotIn(tt, orphan_files)
+        self.assertNotIn(mc, orphan_files)
+        self.assertNotIn(ut, orphan_files)
+        shadows = {
+            s["file"]: s["shadow_of"]
+            for s in orphans["summary"]["variant_shadow_suppressed"]
+        }
+        self.assertEqual(shadows.get(tb_release), tb_debug)
 
     def test_hott_kernel_cli_dispatch_covers_all_public_modes(self) -> None:
         self.assertEqual(
