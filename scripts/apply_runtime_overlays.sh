@@ -86,7 +86,13 @@ apply_reviewable_overlay "engine_pin_v17"
 grep -Fq "4ace319063b87e3c120ad5d971ea2aa12e0a3c94f009550ca48193982bdb78b3" core/codesearch_engine.py
 python3 -m py_compile core/codesearch_engine.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 5 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17 on baked capsule v0.2.41)"
+apply_reviewable_overlay "calibration_py_topo_v1"
+grep -Fq "_go_grouped_type_names" core/topology_engine.py
+grep -Fq "_SEM_MULTI_ANGLE_TYPE_REGEX" core/shared_graph.py
+grep -Fq "annotated_assignment" core/simplification/python_frontend.py
+python3 -m py_compile core/topology_engine.py core/shared_graph.py core/simplification/python_frontend.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 6 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py

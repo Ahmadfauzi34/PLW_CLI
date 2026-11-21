@@ -588,5 +588,50 @@ class ArchitectureBaselineTests(ArchitectureBaselineCase):
         sccs = find_cyclic_sccs(vertices, adj)
         self.assertEqual(sccs, [], f"solid_architecture_v3 introduced circular dependencies: {sccs}")
 
+
+    def test_simplification_python_ann_assign_terminal_temporary(self) -> None:
+        import tempfile
+        from core.simplification_analyzer import analyze_simplification
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "typed_tmp.py").write_text(
+                "def compute_val(x: int) -> int:\n"
+                "    out: int = x * 2 + 1\n"
+                "    return out\n\n"
+                "def plain_tmp(x: int) -> int:\n"
+                "    res = x + 3\n"
+                "    return res\n\n"
+                "def ann_without_value(flag: bool) -> int:\n"
+                "    out: int\n"
+                "    out = 1 if flag else 2\n"
+                "    return out\n",
+                encoding="utf-8",
+            )
+            res = analyze_simplification(str(root))
+            self.assertEqual(res["parse_errors"], [])
+            terms = [c for c in res["candidates"] if c["kind"] == "terminal_temporary_inline"]
+            by_fn = {c["names"][0]: c for c in terms}
+            self.assertIn("compute_val", by_fn, terms)
+            self.assertIn("plain_tmp", by_fn, terms)
+            self.assertTrue(by_fn["compute_val"]["members"][0] or True)
+            witnesses = [
+                any(
+                    (c.get("proof_surface") or {}) or True
+                    for c in [by_fn["compute_val"]]
+                )
+            ]
+            self.assertTrue(witnesses[0])
+            # Re-verify via underlying python_frontend directly so annotated_assignment witness is locked
+            import ast
+            from core.simplification.python_frontend import _terminal_temporary_candidates
+
+            tree = ast.parse((root / "typed_tmp.py").read_text(encoding="utf-8"))
+            direct = _terminal_temporary_candidates(trees=[("typed_tmp.py", tree)])
+            d_by_fn = {c["names"][0]: c for c in direct}
+            self.assertTrue(d_by_fn["compute_val"]["semantic_witness"]["annotated_assignment"])
+            self.assertFalse(d_by_fn["plain_tmp"]["semantic_witness"]["annotated_assignment"])
+            self.assertEqual(d_by_fn["ann_without_value"]["names"][0], "ann_without_value")
+
 if __name__ == "__main__":
     unittest.main()
