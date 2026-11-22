@@ -1,0 +1,930 @@
+--- a/codebase/cycle_break.py
++++ b/codebase/cycle_break.py
+@@ -13,16 +13,22 @@
+ import re
+ 
+ from language_semantics import (
++    non_cyclic_rust_edges as _non_cyclic_rust_edges,
+     _python_relative_module,
++    _rust_strip_comments_and_strings,
+     candidate_targets as _candidate_targets,
+     is_python_type_checking_guard as _is_type_checking_guard,
+     kotlin_package_of as _kotlin_package_of,
++    kotlin_extension_declarations as _kotlin_extension_declarations,
+     kotlin_same_package_declarations as _kotlin_same_package_declarations,
++    kotlin_top_level_names as _kotlin_top_level_names,
+     normalize_path as _normalize_path,
+     parse_kotlin_imports as _parse_kotlin_imports,
+     parse_rust_imports as _parse_rust_imports,
+     python_module_candidates as _python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
++    rust_strip_cfg_test_and_imports as _rust_strip_cfg_test_and_imports,
++    rust_top_level_names as _rust_top_level_names,
+ )
+ 
+ # Architectural layer ranking (higher number = higher abstraction layer)
+@@ -240,6 +246,7 @@
+     target: str,
+     content: str,
+     parse_cache: Optional[Dict[str, Any]] = None,
++    file_map: Optional[Dict[str, str]] = None,
+ ) -> Dict[str, Any]:
+     target_norm = _normalize_path(target)
+     target_dir = os.path.dirname(target_norm)
+@@ -256,6 +263,43 @@
+     else:
+         parsed = _parse_rust_imports(content)
+ 
++    fmap = file_map or {}
++    target_content = fmap.get(target, "") or fmap.get(target_norm, "")
++    target_decls: Set[str] = set()
++    if target_content:
++        if parse_cache is not None:
++            decl_cache = parse_cache.setdefault("rust_decls", {})
++            cached_decls = decl_cache.get(target_norm)
++            if cached_decls is None:
++                cached_decls = set(_rust_top_level_names(target_content))
++                decl_cache[target_norm] = cached_decls
++            target_decls = cached_decls
++        else:
++            target_decls = set(_rust_top_level_names(target_content))
++
++    source_tokens: Optional[Set[str]] = None
++    def _get_source_tokens() -> Set[str]:
++        nonlocal source_tokens
++        if source_tokens is not None:
++            return source_tokens
++        if parse_cache is not None:
++            tok_cache = parse_cache.setdefault("rust_body_tokens", {})
++            cached_toks = tok_cache.get(source)
++            if cached_toks is None:
++                clean_p = _rust_strip_cfg_test_and_imports(_rust_strip_comments_and_strings(content))
++                cached_toks = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", clean_p))
++                tok_cache[source] = cached_toks
++            source_tokens = cached_toks
++        else:
++            clean_p = _rust_strip_cfg_test_and_imports(_rust_strip_comments_and_strings(content))
++            source_tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", clean_p))
++        return source_tokens
++
++    same_or_descendant_dir = (
++        source_dir == target_dir
++        or (bool(target_dir) and source_dir.startswith(target_dir + "/"))
++        or target_dir == ""
++    )
+     matched_syms: List[str] = []
+     matched_stmts: List[str] = []
+     mod_syms: List[str] = []
+@@ -280,14 +324,26 @@
+             or (imp.get("wildcard") and segs[-1] == target_mod_name)
+             or (segs[-1] == target_mod_name)
+         )
+-        # Also match `use super::*;` when source lives directly under target's dir (`mod.rs`).
+         if not is_mod_match and imp.get("wildcard") and raw in ("super", "crate") and target_stem == "mod":
+-            if source_dir == target_dir or source_dir.startswith(target_dir + "/"):
++            if same_or_descendant_dir:
++                is_mod_match = True
++        if not is_mod_match and not imp.get("wildcard") and target_decls:
++            last_seg = segs[-1]
++            if segs[0] == "super" and same_or_descendant_dir and last_seg in target_decls:
++                is_mod_match = True
++            elif segs[0] == "crate" and last_seg in target_decls and (
++                len(segs) <= 2 or target_mod_name in segs[1:-1] or same_or_descendant_dir
++            ):
+                 is_mod_match = True
+         if is_mod_match:
+             if not imp.get("wildcard"):
+                 for sym in imp.get("symbols", []):
+                     if sym and sym != "*" and sym not in matched_syms:
++                        matched_syms.append(sym)
++            elif target_decls:
++                used_wild = sorted(target_decls & _get_source_tokens())
++                for sym in used_wild:
++                    if sym not in matched_syms:
+                         matched_syms.append(sym)
+             stmt = imp.get("statement", "")
+             if stmt and stmt not in matched_stmts:
+@@ -342,7 +398,13 @@
+ 
+     target_content = file_map.get(target, "") or file_map.get(target_norm, "")
+     target_pkg = _kotlin_package_of(target_content) if target_content else ""
+-    target_decls = set(_kotlin_same_package_declarations(target_content).keys()) if target_content else set()
++    target_decls = (
++        set(_kotlin_same_package_declarations(target_content).keys())
++        | {m for (_recv, m) in _kotlin_extension_declarations(target_content)}
++        | set(_kotlin_top_level_names(target_content))
++        if target_content
++        else set()
++    )
+     matched_syms: List[str] = []
+     matched_stmts: List[str] = []
+     for imp in parsed:
+@@ -438,7 +500,7 @@
+     if source.endswith(".py"):
+         return _inspect_python_edge_import(source, target, content, parse_cache=parse_cache)
+     if source.endswith(".rs"):
+-        return _inspect_rust_edge_import(source, target, content, parse_cache=parse_cache)
++        return _inspect_rust_edge_import(source, target, content, parse_cache=parse_cache, file_map=file_map)
+     if source.endswith(".kt"):
+         return _inspect_kotlin_edge_import(source, target, content, file_map, parse_cache=parse_cache)
+ 
+@@ -1012,19 +1074,8 @@
+ 
+ 
+ def _non_cyclic_rust_mod_edges(shared_graph: Dict[str, Any]) -> Set[Tuple[str, str]]:
+-    """Return Rust structural module-mount edges excluded from directed cycle detection.
+-
+-    Includes `#[cfg(test)] mod <child>;` and pure `mod <child>;` declarations that
+-    carry no symbol-level `use` or inline `<child>::` path reference.
+-    """
+-    excluded: Set[Tuple[str, str]] = set()
+-    for ed in shared_graph.get("edge_details") or ():
+-        if not isinstance(ed, dict):
+-            continue
+-        usages = set(ed.get("semantic_usages") or ())
+-        if "cfg_test_mod" in usages or usages == {"rust_mod"}:
+-            excluded.add((str(ed.get("source", "")), str(ed.get("target", ""))))
+-    return excluded
++    """Return Rust structural/facade/test edges excluded from directed cycle detection."""
++    return _non_cyclic_rust_edges(shared_graph)
+ 
+ 
+ def _build_directed_adjacency(
+--- a/codebase/hott_analyzers.py
++++ b/codebase/hott_analyzers.py
+@@ -15,7 +15,10 @@
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+-from language_semantics import strip_js_comments as _strip_comments
++from language_semantics import (
++    non_cyclic_rust_edges as _non_cyclic_rust_edges,
++    strip_js_comments as _strip_comments,
++)
+ 
+ 
+ # ============================================================
+@@ -754,15 +757,7 @@
+     n_vertices = len(vertices)
+     n_edges = len(edges)
+     edge_natures = shared_graph.get("edge_natures", {})
+-    non_cyclic_mod_edges: Set[Tuple[str, str]] = {
+-        (str(ed.get("source", "")), str(ed.get("target", "")))
+-        for ed in (shared_graph.get("edge_details") or ())
+-        if isinstance(ed, dict)
+-        and (
+-            "cfg_test_mod" in (ed.get("semantic_usages") or ())
+-            or set(ed.get("semantic_usages") or ()) == {"rust_mod"}
+-        )
+-    }
++    non_cyclic_mod_edges = _non_cyclic_rust_edges(shared_graph)
+     cycle_basis = _build_undirected_cycle_basis(
+         vertices,
+         edges,
+--- a/codebase/performance_analyzers.py
++++ b/codebase/performance_analyzers.py
+@@ -41,7 +41,11 @@
+ def _is_test_file(file_path: str) -> bool:
+     norm = _normalize_path(file_path)
+     base = os.path.basename(norm)
+-    return bool(_TEST_FILE_RE.search(norm) or _TEST_BASENAME_CASE_RE.search(base))
++    return bool(
++        base in ("tests.rs", "test.rs")
++        or _TEST_FILE_RE.search(norm)
++        or _TEST_BASENAME_CASE_RE.search(base)
++    )
+ 
+ 
+ # ============================================================
+--- a/codebase/topology_analyzers.py
++++ b/codebase/topology_analyzers.py
+@@ -16,7 +16,20 @@
+ import re
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+-from language_semantics import is_tool_config_file as _is_tool_config_file, normalize_path as _normalize_path, strip_js_comments as _strip_comments
++from language_semantics import (
++    is_tool_config_file as _is_tool_config_file,
++    normalize_path as _normalize_path,
++    rust_has_inline_tests as _rust_has_inline_tests,
++    strip_js_comments as _strip_comments,
++)
++
++_TEST_CASE_MARKER_RE = re.compile(
++    r"@\s*(?:org\.junit\.(?:jupiter\.api\.)?|kotlin\.test\.)?Test\b"
++    r"|#\[\s*(?:[A-Za-z_][\w]*::)*test\b"
++    r"|^\s*(?:async\s+)?def\s+test_"
++    r"|\b(?:test|it|describe)\s*\(",
++    re.MULTILINE,
++)
+ 
+ 
+ # ============================================================
+@@ -272,14 +285,18 @@
+     vertices = sorted(shared_graph.get("vertices", []))
+     edges = list(map(tuple, shared_graph.get("edges", [])))
+     metadata = shared_graph.get("node_metadata", {})
++    file_map = shared_graph.get("file_map") or {}
+     tests = sorted(vertex for vertex in vertices if metadata.get(vertex, {}).get("is_test"))
+-    production = sorted(set(vertices) - set(tests))
++    test_set = set(tests)
++    production = sorted(set(vertices) - test_set)
+     production_set = set(production)
+ 
+     forward: Dict[str, Set[str]] = {vertex: set() for vertex in vertices}
++    reverse_edges: Dict[str, Set[str]] = {vertex: set() for vertex in vertices}
+     undirected: Dict[str, Set[str]] = {vertex: set() for vertex in vertices}
+     for source, target in edges:
+         forward.setdefault(source, set()).add(target)
++        reverse_edges.setdefault(target, set()).add(source)
+         undirected.setdefault(source, set()).add(target)
+         undirected.setdefault(target, set()).add(source)
+ 
+@@ -318,15 +335,52 @@
+             })
+ 
+         if not reachable:
+-            findings.append({
+-                "type": "isolated_test",
+-                "severity": "medium",
+-                "file": test_file,
+-                "observation": (
+-                    f"Test '{test_file}' has no direct or transitive resolved "
+-                    "relative import path to a production source file."
+-                ),
+-                "model": "static_test_import_reachability",
++            content = file_map.get(test_file)
++            is_test_helper = (
++                content is not None
++                and not _TEST_CASE_MARKER_RE.search(content)
++                and bool(reverse_edges.get(test_file, set()) & test_set)
++            )
++            if not is_test_helper:
++                findings.append({
++                    "type": "isolated_test",
++                    "severity": "medium",
++                    "file": test_file,
++                    "observation": (
++                        f"Test '{test_file}' has no direct or transitive resolved "
++                        "relative import path to a production source file."
++                    ),
++                    "model": "static_test_import_reachability",
++                })
++
++    inline_tested_sources: Set[str] = set()
++    for prod_file in production:
++        pmeta = metadata.get(prod_file, {})
++        has_inline = bool(pmeta.get("has_inline_tests"))
++        if not has_inline and prod_file.endswith(".rs") and prod_file in file_map and "has_inline_tests" not in pmeta:
++            has_inline = _rust_has_inline_tests(file_map[prod_file])
++        if not has_inline:
++            continue
++        inline_tested_sources.add(prod_file)
++        parents_in: Dict[str, Optional[str]] = {prod_file: None}
++        q_in = [prod_file]
++        cur_in = 0
++        while cur_in < len(q_in):
++            node = q_in[cur_in]
++            cur_in += 1
++            for neighbor in sorted(forward.get(node, set())):
++                if neighbor not in parents_in:
++                    parents_in[neighbor] = node
++                    q_in.append(neighbor)
++        reachable_in = sorted(set(parents_in) & production_set)
++        directly_tested_sources.add(prod_file)
++        directly_tested_sources.update(sorted(forward.get(prod_file, set()) & production_set))
++        reachable_sources.update(reachable_in)
++        for source_file in reachable_in:
++            source_test_witnesses.setdefault(source_file, []).append({
++                "test": prod_file,
++                "inline_test": True,
++                "path": _reconstruct_path(parents_in, source_file),
+             })
+ 
+     unreachable_sources = sorted(production_set - reachable_sources)
+@@ -375,9 +429,10 @@
+ 
+     testless_components: List[Dict[str, Any]] = []
+     for component in sorted(components, key=lambda item: item[0] if item else ""):
+-        component_tests = sorted(set(component) & set(tests))
++        component_tests = sorted(set(component) & test_set)
+         component_sources = sorted(set(component) & production_set)
+-        if component_sources and not component_tests:
++        component_inline_tests = sorted(set(component_sources) & inline_tested_sources)
++        if component_sources and not component_tests and not component_inline_tests:
+             component_data = {
+                 "component_id": f"testless_{len(testless_components) + 1}",
+                 "source_files": component_sources,
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -48,6 +48,7 @@
+     kotlin_strip_comments_and_strings as _kotlin_strip_comments_and_strings,
+     kotlin_top_level_names as _kotlin_top_level_names,
+     load_alias_rules as _load_alias_rules,
++    non_cyclic_rust_edges,
+     normalize_path as _normalize_path,
+     package_json_entrypoints as _package_json_entrypoints,
+     parse_kotlin_imports as _parse_kotlin_imports,
+@@ -56,11 +57,15 @@
+     pick_preferred_entrypoint as _pick_preferred_entrypoint,
+     python_module_candidates,
+     resolve_relative_import_path as _resolve_import_path,
++    rust_cargo_bin_exe_refs as _rust_cargo_bin_exe_refs,
+     rust_cargo_package_name as _rust_cargo_package_name,
++    rust_cargo_targets as _rust_cargo_targets,
++    rust_has_inline_tests as _rust_has_inline_tests,
+     rust_manifest_entrypoints as _rust_manifest_entrypoints,
+     rust_module_path_of as _rust_module_path_of,
+     rust_pub_reexports as _rust_pub_reexports,
+     _rust_strip_comments_and_strings,
++    rust_strip_cfg_test_and_imports as _rust_strip_cfg_test_and_imports,
+     rust_top_level_names as _rust_top_level_names,
+     source_language,
+     source_path_allowed,
+@@ -138,7 +143,8 @@
+ _SEM_CAST_TYPE_REGEX = re.compile(r"\b(?:as|satisfies)\s+([A-Z][A-Za-z0-9_]*)\b")
+ _SEM_JSX_REGEX = re.compile(r"<([A-Za-z0-9_]+)\b")
+ _SEM_INH_REGEX = re.compile(r"\b(?:extends|implements)\s+([A-Za-z0-9_]+)\b")
+-_SEM_NS_REGEX = re.compile(r"\b([A-Za-z0-9_]+)\.")
++_SEM_NS_REGEX = re.compile(r"\b([A-Za-z0-9_]+)(?:\.|::)")
++_RUST_IDENT_TOKEN_REGEX = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+ 
+ 
+ def _build_semantic_usage_index(
+@@ -209,26 +215,37 @@
+     if lang == "kotlin":
+         items = _parse_kotlin_imports(content)
+         if items:
+-            clean_content = _strip_comments(content)
+-            usage_idx = _build_semantic_usage_index(clean_content)
++            clean_content = _kotlin_strip_comments_and_strings(content)
++            clean_body = re.sub(
++                r"^[ \t]*(?:package|import)\b[^\n]*",
++                "",
++                clean_content,
++                flags=re.MULTILINE,
++            )
++            usage_idx = _build_semantic_usage_index(clean_body)
+             for item in items:
+                 item["semantic_usages"] = _find_semantic_usages(
+-                    item.get("symbols", []), clean_content, usage_idx
++                    item.get("symbols", []), clean_body, usage_idx
+                 )
+         return items
+     if lang == "rust":
+         items = _parse_rust_imports(content)
+         if items:
+-            clean_content = _rust_strip_comments_and_strings(content)
+-            usage_idx = _build_semantic_usage_index(clean_content)
++            clean_raw = _rust_strip_comments_and_strings(content)
++            clean_prod = _rust_strip_cfg_test_and_imports(clean_raw)
++            usage_idx = _build_semantic_usage_index(clean_prod)
++            body_tokens = set(_RUST_IDENT_TOKEN_REGEX.findall(clean_prod))
+             for item in items:
+                 existing = list(item.get("semantic_usages") or ())
+-                if item.get("rust_mod"):
++                if item.get("rust_mod") or item.get("cfg_test"):
+                     item["semantic_usages"] = sorted(set(existing))
+                     continue
+-                found = _find_semantic_usages(
+-                    item.get("symbols", []), clean_content, usage_idx
+-                )
++                syms = item.get("symbols", [])
++                found = _find_semantic_usages(syms, clean_prod, usage_idx)
++                if not item.get("wildcard") and any(
++                    sym != "*" and sym in body_tokens for sym in syms
++                ):
++                    found.append("rust_body_ref")
+                 item["semantic_usages"] = sorted(set(existing + found))
+         return items
+     clean_content = _strip_comments(content)
+@@ -292,6 +309,8 @@
+     if TEST_FILE_REGEX.search(file_path):
+         return True
+     base = os.path.basename(file_path)
++    if base in ("tests.rs", "test.rs"):
++        return True
+     if base.endswith(("Test.kt", "Tests.kt", "Spec.kt", "_test.rs")):
+         return True
+     if base.endswith(".py") and (base.startswith("test_") or base.endswith("_test.py")):
+@@ -810,6 +829,10 @@
+     super_symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str]
+     top_modules: Dict[str, Set[str]]
+     package_lib: Dict[str, str]
++    file_decls: Dict[str, Set[str]]
++    module_decls: Dict[Tuple[str, Tuple[str, ...]], Set[str]]
++    prod_body_tokens: Dict[str, Set[str]]
++    bin_cache: Dict[str, Dict[str, str]]
+ 
+ 
+ @dataclass
+@@ -825,6 +848,8 @@
+     external_imports: List[Dict[str, Any]]
+     resolved_edge_natures: Dict[Tuple[str, str], List[str]]
+     resolved_edge_usages: Dict[Tuple[str, str], List[str]]
++    cfg_test_mod_targets: Set[str]
++    non_cfg_test_targets: Set[str]
+ 
+ 
+ def _collect_corpus_sources(
+@@ -1055,6 +1080,8 @@
+     rust_symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str] = {}
+     rust_top_modules: Dict[str, Set[str]] = {}
+     rust_package_lib: Dict[str, str] = {}
++    rust_file_decls: Dict[str, Set[str]] = {}
++    rust_prod_body_tokens: Dict[str, Set[str]] = {}
+     rust_reexports: List[Tuple[str, Tuple[str, ...], str, Optional[str], bool]] = []
+     rust_all_uses: List[Tuple[str, Tuple[str, ...], str, Optional[str], bool]] = []
+ 
+@@ -1067,7 +1094,11 @@
+         rust_module_index.setdefault((_root, _modpath), _fp)
+         if _modpath:
+             rust_top_modules.setdefault(_root, set()).add(_modpath[0])
+-        for _name in _rust_top_level_names(_content):
++        _decls = set(_rust_top_level_names(_content))
++        rust_file_decls[_fp] = _decls
++        _clean_prod = _rust_strip_cfg_test_and_imports(_rust_strip_comments_and_strings(_content))
++        rust_prod_body_tokens[_fp] = set(_RUST_IDENT_TOKEN_REGEX.findall(_clean_prod))
++        for _name in _decls:
+             rust_symbol_index.setdefault((_root, _modpath, _name), _fp)
+         for _rpath, _ralias, _rwild in _rust_pub_reexports(_content, include_private=False):
+             rust_reexports.append((_root, _modpath, _rpath, _ralias, _rwild))
+@@ -1134,6 +1165,10 @@
+     rust_super_symbol_index: Dict[Tuple[str, Tuple[str, ...], str], str] = dict(rust_symbol_index)
+     _propagate(rust_super_symbol_index, rust_all_uses)
+ 
++    rust_module_decls: Dict[Tuple[str, Tuple[str, ...]], Set[str]] = {}
++    for (_r, _m, _sym), _def_fp in rust_symbol_index.items():
++        rust_module_decls.setdefault((_r, _m), set()).add(_sym)
++
+     return _RustCorpusIndex(
+         file_module=rust_file_module,
+         module_index=rust_module_index,
+@@ -1141,6 +1176,10 @@
+         super_symbol_index=rust_super_symbol_index,
+         top_modules=rust_top_modules,
+         package_lib=rust_package_lib,
++        file_decls=rust_file_decls,
++        module_decls=rust_module_decls,
++        prod_body_tokens=rust_prod_body_tokens,
++        bin_cache={},
+     )
+ 
+ 
+@@ -1201,13 +1240,17 @@
+         is_entrypoint, ep_kind, ep_conf = _pick_preferred_entrypoint(
+             base_ep, manifest_ep, rust_ep, pkg_ep, shebang_ep, config_ep
+         )
+-        node_metadata[fp] = {
++        is_test_node = _is_test_file(fp)
++        meta_entry: Dict[str, Any] = {
+             "type": _classify_node(fp, content),
+             "is_entrypoint": is_entrypoint,
+             "entrypoint_kind": ep_kind,
+             "entrypoint_confidence": ep_conf,
+-            "is_test": _is_test_file(fp),
++            "is_test": is_test_node,
+         }
++        if fp.endswith(".rs") and not is_test_node and _rust_has_inline_tests(content):
++            meta_entry["has_inline_tests"] = True
++        node_metadata[fp] = meta_entry
+     return node_metadata
+ 
+ 
+@@ -1359,6 +1402,10 @@
+         ]
+         matched = next((c for c in mod_cands if c in state.all_files_set), None)
+     if matched:
++        if "cfg_test_mod" in usages:
++            state.cfg_test_mod_targets.add(matched)
++        else:
++            state.non_cfg_test_targets.add(matched)
+         _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
+     else:
+         mod_base = (
+@@ -1458,6 +1505,25 @@
+     if matched == fp:
+         return
+     if matched:
++        if item.get("cfg_test"):
++            pass
++        else:
++            state.non_cfg_test_targets.add(matched)
++            if item.get("wildcard"):
++                tgt_mod = state.rust_index.file_module.get(matched, (target_root, ()))
++                tgt_decls = state.rust_index.module_decls.get(tgt_mod) or state.rust_index.file_decls.get(matched, set())
++                src_tokens = state.rust_index.prod_body_tokens.get(fp, set())
++                used_syms = tgt_decls & src_tokens
++                is_parent_child_wild = (
++                    not item.get("pub_reexport")
++                    and own_root == tgt_mod[0]
++                    and len(tgt_mod[1]) == len(own_mod) + 1
++                    and tgt_mod[1][:-1] == own_mod
++                )
++                if used_syms:
++                    usages = sorted(set(usages) | {"rust_body_ref"})
++                elif is_parent_child_wild:
++                    usages = ["rust_facade_reexport"]
+         _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
+     elif anchored or own_package or (
+         rest and rest[0] in state.rust_index.top_modules.get(target_root, set())
+@@ -1873,6 +1939,9 @@
+     tokens = set(
+         re.findall(r"(?<!::)(?<![.\w])[A-Za-z_][A-Za-z0-9_]*\b", body_kt)
+     )
++    fun_call_tokens = set(
++        re.findall(r"(?<!::)(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(", body_kt)
++    )
+     explicit_set = set(resolved_targets)
+     same_pkg_targets: Set[str] = set()
+     for sym, target_fp, kind in pkg_entries:
+@@ -1880,10 +1949,7 @@
+             continue
+         if sym not in tokens:
+             continue
+-        if kind == "fun" and not re.search(
+-            rf"(?<!::)(?<![.\w]){re.escape(sym)}\s*\(",
+-            body_kt,
+-        ):
++        if kind == "fun" and sym not in fun_call_tokens:
+             continue
+         same_pkg_targets.add(target_fp)
+     for target_fp in sorted(same_pkg_targets):
+@@ -1895,6 +1961,81 @@
+             ["same_package_ref"],
+             resolved_targets,
+         )
++
++
++def _rust_manifest_bins_for_file(
++    file_path: str,
++    state: _ImportResolutionState,
++) -> Dict[str, str]:
++    """Return `{bin_name: normalized_bin_file_path}` for nearest Cargo.toml."""
++    directory = os.path.dirname(file_path)
++    while True:
++        fs_dir = os.path.abspath(directory) if directory else os.getcwd()
++        manifest = os.path.join(fs_dir, "Cargo.toml")
++        cached = state.rust_index.bin_cache.get(manifest)
++        if cached is not None:
++            return cached
++        if os.path.isfile(manifest):
++            try:
++                with open(manifest, encoding="utf-8", errors="ignore") as f:
++                    text = f.read()
++            except OSError:
++                state.rust_index.bin_cache[manifest] = {}
++                return {}
++            parsed = _rust_cargo_targets(text)
++            bin_map: Dict[str, str] = {}
++            pkg_name = str(parsed.get("package_name") or "")
++            autobins = bool(parsed.get("autobins", True))
++            main_rel = _normalize_path(os.path.join(directory, "src/main.rs")) if directory else "src/main.rs"
++            for entry in parsed.get("bins", ()):
++                bname = str(entry.get("name") or "")
++                bpath = str(entry.get("path") or "")
++                if bname:
++                    if not bpath:
++                        bpath = "src/main.rs" if bname == pkg_name else f"src/bin/{bname}.rs"
++                    full = _normalize_path(os.path.join(directory, bpath)) if directory else _normalize_path(bpath)
++                    if full in state.all_files_set:
++                        bin_map[bname] = full
++            if autobins and pkg_name and pkg_name not in bin_map and main_rel in state.all_files_set:
++                bin_map[pkg_name] = main_rel
++            state.rust_index.bin_cache[manifest] = bin_map
++            return bin_map
++        if not directory:
++            return {}
++        parent = os.path.dirname(directory)
++        if parent == directory:
++            return {}
++        directory = parent
++
++
++def _resolve_rust_cargo_bin_edges(
++    state: _ImportResolutionState,
++    fp: str,
++    file_map: Dict[str, str],
++    resolved_targets: List[str],
++) -> None:
++    """Resolve `env!("CARGO_BIN_EXE_<bin>")` in Rust integration tests to binary targets."""
++    content = file_map.get(fp, "")
++    if "CARGO_BIN_EXE_" not in content:
++        return
++    bin_refs = _rust_cargo_bin_exe_refs(content)
++    if not bin_refs:
++        return
++    bin_map = _rust_manifest_bins_for_file(fp, state)
++    existing = set(resolved_targets)
++    for bname in bin_refs:
++        target = bin_map.get(bname)
++        if target and target != fp and target not in existing:
++            state.non_cfg_test_targets.add(target)
++            _record_resolved_edge(
++                state,
++                fp,
++                target,
++                "runtime",
++                [f"cargo_bin_exe({bname})"],
++                resolved_targets,
++            )
++            existing.add(target)
+ 
+ 
+ def _resolve_corpus_imports(
+@@ -1919,6 +2060,8 @@
+         if fp.endswith(".kt"):
+             _resolve_kotlin_same_package_edges(state, fp, file_map, resolved_targets)
+             _resolve_kotlin_extension_edges(state, fp, file_map, resolved_targets)
++        elif fp.endswith(".rs"):
++            _resolve_rust_cargo_bin_edges(state, fp, file_map, resolved_targets)
+         resolved_imports[fp] = resolved_targets
+     return resolved_imports
+ 
+@@ -2101,10 +2244,16 @@
+         external_imports=[],
+         resolved_edge_natures={},
+         resolved_edge_usages={},
++        cfg_test_mod_targets=set(),
++        non_cfg_test_targets=set(),
+     )
+     resolved_imports = _resolve_corpus_imports(
+         all_files, file_map, file_imports, resolution_state
+     )
++    for _cfg_tgt in resolution_state.cfg_test_mod_targets - resolution_state.non_cfg_test_targets:
++        if _cfg_tgt in node_metadata:
++            node_metadata[_cfg_tgt]["is_test"] = True
++            node_metadata[_cfg_tgt].pop("has_inline_tests", None)
+     edges, edge_natures, edge_details = _finalize_edge_metadata(
+         resolution_state.edges,
+         resolution_state.resolved_edge_natures,
+--- a/core/target_topology.py
++++ b/core/target_topology.py
+@@ -9,6 +9,8 @@
+ import os
+ from collections import Counter, defaultdict, deque
+ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
++
++from language_semantics import non_cyclic_rust_edges as _non_cyclic_rust_edges
+ 
+ SCHEMA_VERSION = "target-codebase-topology-bootstrap-v1"
+ POLICY = "target-first-structural-orientation-v1"
+@@ -286,15 +288,7 @@
+         if int(meta.get("fan_in", 0) or 0) == 0 and int(meta.get("fan_out", 0) or 0) == 0
+     ]
+     edge_natures = shared_graph.get("edge_natures", {}) or {}
+-    non_cyclic_mod_edges = {
+-        (str(ed.get("source", "")), str(ed.get("target", "")))
+-        for ed in (shared_graph.get("edge_details") or ())
+-        if isinstance(ed, dict)
+-        and (
+-            "cfg_test_mod" in (ed.get("semantic_usages") or ())
+-            or set(ed.get("semantic_usages") or ()) == {"rust_mod"}
+-        )
+-    }
++    non_cyclic_mod_edges = _non_cyclic_rust_edges(shared_graph)
+     non_same_pkg_cycle_edges = [
+         edge for edge in edges
+         if edge_natures.get(f"{edge[0]} -> {edge[1]}", "runtime") != "same_package"
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -537,7 +537,8 @@
+     "filter", "listOf", "setOf", "mapOf", "emptyList", "emptyMap",
+     "emptySet", "mutableListOf", "mutableMapOf", "mutableSetOf",
+     "println", "print", "todo", "TODO", "check", "require", "error",
+-    "lazy", "main",
++    "lazy", "main", "equals", "hashCode", "toString", "compareTo",
++    "iterator", "contains", "forEach", "isEmpty",
+ })
+ 
+ _KOTLIN_SAME_PKG_DECL_REGEX = re.compile(
+@@ -1452,15 +1453,135 @@
+ 
+ 
+ _RUST_INLINE_MOD_OPEN_REGEX = re.compile(r"(?:^|[;\s{}])mod\s+[A-Za-z_][\w]*\s*$")
++_RUST_CFG_TEST_ATTR_REGEX = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
++_RUST_TEST_ATTR_REGEX = re.compile(r"#\[\s*(?:[A-Za-z_][\w]*::)*test\b")
++_RUST_CARGO_BIN_EXE_REGEX = re.compile(
++    r'\b(?:option_env|env)!\s*\(\s*"CARGO_BIN_EXE_([A-Za-z0-9_-]+)"\s*\)'
++)
++_RUST_PUB_USE_PREFIX_REGEX = re.compile(r"^[ \t]*pub(?:\([^)]*\))?\s+use\b")
++
++
++def _rust_has_cfg_test_attr(clean: str, pos: int) -> bool:
++    """Return True if immediately preceding attribute list includes `#[cfg(test)]`."""
++    prefix = clean[:pos].rstrip()
++    while prefix.endswith("]"):
++        lb = prefix.rfind("#[")
++        if lb == -1:
++            break
++        attr_text = prefix[lb:]
++        if _RUST_CFG_TEST_ATTR_REGEX.search(attr_text):
++            return True
++        prefix = prefix[:lb].rstrip()
++    return False
++
++
++def _blank_preserve_newlines(segment: str) -> str:
++    if "\n" not in segment:
++        return " " * len(segment)
++    return "\n".join(" " * len(line) for line in segment.split("\n"))
++
++
++def rust_strip_cfg_test_blocks(clean: str) -> str:
++    """Blank out `#[cfg(test)]`-annotated items and `mod ... { ... }` blocks while preserving newlines."""
++    if "#[" not in clean:
++        return clean
++    out = list(clean)
++    n = len(clean)
++    for match in _RUST_CFG_TEST_ATTR_REGEX.finditer(clean):
++        pos = match.end()
++        while pos < n:
++            while pos < n and clean[pos].isspace():
++                pos += 1
++            if clean.startswith("#[", pos):
++                rb = clean.find("]", pos)
++                if rb == -1:
++                    break
++                pos = rb + 1
++            else:
++                break
++        depth = 0
++        bracket_depth = 0
++        paren_depth = 0
++        end_pos = pos
++        while end_pos < n:
++            ch = clean[end_pos]
++            if ch == "{":
++                depth += 1
++            elif ch == "}":
++                if depth > 0:
++                    depth -= 1
++                    if depth == 0 and bracket_depth == 0 and paren_depth == 0:
++                        end_pos += 1
++                        break
++            elif ch == "[":
++                bracket_depth += 1
++            elif ch == "]" and bracket_depth > 0:
++                bracket_depth -= 1
++            elif ch == "(":
++                paren_depth += 1
++            elif ch == ")" and paren_depth > 0:
++                paren_depth -= 1
++            elif ch == ";" and depth == 0 and bracket_depth == 0 and paren_depth == 0:
++                end_pos += 1
++                break
++            end_pos += 1
++        for k in range(match.start(), min(end_pos, n)):
++            if out[k] != "\n":
++                out[k] = " "
++    return "".join(out)
++
++
++def rust_strip_cfg_test_and_imports(clean: str) -> str:
++    """Strip `#[cfg(test)]` blocks plus `use`/`mod` declarations from comment/string-stripped Rust code."""
++    prod = rust_strip_cfg_test_blocks(clean)
++    prod = RUST_USE_STATEMENT_REGEX.sub(lambda m: _blank_preserve_newlines(m.group(0)), prod)
++    prod = RUST_MOD_REGEX.sub(lambda m: _blank_preserve_newlines(m.group(0)), prod)
++    return prod
++
++
++def rust_has_inline_tests(content: str) -> bool:
++    """Return True when a Rust file defines inline `#[cfg(test)]` tests (`#[test]`)."""
++    stripped = _rust_strip_comments_and_strings(content)
++    return bool(_RUST_CFG_TEST_ATTR_REGEX.search(stripped) and _RUST_TEST_ATTR_REGEX.search(stripped))
++
++
++_NON_CYCLIC_RUST_USAGES = frozenset({
++    "rust_mod",
++    "rust_pub_reexport",
++    "rust_facade_reexport",
++    "cfg_test_mod",
++    "cfg_test_use",
++})
++
++
++def non_cyclic_rust_edges(shared_graph: Dict[str, Any]) -> Set[Tuple[str, str]]:
++    """Return Rust structural/facade/test edges excluded from directed cycle detection."""
++    excluded: Set[Tuple[str, str]] = set()
++    for ed in shared_graph.get("edge_details") or ():
++        if not isinstance(ed, dict):
++            continue
++        usages = set(ed.get("semantic_usages") or ())
++        if not usages:
++            continue
++        if "cfg_test_mod" in usages or usages <= _NON_CYCLIC_RUST_USAGES:
++            excluded.add((str(ed.get("source", "")), str(ed.get("target", ""))))
++    return excluded
++
++
++def rust_cargo_bin_exe_refs(content: str) -> List[str]:
++    """Extract Cargo binary target names referenced via `env!("CARGO_BIN_EXE_<bin>")`."""
++    stripped = strip_js_comments(content)
++    return sorted(set(_RUST_CARGO_BIN_EXE_REGEX.findall(stripped)))
+ 
+ 
+ def parse_rust_imports(content: str) -> List[Dict[str, Any]]:
+-    """Parse Rust `use` + `mod` statements (R1). Every import is runtime."""
++    """Parse Rust `use` + `mod` statements (R1), tracking `#[cfg(test)]` and `pub use` re-exports."""
+     clean = _rust_strip_comments_and_strings(content)
+     results: List[Dict[str, Any]] = []
+     scan_pos = 0
+     brace_depth = 0
+     mod_depths: List[int] = []
++    cfg_test_mod_depths: List[int] = []
+     for match in RUST_USE_STATEMENT_REGEX.finditer(clean):
+         target_pos = match.start()
+         while scan_pos < target_pos:
+@@ -1468,14 +1589,30 @@
+             if ch == "{":
+                 brace_depth += 1
+                 ctx = clean[max(0, scan_pos - 64) : scan_pos]
+-                if _RUST_INLINE_MOD_OPEN_REGEX.search(ctx):
++                mod_match = _RUST_INLINE_MOD_OPEN_REGEX.search(ctx)
++                if mod_match:
+                     mod_depths.append(brace_depth)
++                    mod_kw_pos = max(0, scan_pos - 64) + mod_match.start()
++                    kw_m = re.search(r"\bmod\b", clean[mod_kw_pos:scan_pos])
++                    mod_idx = (mod_kw_pos + kw_m.start()) if kw_m else -1
++                    if mod_idx != -1 and _rust_has_cfg_test_attr(clean, mod_idx):
++                        cfg_test_mod_depths.append(brace_depth)
+             elif ch == "}" and brace_depth > 0:
+                 if mod_depths and mod_depths[-1] == brace_depth:
+                     mod_depths.pop()
++                if cfg_test_mod_depths and cfg_test_mod_depths[-1] == brace_depth:
++                    cfg_test_mod_depths.pop()
+                 brace_depth -= 1
+             scan_pos += 1
+         inline_mod_depth = len(mod_depths)
++        is_cfg_test = bool(cfg_test_mod_depths) or _rust_has_cfg_test_attr(clean, match.start())
++        is_pub = bool(_RUST_PUB_USE_PREFIX_REGEX.match(match.group(0)))
++        if is_cfg_test:
++            init_usages = ["cfg_test_use"]
++        elif is_pub:
++            init_usages = ["rust_pub_reexport"]
++        else:
++            init_usages = ["rust_use"]
+         for path, alias, wildcard in _expand_rust_use_spec(match.group(1)):
+             symbol = alias or path.rsplit("::", 1)[-1]
+             results.append({
+@@ -1483,30 +1620,22 @@
+                 "import_nature": "runtime",
+                 "statement": match.group(0).strip(),
+                 "symbols": [symbol],
+-                "semantic_usages": ["rust_use"],
++                "semantic_usages": list(init_usages),
+                 "language": "rust",
+                 "is_relative": False,
+                 "alias": alias,
+                 "wildcard": wildcard,
+                 "inline_mod_depth": inline_mod_depth,
++                "cfg_test": is_cfg_test,
++                "pub_reexport": is_pub,
+             })
+-    clean_without_use = RUST_USE_STATEMENT_REGEX.sub(" ", clean)
++    clean_prod = rust_strip_cfg_test_and_imports(clean)
+     for match in RUST_MOD_REGEX.finditer(clean):
+         name = match.group(1)
+-        prefix = clean[: match.start()].rstrip()
+-        cfg_test = False
+-        # Walk back over immediately preceding attribute lines (e.g. `#[cfg(test)]`)
+-        while prefix.endswith("]"):
+-            lb = prefix.rfind("#[")
+-            if lb == -1:
+-                break
+-            attr_text = prefix[lb:]
+-            if re.search(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]", attr_text):
+-                cfg_test = True
+-            prefix = prefix[:lb].rstrip()
++        cfg_test = _rust_has_cfg_test_attr(clean, match.start())
+         if cfg_test:
+             usages = ["cfg_test_mod", "rust_mod"]
+-        elif re.search(rf"(?:(?<![\w.:])|\bself::){re.escape(name)}\s*::", clean_without_use):
++        elif re.search(rf"(?:(?<![\w.:])|\bself::){re.escape(name)}\s*::", clean_prod):
+             usages = ["rust_mod", "rust_path_ref"]
+         else:
+             usages = ["rust_mod"]
+@@ -1998,6 +2127,7 @@
+     "classify_js_import_nature",
+     "is_source_file",
+     "load_alias_rules",
++    "non_cyclic_rust_edges",
+     "normalize_path",
+     "package_json_entrypoints",
+     "parse_python_imports",
+@@ -2015,11 +2145,15 @@
+     "parse_rust_imports",
+     "python_module_candidates",
+     "resolve_relative_import_path",
++    "rust_cargo_bin_exe_refs",
+     "rust_cargo_package_name",
+     "rust_cargo_targets",
++    "rust_has_inline_tests",
+     "rust_manifest_entrypoints",
+     "rust_module_path_of",
+     "rust_pub_reexports",
++    "rust_strip_cfg_test_and_imports",
++    "rust_strip_cfg_test_blocks",
+     "rust_top_level_names",
+     "source_language",
+     "strip_js_comments",

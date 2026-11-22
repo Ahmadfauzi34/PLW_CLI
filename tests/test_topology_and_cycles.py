@@ -844,5 +844,211 @@ class TopologyAndCyclesTests(ArchitectureBaselineCase):
             ):
                 self.assertIn(want_usage, usages, f"missing {want_usage!r} in {usages}")
 
+
+    def test_calibration_rust_kotlin_topology_cycles_check_v1(self) -> None:
+        """Regression suite for Rust & Kotlin topology, cycle-break, and test_reachability calibration."""
+        from codebase.cycle_break import compute_cycle_break_advisory
+        from codebase.hott_analyzers import analyze_manifold
+        from codebase.performance_analyzers import _is_test_file as perf_is_test_file
+        from codebase.topology_analyzers import analyze_circular, analyze_test_reachability
+        from core.shared_graph import build_shared_graph
+        from core.target_topology import build_target_topology_orientation
+
+        # 1. performance_analyzers parity for Rust tests.rs / test.rs
+        self.assertTrue(perf_is_test_file("src/module/tests.rs"))
+        self.assertTrue(perf_is_test_file("src/module/test.rs"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            (repo / "Cargo.toml").write_text('[package]\nname = "demo_app"\nversion = "0.1.0"\n', encoding="utf-8")
+            (repo / "src" / "bus").mkdir(parents=True)
+            (repo / "src" / "rpc").mkdir(parents=True)
+            (repo / "src" / "extra").mkdir(parents=True)
+            (repo / "tests").mkdir(parents=True)
+
+            (repo / "src" / "lib.rs").write_text(
+                "pub mod bus;\npub mod rpc;\npub mod engine;\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "main.rs").write_text(
+                "fn main() { demo_app::engine::boot(); }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "util.rs").write_text(
+                "pub fn pure_math(x: i32) -> i32 { x + 1 }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "engine.rs").write_text(
+                "use crate::util::pure_math;\n"
+                "pub fn boot() -> i32 { pure_math(1) }\n"
+                "#[cfg(test)]\n"
+                "mod tests {\n"
+                "    #[test]\n"
+                "    fn inline_ok() { assert_eq!(super::boot(), 2); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "extra" / "tests.rs").write_text(
+                "use crate::engine::boot;\n#[test]\nfn mod_tests_rs_runs() { let _ = boot(); }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "extra" / "mod.rs").write_text(
+                "#[cfg(test)]\nmod helper_only;\n#[cfg(test)]\nmod tests;\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "extra" / "helper_only.rs").write_text(
+                "pub fn fixture_seed() -> i32 { 42 }\n",
+                encoding="utf-8",
+            )
+            (repo / "tests" / "cli_smoke.rs").write_text(
+                '#[test]\nfn runs_bin() { let _bin = env!("CARGO_BIN_EXE_demo_app"); }\n',
+                encoding="utf-8",
+            )
+
+            # Pure wildcard facade edge (`use helper::*;` with 0 helper symbols used in parent body)
+            # + `#[cfg(test)] use crate::rpc::other::MockVal;` must NOT form a production cycle.
+            (repo / "src" / "rpc" / "mod.rs").write_text(
+                "mod helper;\n"
+                "pub mod other;\n"
+                "use helper::*;\n"
+                "#[cfg(test)]\n"
+                "use crate::rpc::other::MockVal;\n"
+                "pub fn rpc_entry() { other::other_step(); }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "rpc" / "helper.rs").write_text(
+                "use crate::rpc::rpc_entry;\n"
+                "pub fn hidden_helper() { rpc_entry(); }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "rpc" / "other.rs").write_text(
+                "pub struct MockVal;\npub fn other_step() {}\n",
+                encoding="utf-8",
+            )
+
+            # Real Rust cycle with `use super::Sym` and wildcard `use worker::*;` (called in body)
+            (repo / "src" / "bus" / "mod.rs").write_text(
+                "mod worker;\n"
+                "use worker::*;\n"
+                "pub struct BusConfig { pub id: i32 }\n"
+                "pub fn start_bus() { WorkerLoop::run(); }\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "bus" / "worker.rs").write_text(
+                "use super::BusConfig;\n"
+                "pub struct WorkerLoop;\n"
+                "impl WorkerLoop { pub fn run() { let _ = BusConfig { id: 1 }; } }\n",
+                encoding="utf-8",
+            )
+
+            # Kotlin same-package extension function (`ext_fun`), top-level val (`appGraph`), & test helper
+            kt_main = repo / "android" / "app" / "src" / "main" / "kotlin" / "com" / "example" / "app"
+            kt_test = repo / "android" / "app" / "src" / "test" / "kotlin" / "com" / "example" / "app"
+            kt_main.mkdir(parents=True)
+            kt_test.mkdir(parents=True)
+
+            (kt_main / "UiScreen.kt").write_text(
+                "package com.example.app\n\n"
+                "fun renderMain(state: UiState) {\n"
+                "    state.openDrawerSheet()\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (kt_main / "UiExtensions.kt").write_text(
+                "package com.example.app\n\n"
+                "class UiState\n"
+                "internal fun UiState.openDrawerSheet() {}\n",
+                encoding="utf-8",
+            )
+            (kt_main / "sidebar").mkdir(parents=True)
+            (kt_main / "sidebar" / "NavState.kt").write_text(
+                "package com.example.app.sidebar\n\n"
+                "import com.example.app.NavHostRef\n"
+                "import com.example.app.appGraph\n\n"
+                "class NavState {\n"
+                "    fun bind() { val _g = NavHostRef.appGraph }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (kt_main / "AppGraph.kt").write_text(
+                "package com.example.app\n\n"
+                "import com.example.app.sidebar.NavState\n\n"
+                "object NavHostRef\n"
+                "val NavHostRef.appGraph: NavState get() = NavState()\n",
+                encoding="utf-8",
+            )
+            (kt_test / "FakePrefs.kt").write_text(
+                "package com.example.app\n\n"
+                "class FakePrefs { fun seed() = 1 }\n",
+                encoding="utf-8",
+            )
+            (kt_test / "ScreenBehaviorTest.kt").write_text(
+                "package com.example.app\n\n"
+                "import org.junit.Test\n"
+                "class ScreenBehaviorTest {\n"
+                "    @Test fun renders() {\n"
+                "        val p = FakePrefs(); p.seed()\n"
+                "        renderMain(UiState())\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            g = build_shared_graph(str(repo))
+            nmeta = g["node_metadata"]
+            edge_map = {(e["source"], e["target"]): set(e["semantic_usages"]) for e in g["edge_details"]}
+
+            p = lambda rel: str((repo / rel).resolve()).replace("\\", "/")
+
+            # Classification & inline test flags
+            self.assertTrue(nmeta[p("src/extra/tests.rs")]["is_test"])
+            self.assertTrue(nmeta[p("src/extra/helper_only.rs")]["is_test"])
+            self.assertFalse(nmeta[p("src/engine.rs")]["is_test"])
+            self.assertTrue(nmeta[p("src/engine.rs")]["has_inline_tests"])
+
+            # CARGO_BIN_EXE resolution & Rust facade / cfg(test) semantics
+            self.assertIn("cargo_bin_exe(demo_app)", edge_map[(p("tests/cli_smoke.rs"), p("src/main.rs"))])
+            self.assertIn("rust_facade_reexport", edge_map[(p("src/rpc/mod.rs"), p("src/rpc/helper.rs"))])
+            self.assertIn("cfg_test_use", edge_map[(p("src/rpc/mod.rs"), p("src/rpc/other.rs"))])
+
+            # Kotlin same-package extension function dot-call edge
+            self.assertIn(
+                (p("android/app/src/main/kotlin/com/example/app/UiScreen.kt"), p("android/app/src/main/kotlin/com/example/app/UiExtensions.kt")),
+                edge_map,
+            )
+
+            # Cycles & cycle-break symbols (must include real bus + kotlin cycle, NOT rpc facade, zero empty symbols)
+            circ = analyze_circular(g)
+            cycle_nodes = {n for f in circ["findings"] for n in f["cycle"]}
+            self.assertNotIn(p("src/rpc/helper.rs"), cycle_nodes)
+            self.assertIn(p("src/bus/mod.rs"), cycle_nodes)
+            self.assertIn(p("src/bus/worker.rs"), cycle_nodes)
+
+            cb = compute_cycle_break_advisory(g, [c["cycle"] for c in circ["findings"]])
+            cuts = cb["cycle_break_plan"]["recommended_cuts"]
+            self.assertGreaterEqual(len(cuts), 2)
+            for cut in cuts:
+                self.assertTrue(cut["symbols_involved"], f"empty symbols_involved in cut: {cut}")
+            bus_syms = {sym for cut in cuts if "bus/" in cut["source"] for sym in cut["symbols_involved"]}
+            self.assertTrue(bus_syms & {"BusConfig", "WorkerLoop"}, f"expected bus symbols in {cuts}")
+            kt_syms = {sym for cut in cuts if cut["source"].endswith(".kt") for sym in cut["symbols_involved"]}
+            self.assertTrue(kt_syms & {"appGraph", "NavState", "NavHostRef"}, f"expected kotlin symbols in {cuts}")
+
+            # Test reachability: inline tests credit engine.rs & util.rs; test helper FakePrefs.kt not flagged isolated_test
+            tr = analyze_test_reachability(g)
+            isolated_test_files = {f["file"] for f in tr["findings"] if f["type"] == "isolated_test"}
+            self.assertNotIn(p("android/app/src/test/kotlin/com/example/app/FakePrefs.kt"), isolated_test_files)
+            self.assertTrue(any(w.get("inline_test") and w.get("test") == p("src/engine.rs") for w in tr["source_test_witnesses"].get(p("src/engine.rs"), [])), tr["source_test_witnesses"])
+            self.assertIn(p("src/util.rs"), tr["source_test_witnesses"])
+            self.assertTrue(any(w.get("test") == p("tests/cli_smoke.rs") for w in tr["source_test_witnesses"].get(p("src/main.rs"), [])))
+            self.assertGreaterEqual(tr["summary"]["directly_tested_files"], 3)
+
+            # Topology & manifold consistency
+            topo = build_target_topology_orientation(g)
+            mani = analyze_manifold(g)
+            self.assertEqual(topo["inventory"]["cyclic_sccs"], mani["summary"]["runtime_cyclic_sccs"])
+            self.assertEqual(topo["inventory"]["cyclic_sccs"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
