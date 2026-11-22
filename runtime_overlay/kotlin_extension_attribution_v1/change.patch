@@ -1,0 +1,1025 @@
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -546,7 +546,7 @@
+     r"(?P<kw>class|interface|object|fun|val|var|typealias|enum)"
+     r"(?:\s+(?:class|interface))?\s+"
+     r"(?:<[^>]*>\s+)?"
+-    r"(?P<recv>[\w]+(?:<[^>]*>)?\??\.)?"
++    r"(?P<recv>(?:[\w]+(?:<[^>]*>)?\??\.)+)?"
+     r"(?P<name>[A-Za-z_][\w]*)",
+     re.MULTILINE,
+ )
+@@ -664,6 +664,377 @@
+     return decls
+ 
+ 
++_KOTLIN_PROP_TYPE_REGEX = re.compile(
++    r"\b(?:val|var)\s+([A-Za-z_][\w]*)\s*:\s*"
++    r"([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)",
++)
++
++# Function params carry no val/var: `item: TimelineItem.User`.
++_KOTLIN_PARAM_TYPE_REGEX = re.compile(
++    r"([A-Za-z_][\w]*)\s*:\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)",
++)
++
++
++def _kotlin_class_ctor_param_spans(clean: str) -> List[str]:
++    """Return the raw text inside each class constructor header's parens.
++
++    Scans `class Name(` headers with a paren-depth walk (defaults may
++    contain nested parens, e.g. `= System.currentTimeMillis()`), so a
++    naive `[^)]*` match would stop early. Only `class` headers are
++    scanned: constructor `val`/`var` params ARE the properties, while a
++    plain param (`cause: Throwable?`) is not accessible via dot syntax
++    and must never enter a property-type index.
++    """
++    spans: List[str] = []
++    for match in re.finditer(
++        r"(?:^|\s)(?:data\s+|sealed\s+|open\s+|abstract\s+|internal\s+|"
++        r"public\s+|private\s+|protected\s+|enum\s+)*class\s+[\w]+\s*\(",
++        clean,
++        re.MULTILINE,
++    ):
++        start = match.end() - 1  # the opening paren
++        depth = 0
++        pos = start
++        while pos < len(clean):
++            ch = clean[pos]
++            if ch == "(":
++                depth += 1
++            elif ch == ")":
++                depth -= 1
++                if depth == 0:
++                    spans.append(clean[start + 1:pos])
++                    break
++            pos += 1
++    return spans
++
++
++def kotlin_constructor_property_types(
++    content: str,
++    _stripped: Optional[str] = None,
++) -> Dict[str, Set[str]]:
++    """Map property name -> set of declared base types (constructor only).
++
++    Collects ONLY `val`/`var` constructor params: `val cause: ErrorCause`
++    is a property, `cause: Throwable?` (plain param) is not. The base
++    type strips generics and nullability (`List<Foo>` -> `List`,
++    `AppNotice?` -> `AppNotice`). A name maps to several types when
++    different classes declare the same property with different types;
++    callers must treat that as ambiguous (fail closed).
++    """
++    clean = _stripped if _stripped is not None else kotlin_strip_comments_and_strings(content)
++    props: Dict[str, Set[str]] = {}
++    for span in _kotlin_class_ctor_param_spans(clean):
++        for match in _KOTLIN_PROP_TYPE_REGEX.finditer(span):
++            props.setdefault(match.group(1), set()).add(match.group(2))
++    return props
++
++
++def kotlin_extension_declarations(
++    content: str,
++    _stripped: Optional[str] = None,
++) -> Dict[Tuple[str, str], str]:
++    """Extract non-private top-level Kotlin extension declarations.
++
++    Returns {(receiver, member): kind} with kind in {"ext_fun", "ext_val"}:
++    the receiver is the full dotted base type (`TimelineItem.ToolCall`,
++    `JSONArray?` -> `JSONArray`, `List<TimelineItem>` -> `List`). Same
++    guards as `kotlin_same_package_declarations`: private excluded,
++    len(name) >= 3. Unlike same-package declarations, extensions REQUIRE
++    dot syntax, so they are indexed separately and resolved only with
++    receiver-type evidence — never by name alone.
++    """
++    clean = _stripped if _stripped is not None else kotlin_strip_comments_and_strings(content)
++    decls: Dict[Tuple[str, str], str] = {}
++    for match in _KOTLIN_SAME_PKG_DECL_REGEX.finditer(clean):
++        mods = set((match.group("mods") or "").split())
++        if "private" in mods:
++            continue
++        recv = match.group("recv")
++        if not recv:
++            continue
++        kw = match.group("kw")
++        name = match.group("name")
++        if len(name) < 3:
++            continue
++        receiver = ".".join(
++            re.sub(r"<.*$", "", seg).rstrip("?")
++            for seg in recv.rstrip(".").split(".")
++        )
++        if not receiver or not receiver[0].isupper():
++            continue
++        kind = "ext_fun" if kw == "fun" else "ext_val"
++        decls.setdefault((receiver, name), kind)
++    return decls
++
++
++_KOTLIN_TYPE_HEADER_REGEX = re.compile(
++    r"(?:^|\s)(?:(?:data|sealed|open|abstract|internal|public|private|protected|enum|annotation|value|inner)\s+)*"
++    r"(?:class|interface)\s+([A-Za-z_][\w]*)",
++    re.MULTILINE,
++)
++
++_KOTLIN_OBJECT_HEADER_REGEX = re.compile(
++    r"(?:^|\s)object\s+([A-Za-z_][\w]*)",
++    re.MULTILINE,
++)
++
++_KOTLIN_MEMBER_FUN_REGEX = re.compile(
++    r"\bfun\s+([A-Za-z_][\w]*)\s*(?:<[^>]*>\s*)?\((?:[^()]|\([^()]*\))*\)\s*"
++    r"(?::\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*))?",
++)
++
++_KOTLIN_TOP_LEVEL_KEYWORDS = (
++    "fun", "val", "var", "class", "object", "interface", "import", "package",
++)
++
++
++def _kotlin_type_spans(clean: str) -> List[Tuple[str, int, Optional[str], Optional[int], Optional[int]]]:
++    """Spans of every class/interface/object header in stripped source.
++
++    Returns (name, header_start, ctor_param_span, body_start, body_end);
++    body bounds are None when the type has no body block. The body
++    search stops at a new top-level declaration, so a body-less
++    `class Foo` never swallows the next function's body as its own.
++    """
++    headers: List[Tuple[int, str, int]] = []
++    for match in _KOTLIN_TYPE_HEADER_REGEX.finditer(clean):
++        headers.append((match.start(), match.group(1), match.end()))
++    for match in _KOTLIN_OBJECT_HEADER_REGEX.finditer(clean):
++        before = clean[max(0, match.start() - 12):match.start()]
++        if before.rstrip().endswith("companion"):
++            continue
++        headers.append((match.start(), match.group(1), match.end()))
++    headers.sort()
++    spans: List[Tuple[str, int, Optional[str], Optional[int], Optional[int]]] = []
++    for header_start, name, hend in headers:
++        pos = hend
++        # Skip type parameters `<...>` (nesting-aware).
++        while pos < len(clean) and clean[pos] in " \t":
++            pos += 1
++        if pos < len(clean) and clean[pos] == "<":
++            depth = 0
++            while pos < len(clean):
++                if clean[pos] == "<":
++                    depth += 1
++                elif clean[pos] == ">":
++                    depth -= 1
++                    if depth == 0:
++                        pos += 1
++                        break
++                pos += 1
++        # Constructor paren span, if present.
++        ctor_span: Optional[str] = None
++        while pos < len(clean) and clean[pos] in " \t":
++            pos += 1
++        if pos < len(clean) and clean[pos] == "(":
++            start = pos
++            depth = 0
++            while pos < len(clean):
++                if clean[pos] == "(":
++                    depth += 1
++                elif clean[pos] == ")":
++                    depth -= 1
++                    if depth == 0:
++                        ctor_span = clean[start + 1:pos]
++                        pos += 1
++                        break
++                pos += 1
++        # Body `{` at paren depth 0, bounded, stopping at a new
++        # top-level declaration.
++        body_start: Optional[int] = None
++        body_end: Optional[int] = None
++        depth = 0
++        limit = min(len(clean), pos + 2000)
++        while pos < limit:
++            ch = clean[pos]
++            if ch == "(":
++                depth += 1
++            elif ch == ")":
++                depth -= 1
++            elif ch == "{" and depth == 0:
++                body_start = pos
++                break
++            elif ch == "\n" and depth == 0:
++                rest = clean[pos + 1:pos + 40].lstrip()
++                if any(
++                    rest == kw or rest.startswith(kw + " ")
++                    or rest.startswith(kw + "(")
++                    for kw in _KOTLIN_TOP_LEVEL_KEYWORDS
++                ):
++                    break
++            pos += 1
++        if body_start is not None:
++            depth = 0
++            pos = body_start
++            while pos < len(clean):
++                ch = clean[pos]
++                if ch == "{":
++                    depth += 1
++                elif ch == "}":
++                    depth -= 1
++                    if depth == 0:
++                        body_end = pos + 1
++                        break
++                pos += 1
++        spans.append((name, header_start, ctor_span, body_start, body_end))
++    return spans
++
++
++def kotlin_class_members(
++    content: str,
++    _stripped: Optional[str] = None,
++) -> Dict[Tuple[str, str], Optional[str]]:
++    """Map (type, member) -> declared return/property type (or None).
++
++    Members of a class/interface/object body at brace depth 1 (direct
++    members only): `fun name(...): Ret` gives the base return type,
++    `val`/`var name: Type` gives the property type, a `fun` without a
++    declared return gives None (member exists, return unknown).
++    Constructor `val`/`var` params count as members too
++    (`data class User(val text: String)` -> `User.text`).
++    Nested types are blanked out of the enclosing body, so a nested
++    class's members never leak to its outer type. Companion-object
++    members are NOT indexed (their receiver is `Foo.Companion`, not
++    `Foo`). Conflicting known return types for one member collapse to
++    None — existence is certain, the return is not.
++    """
++    clean = _stripped if _stripped is not None else kotlin_strip_comments_and_strings(content)
++    members: Dict[Tuple[str, str], Optional[str]] = {}
++
++    def _add(type_name: str, member: str, ret: Optional[str]) -> None:
++        key = (type_name, member)
++        if key not in members:
++            members[key] = ret
++        elif members[key] is None:
++            members[key] = ret
++        elif ret is not None and members[key] != ret:
++            members[key] = None
++
++    spans = _kotlin_type_spans(clean)
++    for name, header_start, ctor_span, body_start, body_end in spans:
++        if ctor_span:
++            for match in _KOTLIN_PROP_TYPE_REGEX.finditer(ctor_span):
++                _add(name, match.group(1), match.group(2))
++        if body_start is None or body_end is None:
++            continue
++        blanked = list(clean[body_start:body_end])
++        for _n2, h2, _c2, bs2, be2 in spans:
++            if bs2 is None or be2 is None:
++                continue
++            if body_start < bs2 < body_end:
++                for i in range(h2 - body_start, be2 - body_start):
++                    if 0 <= i < len(blanked):
++                        blanked[i] = " "
++        depth = 0
++        depth1: List[str] = []
++        for ch in blanked:
++            if ch == "{":
++                depth += 1
++            elif ch == "}":
++                depth -= 1
++            elif depth == 1:
++                depth1.append(ch)
++        own = "".join(depth1)
++        for match in _KOTLIN_MEMBER_FUN_REGEX.finditer(own):
++            _add(name, match.group(1), match.group(2))
++        for match in _KOTLIN_PROP_TYPE_REGEX.finditer(own):
++            _add(name, match.group(1), match.group(2))
++    return members
++
++
++_KOTLIN_INFERRED_TYPE_METHODS = {
++    "optJSONArray": "JSONArray",
++    "getJSONArray": "JSONArray",
++    "optJSONObject": "JSONObject",
++    "getJSONObject": "JSONObject",
++    "optString": "String",
++    "getString": "String",
++    "optInt": "Int",
++    "getInt": "Int",
++    "optLong": "Long",
++    "getLong": "Long",
++    "optDouble": "Double",
++    "getDouble": "Double",
++    "optBoolean": "Boolean",
++    "getBoolean": "Boolean",
++    "listOf": "List",
++    "mutableListOf": "List",
++    "mapOf": "Map",
++    "mutableMapOf": "Map",
++    "setOf": "Set",
++    "mutableSetOf": "Set",
++}
++
++_KOTLIN_INFERRED_INIT_REGEX = re.compile(
++    r"\b(?:val|var)\s+([A-Za-z_][\w]*)\s*=\s*([^\n;]+)",
++)
++
++
++def _kotlin_infer_init_type(init: str) -> Optional[str]:
++    """Infer a type from a `val x = <init>` initializer, or None.
++
++    Sound patterns only: a constructor call `Type(...)`, a cast
++    `expr as Type` / `as? Type`, or a call to a method whose return
++    type is in a small table of stable APIs (org.json accessors,
++    stdlib collection factories). Anything else is unknown — an
++    inferred wrong type would be worse than no evidence.
++    """
++    init = init.strip()
++    cast = re.search(r"\bas\??\s+([A-Za-z_][\w]*)\s*$", init)
++    if cast:
++        return cast.group(1)
++    ctor = re.match(r"((?:[A-Z][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*)\s*\(", init)
++    if ctor:
++        return ctor.group(1)
++    call = re.search(r"([A-Za-z_][\w]*)\s*\(", init)
++    if call:
++        return _KOTLIN_INFERRED_TYPE_METHODS.get(call.group(1))
++    return None
++
++
++def kotlin_local_declared_types(
++    content: str,
++    _stripped: Optional[str] = None,
++) -> Dict[str, str]:
++    """Map a file's own declared names -> their declared base types.
++
++    Covers `val`/`var name: Type` anywhere in the file, `name: Type`
++    params of `fun` headers, and `val`/`var name = <init>` where the
++    initializer's type is inferable (constructor call, cast, or a
++    tabled method such as `optJSONArray` -> `JSONArray`). First
++    declaration wins; a name declared with two different types is
++    dropped (ambiguous). Used only as receiver-type evidence for
++    extension resolution in the same file.
++    """
++    clean = _stripped if _stripped is not None else kotlin_strip_comments_and_strings(content)
++    types: Dict[str, str] = {}
++    ambiguous: Set[str] = set()
++
++    def _add(name: str, typ: str) -> None:
++        if name in ambiguous:
++            return
++        if name in types and types[name] != typ:
++            del types[name]
++            ambiguous.add(name)
++        else:
++            types[name] = typ
++
++    for match in _KOTLIN_PROP_TYPE_REGEX.finditer(clean):
++        _add(match.group(1), match.group(2))
++    for match in re.finditer(
++        r"\bfun\s+[\w.]+\s*(?:<[^>]*>\s*)?\(([^)]*)\)", clean
++    ):
++        for param in _KOTLIN_PARAM_TYPE_REGEX.finditer(match.group(1)):
++            _add(param.group(1), param.group(2))
++    for match in _KOTLIN_INFERRED_INIT_REGEX.finditer(clean):
++        if match.group(1) in types or match.group(1) in ambiguous:
++            continue
++        inferred = _kotlin_infer_init_type(match.group(2))
++        if inferred:
++            _add(match.group(1), inferred)
++    return types
++
++
+ def kotlin_source_root(file_path: str, package: str) -> str:
+     """Derive the source root from a file path + its declared package (K5).
+ 
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -35,8 +35,12 @@
+     is_source_file as _is_source_file,
+     is_tool_config_file as _is_tool_config_file,
+     kotlin_aidl_fqns as _kotlin_aidl_fqns,
++    kotlin_class_members as _kotlin_class_members,
++    kotlin_constructor_property_types as _kotlin_constructor_property_types,
++    kotlin_extension_declarations as _kotlin_extension_declarations,
+     kotlin_is_generated_import as _kotlin_is_generated,
+     kotlin_is_internal_import as _kotlin_is_internal,
++    kotlin_local_declared_types as _kotlin_local_declared_types,
+     kotlin_module_candidates as _kotlin_module_candidates,
+     kotlin_package_of as _kotlin_package_of,
+     kotlin_same_package_declarations as _kotlin_same_package_declarations,
+@@ -776,10 +780,26 @@
+     packages: Set[str]
+     roots: List[str]
+     symbol_index: Dict[Tuple[str, str], str]
++    # All owners per (package, top-level name); symbol_index keeps the
++    # first owner for compatibility, this map is the fail-closed source.
++    symbol_owners: Dict[Tuple[str, str], List[str]]
+     file_packages: Dict[str, str]
+     same_pkg_index: Dict[str, List[Tuple[str, str, str]]]
+     stripped_map: Dict[str, str]
+     aidl_fqns: Set[str]
++    # (package, receiver, member) -> owner file, unique owner only.
++    ext_index: Dict[Tuple[str, str, str], str]
++    # Property name -> set of declared base types, per package and global.
++    prop_types_pkg: Dict[Tuple[str, str], Set[str]]
++    prop_types_global: Dict[str, Set[str]]
++    # (package, top-level type name) -> files declaring it (variant shadow).
++    fqn_index: Dict[Tuple[str, str], List[str]]
++    # (package, type, member) -> declared return/property type (None =
++    # member exists, return unknown). Kotlin members win over extensions.
++    member_index: Dict[Tuple[str, str, str], Optional[str]]
++    # (type, member) -> same, only when exactly one file in the corpus
++    # declares it (unique-owner global fallback).
++    member_index_global: Dict[Tuple[str, str], Optional[str]]
+ 
+ 
+ @dataclass
+@@ -796,6 +816,7 @@
+ class _ImportResolutionState:
+     scan_root_norm: str
+     all_files_set: Set[str]
++    file_map: Dict[str, str]
+     alias_rules: List[Dict[str, Any]]
+     kotlin_index: _KotlinCorpusIndex
+     rust_index: _RustCorpusIndex
+@@ -861,8 +882,14 @@
+     kotlin_packages: Set[str] = set()
+     kotlin_roots: List[str] = []
+     kotlin_symbol_index: Dict[Tuple[str, str], str] = {}
++    kotlin_symbol_owners_raw: Dict[Tuple[str, str], Set[str]] = {}
+     kotlin_file_packages: Dict[str, str] = {}
+     kotlin_same_pkg_raw: Dict[Tuple[str, str], Dict[str, str]] = {}
++    kotlin_ext_raw: Dict[Tuple[str, str, str], Dict[str, str]] = {}
++    kotlin_prop_types_pkg: Dict[Tuple[str, str], Set[str]] = {}
++    kotlin_prop_types_global: Dict[str, Set[str]] = {}
++    kotlin_fqn_raw: Dict[Tuple[str, str], Set[str]] = {}
++    kotlin_member_raw: Dict[Tuple[str, str, str], Dict[str, Optional[str]]] = {}
+     kotlin_stripped_map: Dict[str, str] = {}
+     has_kotlin = False
+ 
+@@ -881,12 +908,29 @@
+             kotlin_roots.append(_root)
+         for _name in _kotlin_top_level_names(_content):
+             kotlin_symbol_index.setdefault((_pkg, _name), _fp)
++            kotlin_symbol_owners_raw.setdefault((_pkg, _name), set()).add(_fp)
+         _stripped_kt = _kotlin_strip_comments_and_strings(_content)
+         kotlin_stripped_map[_fp] = _stripped_kt
+-        for _sym, _skind in _kotlin_same_package_declarations(
++        _same_pkg_decls = _kotlin_same_package_declarations(
+             _content, _stripped=_stripped_kt
+-        ).items():
++        )
++        for _sym, _skind in _same_pkg_decls.items():
+             kotlin_same_pkg_raw.setdefault((_pkg, _sym), {})[_fp] = _skind
++            if _skind == "pascal":
++                kotlin_fqn_raw.setdefault((_pkg, _sym), set()).add(_fp)
++        for (_recv, _member), _ekind in _kotlin_extension_declarations(
++            _content, _stripped=_stripped_kt
++        ).items():
++            kotlin_ext_raw.setdefault((_pkg, _recv, _member), {})[_fp] = _ekind
++        for _prop, _types in _kotlin_constructor_property_types(
++            _content, _stripped=_stripped_kt
++        ).items():
++            kotlin_prop_types_pkg.setdefault((_pkg, _prop), set()).update(_types)
++            kotlin_prop_types_global.setdefault(_prop, set()).update(_types)
++        for (_t, _m), _ret in _kotlin_class_members(
++            _content, _stripped=_stripped_kt
++        ).items():
++            kotlin_member_raw.setdefault((_pkg, _t, _m), {})[_fp] = _ret
+ 
+     # Keep only unique (package, symbol) owners so duplicate-named top-level
+     # symbols across variant source roots (e.g. src/debug vs src/release) fail closed.
+@@ -898,6 +942,52 @@
+     for _pkg in kotlin_same_pkg_index:
+         kotlin_same_pkg_index[_pkg].sort()
+ 
++    # Extension owners: same uniqueness gate — a (package, receiver,
++    # member) declared by two files resolves to neither.
++    kotlin_ext_index: Dict[Tuple[str, str, str], str] = {}
++    for _key, _owners in kotlin_ext_raw.items():
++        if len(_owners) == 1:
++            kotlin_ext_index[_key] = next(iter(_owners))
++
++    kotlin_symbol_owners: Dict[Tuple[str, str], List[str]] = {
++        _key: sorted(_owners)
++        for _key, _owners in kotlin_symbol_owners_raw.items()
++    }
++    kotlin_fqn_index: Dict[Tuple[str, str], List[str]] = {
++        _key: sorted(_owners)
++        for _key, _owners in kotlin_fqn_raw.items()
++        if len(_owners) > 1
++    }
++
++    # Class members: agreed known return type wins; conflicting known
++    # returns collapse to None (member exists, return unknown).
++    kotlin_member_index: Dict[Tuple[str, str, str], Optional[str]] = {}
++    _member_global_owner: Dict[Tuple[str, str], str] = {}
++    _member_global_multi: Set[Tuple[str, str]] = set()
++    for (_pkg, _t, _m), _owners in kotlin_member_raw.items():
++        _known = {_r for _r in _owners.values() if _r is not None}
++        kotlin_member_index[(_pkg, _t, _m)] = (
++            next(iter(_known)) if len(_known) == 1 else None
++        )
++        for _fp in _owners:
++            _gkey = (_t, _m)
++            if _gkey in _member_global_multi:
++                continue
++            if _gkey in _member_global_owner and _member_global_owner[_gkey] != _fp:
++                del _member_global_owner[_gkey]
++                _member_global_multi.add(_gkey)
++            else:
++                _member_global_owner[_gkey] = _fp
++    kotlin_member_global: Dict[Tuple[str, str], Optional[str]] = {}
++    for (_t, _m), _fp in _member_global_owner.items():
++        _rets = [
++            _ret
++            for (_p, _tt, _mm), _ret in kotlin_member_index.items()
++            if (_tt, _mm) == (_t, _m)
++            and _fp in kotlin_member_raw.get((_p, _tt, _mm), {})
++        ]
++        kotlin_member_global[(_t, _m)] = _rets[0] if _rets else None
++
+     aidl_fqns = (
+         _kotlin_aidl_fqns(scan_root_norm, ignore_dirs=ignore_dirs)
+         if has_kotlin and scan_root_norm
+@@ -908,10 +998,17 @@
+         packages=kotlin_packages,
+         roots=kotlin_roots,
+         symbol_index=kotlin_symbol_index,
++        symbol_owners=kotlin_symbol_owners,
+         file_packages=kotlin_file_packages,
+         same_pkg_index=kotlin_same_pkg_index,
+         stripped_map=kotlin_stripped_map,
+         aidl_fqns=aidl_fqns,
++        ext_index=kotlin_ext_index,
++        prop_types_pkg=kotlin_prop_types_pkg,
++        prop_types_global=kotlin_prop_types_global,
++        fqn_index=kotlin_fqn_index,
++        member_index=kotlin_member_index,
++        member_index_global=kotlin_member_global,
+     )
+ 
+ 
+@@ -1181,12 +1278,38 @@
+     if not matched:
+         parts = raw_import.split(".")
+         for k in range(len(parts) - 1, 0, -1):
+-            cand_file = state.kotlin_index.symbol_index.get(
+-                (".".join(parts[:k]), parts[k])
+-            )
+-            if cand_file is not None and cand_file in state.all_files_set:
+-                matched = cand_file
++            key = (".".join(parts[:k]), parts[k])
++            owners = [
++                o
++                for o in state.kotlin_index.symbol_owners.get(key, [])
++                if o in state.all_files_set
++            ]
++            if len(owners) == 1:
++                matched = owners[0]
+                 break
++            if len(owners) > 1:
++                # G5b A'1 (review #4): never first-owner-wins. Vote via
++                # receiver-type evidence; every voted owner is a real
++                # dependency (one import name can serve extensions on
++                # different receiver types), so all of them edge.
++                # Only zero votes stay unresolved (not a wrong edge).
++                voted = _resolve_kotlin_ambiguous_import(
++                    state, fp, key[0], key[1], owners
++                )
++                if voted:
++                    for _voted_fp in voted:
++                        _record_resolved_edge(
++                            state, fp, _voted_fp, nature, usages,
++                            resolved_targets,
++                        )
++                    return
++                state.unresolved_imports.append({
++                    "importer": fp,
++                    "raw_import": raw_import,
++                    "reason": "kotlin_ambiguous",
++                    "candidates": sorted(owners),
++                })
++                return
+ 
+     if matched:
+         _record_resolved_edge(state, fp, matched, nature, usages, resolved_targets)
+@@ -1427,6 +1550,306 @@
+ }
+ 
+ 
++_KOTLIN_DOT_MEMBER_REGEX = re.compile(r"\.([A-Za-z_][\w]*)")
++_KOTLIN_SCOPE_FN_REGEX = re.compile(
++    r"([\w.?]+)\.(let|run|also|apply)\s*\{"
++    r"|with\s*\(([\w.]+)\)\s*\{"
++)
++
++_KOTLIN_IT_BINDERS = frozenset({"let", "also"})
++_KOTLIN_THIS_BINDERS = frozenset({"run", "apply", "with"})
++_KOTLIN_EXPLICIT_PARAM_REGEX = re.compile(
++    r"\s*(?:[A-Za-z_][\w]*|\([^)]*\))\s*->"
++)
++
++
++def _kotlin_enclosing_scope_receiver(
++    body: str, use_offset: int, binder: str
++) -> Optional[str]:
++    """Receiver of the lexically enclosing scope function for `it`/`this`.
++
++    Walks scope calls from nearest to farthest (bounded window) and
++    takes the first whose block still encloses the use (brace depth > 0
++    from its `{`), whose binder matches (`it` <- let/also,
++    `this` <- run/apply/with), and whose lambda has no explicit
++    parameter (an explicit `x ->` means `it` belongs to an outer scope).
++    """
++    want = _KOTLIN_IT_BINDERS if binder == "it" else _KOTLIN_THIS_BINDERS
++    window_start = max(0, use_offset - 2000)
++    scope_text = body[window_start:use_offset]
++    for match in reversed(list(_KOTLIN_SCOPE_FN_REGEX.finditer(scope_text))):
++        fn = match.group(2) or "with"
++        if fn not in want:
++            continue
++        brace_pos = window_start + match.end() - 1
++        depth = 0
++        for ch in body[brace_pos:use_offset]:
++            if ch == "{":
++                depth += 1
++            elif ch == "}":
++                depth -= 1
++        if depth <= 0:
++            continue
++        if _KOTLIN_EXPLICIT_PARAM_REGEX.match(body, brace_pos + 1):
++            continue
++        recv = match.group(1) or match.group(3)
++        if recv:
++            return recv
++    return None
++
++
++def _kotlin_dot_member_uses(body: str) -> List[Tuple[str, str, int]]:
++    """List (member, receiver_expr, dot_offset) for every `.member` use.
++
++    The receiver expression is recovered by walking backwards from the
++    dot with paren-depth tracking, so `Modifier.fillMaxSize()` survives
++    as one expression while `a, b).member` stops at the comma. Package
++    and import lines must already be stripped from `body`.
++    """
++    uses: List[Tuple[str, str, int]] = []
++    for match in _KOTLIN_DOT_MEMBER_REGEX.finditer(body):
++        member = match.group(1)
++        pos = match.start() - 1
++        depth = 0
++        start = pos + 1
++        while pos >= 0:
++            ch = body[pos]
++            if ch == ")":
++                depth += 1
++            elif ch == "(":
++                depth -= 1
++                if depth < 0:
++                    break
++            elif ch in " \t\r\n,":
++                if depth == 0:
++                    break
++            elif ch.isalnum() or ch in "_.?<>":
++                pass
++            else:
++                break
++            start = pos
++            pos -= 1
++        receiver = body[start:match.start()].strip()
++        uses.append((member, receiver, match.start()))
++    return uses
++
++
++def _kotlin_member_return(
++    state: _ImportResolutionState,
++    pkg: str,
++    recv_type: str,
++    member: str,
++) -> Tuple[bool, Optional[str]]:
++    """(exists, return_type) for a class member of the receiver type.
++
++    Package-scoped first, then the unique-owner global fallback, trying
++    the full dotted receiver name before its last segment. Kotlin
++    members win over same-named extensions, so callers suppress the
++    extension edge when this reports exists=True.
++    """
++    index = state.kotlin_index
++    for cand in (recv_type, recv_type.rsplit(".", 1)[-1]):
++        key = (pkg, cand, member)
++        if key in index.member_index:
++            return True, index.member_index[key]
++    for cand in (recv_type, recv_type.rsplit(".", 1)[-1]):
++        key = (cand, member)
++        if key in index.member_index_global:
++            return True, index.member_index_global[key]
++    return False, None
++
++
++def _kotlin_receiver_type(
++    expr: str,
++    member: str,
++    pkg: str,
++    state: _ImportResolutionState,
++    body: str,
++    use_offset: int,
++    local_types: Dict[str, str],
++    depth: int = 0,
++) -> Optional[str]:
++    """Resolve the receiver type of a `.member` use, or None (fail closed).
++
++    Evidence, in order:
++    (a) literal type: the first segment is a capitalized name equal to a
++        declared receiver for `member`, and every later segment is a call
++        (`Modifier`, `Modifier.fillMaxSize()`).
++    (b) property type: the last segment is a property whose declared type
++        is unique — package-scoped first, then global.
++    (c) local type: a single-segment receiver declared as `val`/`var`/
++        param in the using file.
++    (e) scope-function chain: `it` inside `?.let { }` / `also` (or
++        `this` inside `run` / `apply` / `with(...)`) resolves to the
++        lexically enclosing scope call's receiver type (recursed once):
++        binder kind must match, an explicit lambda parameter
++        (`{ x ->`) binds neither, and the use must sit inside the
++        scope block (brace depth).
++    A receiver ending in a call whose root is not a known receiver type
++    has an unknowable return type and resolves to None.
++    """
++    expr = expr.strip().rstrip("?")
++    if not expr:
++        return None
++    segments = [s for s in expr.split(".") if s]
++    if not segments:
++        return None
++    index = state.kotlin_index
++    receivers = {
++        recv
++        for (p, recv, m) in index.ext_index
++        if p == pkg and m == member
++    }
++    first = re.sub(r"<[^>]*>$", "", segments[0]).rstrip("?")
++    if first and first[0].isupper() and first in receivers:
++        rest = segments[1:]
++        if all("(" in seg for seg in rest):
++            # Review #1: break the chain when local evidence says an
++            # intermediate call changes the type (its declared return
++            # type is known and differs from the first segment).
++            # Unknown or SDK calls keep the builder-pattern heuristic.
++            for seg in rest:
++                callee = re.match(r"([A-Za-z_][\w]*)\s*\(", seg)
++                if not callee:
++                    continue
++                exists, ret = _kotlin_member_return(
++                    state, pkg, first, callee.group(1)
++                )
++                if exists and ret is not None and ret != first:
++                    return None
++            return first
++    if len(segments) == 1 and segments[0] in ("it", "this"):
++        if depth > 0:
++            return None
++        # Review #3: lexical scope, not nearest text. `it` binds only
++        # to let/also, `this` only to run/apply/with; a scope lambda
++        # with an explicit parameter (`{ x ->`) binds neither; and the
++        # use must sit inside the scope block (brace depth > 0), so a
++        # closed or sibling scope never matches.
++        scope_recv = _kotlin_enclosing_scope_receiver(
++            body, use_offset, segments[0]
++        )
++        if scope_recv:
++            return _kotlin_receiver_type(
++                scope_recv, member, pkg, state, body,
++                use_offset, local_types, depth + 1,
++            )
++        return None
++    last = segments[-1].rstrip("?")
++    if "(" in last or ")" in last:
++        return None
++    if len(segments) == 1 and last in local_types:
++        return local_types[last]
++    prop_types = index.prop_types_pkg.get((pkg, last))
++    if prop_types is not None and len(prop_types) == 1:
++        return next(iter(prop_types))
++    global_types = index.prop_types_global.get(last)
++    if global_types is not None and len(global_types) == 1:
++        return next(iter(global_types))
++    return None
++
++
++def _resolve_kotlin_ambiguous_import(
++    state: _ImportResolutionState,
++    fp: str,
++    pkg: str,
++    member: str,
++    owners: List[str],
++) -> List[str]:
++    """Resolve a multi-owner Kotlin import via receiver-type evidence.
++
++    Every `.member` use site in the importing file votes for the owner
++    whose extension declaration matches the receiver type. Returns the
++    sorted voted owners — possibly several, because one import name can
++    serve same-named extensions on different receiver types, and each
++    voted owner is a real dependency. No resolvable use site returns []
++    (unresolved) — never first-owner-wins.
++    """
++    body = state.kotlin_index.stripped_map.get(fp)
++    if body is None:
++        body = _kotlin_strip_comments_and_strings(state.file_map.get(fp, ""))
++    body = re.sub(
++        r"^[ \t]*(?:package|import)\b[^\n]*",
++        "",
++        body,
++        flags=re.MULTILINE,
++    )
++    local_types = _kotlin_local_declared_types(body)
++    votes: Set[str] = set()
++    for use_member, receiver, dot_offset in _kotlin_dot_member_uses(body):
++        if use_member != member:
++            continue
++        recv_type = _kotlin_receiver_type(
++            receiver, member, pkg, state, body, dot_offset, local_types
++        )
++        if recv_type is None:
++            continue
++        owner = state.kotlin_index.ext_index.get((pkg, recv_type, member))
++        if owner is not None and owner in owners:
++            # Review #1: a class member of the receiver type wins over
++            # the extension — this use site is not evidence for it.
++            exists, _ret = _kotlin_member_return(
++                state, pkg, recv_type, member
++            )
++            if not exists:
++                votes.add(owner)
++    return sorted(votes)
++
++
++def _resolve_kotlin_extension_edges(
++    state: _ImportResolutionState,
++    fp: str,
++    file_map: Dict[str, str],
++    resolved_targets: List[str],
++) -> None:
++    """PASS 3b (G5b A'2): Resolve Kotlin extension member uses in-package.
++
++    A `.member` use edges to the file declaring extension
++    `(receiver, member)` when the receiver type is evidenced and the
++    (package, receiver, member) owner is unique. Name-only attribution
++    is forbidden: an ambiguous or unevidenced member gets no edge.
++    """
++    pkg = state.kotlin_index.file_packages.get(fp, "")
++    if not pkg:
++        return
++    body_kt = state.kotlin_index.stripped_map.get(fp)
++    if body_kt is None:
++        body_kt = _kotlin_strip_comments_and_strings(file_map.get(fp, ""))
++    body_kt = re.sub(
++        r"^[ \t]*(?:package|import)\b[^\n]*",
++        "",
++        body_kt,
++        flags=re.MULTILINE,
++    )
++    local_types = _kotlin_local_declared_types(body_kt)
++    explicit_set = set(resolved_targets)
++    targets: Set[str] = set()
++    for member, receiver, dot_offset in _kotlin_dot_member_uses(body_kt):
++        recv_type = _kotlin_receiver_type(
++            receiver, member, pkg, state, body_kt, dot_offset, local_types
++        )
++        if recv_type is None:
++            continue
++        owner = state.kotlin_index.ext_index.get((pkg, recv_type, member))
++        if owner is None or owner == fp or owner in explicit_set:
++            continue
++        # Review #1: a class member of the receiver type wins over an
++        # extension of the same name — never edge to the extension.
++        exists, _ret = _kotlin_member_return(state, pkg, recv_type, member)
++        if exists:
++            continue
++        targets.add(owner)
++    for target_fp in sorted(targets):
++        _record_resolved_edge(
++            state,
++            fp,
++            target_fp,
++            "same_package",
++            ["extension_ref"],
++            resolved_targets,
++        )
++
++
+ def _resolve_kotlin_same_package_edges(
+     state: _ImportResolutionState,
+     fp: str,
+@@ -1495,10 +1918,65 @@
+ 
+         if fp.endswith(".kt"):
+             _resolve_kotlin_same_package_edges(state, fp, file_map, resolved_targets)
++            _resolve_kotlin_extension_edges(state, fp, file_map, resolved_targets)
+         resolved_imports[fp] = resolved_targets
+     return resolved_imports
+ 
+ 
++def _kotlin_variant_path_pair(a: str, b: str) -> bool:
++    """True when two files are plausibly build variants of one FQN.
++
++    Same length, identical segments except exactly one, and that
++    segment sits directly under a source-set root (`src`, `kotlin`,
++    or `java`): Gradle layout src/debug vs src/release, or a
++    simplified kotlin/<variant> layout. Separate modules differ in a
++    module segment, not under a source-set root, so they are not
++    variants of each other.
++    """
++    sa = a.replace(os.sep, "/").split("/")
++    sb = b.replace(os.sep, "/").split("/")
++    if len(sa) != len(sb):
++        return False
++    diffs = [i for i, (x, y) in enumerate(zip(sa, sb)) if x != y]
++    if len(diffs) != 1:
++        return False
++    i = diffs[0]
++    return i > 0 and sa[i - 1] in ("src", "kotlin", "java")
++
++
++def _annotate_variant_shadows(
++    node_metadata: Dict[str, Dict[str, Any]],
++    kotlin_index: _KotlinCorpusIndex,
++) -> None:
++    """PASS 4b (G5b B1): Mark build-variant shadows on node metadata.
++
++    A file whose (package, top-level type) FQN is also declared by a
++    LIVE file (fan_in > 0 or entrypoint) is a variant shadow of that
++    file, not an orphan — but only when the two paths are a variant
++    pair (review #2): same module, differing in exactly one segment
++    under a source-set root. When every twin is itself unreferenced,
++    none is marked — all stay orphans (fail closed).
++    """
++    for (_pkg, _typename), owners in kotlin_index.fqn_index.items():
++        live = sorted(
++            o for o in owners
++            if o in node_metadata
++            and (node_metadata[o].get("fan_in", 0) > 0
++                 or node_metadata[o].get("is_entrypoint"))
++        )
++        if not live:
++            continue
++        for owner in owners:
++            if owner in live or owner not in node_metadata:
++                continue
++            twin = next(
++                (l for l in live if _kotlin_variant_path_pair(owner, l)),
++                None,
++            )
++            if twin is not None:
++                node_metadata[owner]["variant_shadow_of"] = twin
++
++
+ def _finalize_edge_metadata(
+     raw_edges: List[Tuple[str, str]],
+     resolved_edge_natures: Dict[Tuple[str, str], List[str]],
+@@ -1614,6 +2092,7 @@
+     resolution_state = _ImportResolutionState(
+         scan_root_norm=scan_root_norm,
+         all_files_set=all_files_set,
++        file_map=file_map,
+         alias_rules=alias_rules,
+         kotlin_index=kotlin_index,
+         rust_index=rust_index,
+@@ -1633,6 +2112,7 @@
+     )
+ 
+     _compute_degree_metrics(all_files, edges, node_metadata)
++    _annotate_variant_shadows(node_metadata, kotlin_index)
+     boundaries, file_to_boundary = _detect_boundaries(all_files, scan_root)
+     type_shapes = _extract_corpus_type_shapes(all_files, file_map)
+ 
+--- a/core/analyzer_registry.py
++++ b/core/analyzer_registry.py
+@@ -96,11 +96,17 @@
+     """Adapter untuk unreferenced_files detection."""
+     findings = []
+     metadata = shared_graph.get("node_metadata", {})
++    variant_shadows = []
+ 
+     for fp, meta in metadata.items():
+         fan_in = meta.get("fan_in", 0)
+         is_entrypoint = meta.get("is_entrypoint", False)
+         is_test = meta.get("is_test", False)
++        shadow_of = meta.get("variant_shadow_of")
++        if shadow_of:
++            # G5b B1: build-variant shadow of a live file — not an orphan.
++            variant_shadows.append({"file": fp, "shadow_of": shadow_of})
++            continue
+ 
+         if fan_in == 0 and not is_entrypoint and not is_test:
+             findings.append({
+@@ -115,12 +121,14 @@
+             })
+ 
+     findings.sort(key=lambda f: f["file"])
++    variant_shadows.sort(key=lambda s: s["file"])
+ 
+     return {
+         "analyzer": "topo.orphan",
+         "findings": findings,
+         "summary": {
+             "total_findings": len(findings),
++            "variant_shadow_suppressed": variant_shadows,
+         },
+     }
+ 
