@@ -1,0 +1,1944 @@
+diff --git a/codebase/topology_analyzers.py b/codebase/topology_analyzers.py
+index 812cfba..8c6973a 100644
+--- a/codebase/topology_analyzers.py
++++ b/codebase/topology_analyzers.py
+@@ -336,7 +336,7 @@ def analyze_test_reachability(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+ 
+         if not reachable:
+             content = file_map.get(test_file)
+-            is_test_helper = (
++            is_test_helper = bool(metadata.get(test_file, {}).get("is_test_helper")) or (
+                 content is not None
+                 and not _TEST_CASE_MARKER_RE.search(content)
+                 and bool(reverse_edges.get(test_file, set()) & test_set)
+@@ -389,6 +389,17 @@ def analyze_test_reachability(shared_graph: Dict[str, Any]) -> Dict[str, Any]:
+         meta = metadata.get(source_file, {})
+         if _is_tool_config_file(source_file) and meta.get("fan_in", 0) < 2:
+             continue
++        if (
++            meta.get("entrypoint_kind")
++            in (
++                "project_calibration:config",
++                "project_calibration:tooling",
++                "project_calibration:script",
++                "project_calibration:test_setup",
++            )
++            and meta.get("fan_in", 0) < 2
++        ):
++            continue
+         if meta.get("is_entrypoint") or meta.get("fan_in", 0) >= 2:
+             reasons = []
+             if meta.get("is_entrypoint"):
+diff --git a/core/analyzer_registry.py b/core/analyzer_registry.py
+index 8d6e6c8..ea09d86 100644
+--- a/core/analyzer_registry.py
++++ b/core/analyzer_registry.py
+@@ -13,6 +13,7 @@ import marshal
+ import os
+ import sys
+ from typing import Any, Dict, List, Optional
++from core.project_calibration import apply_finding_suppressions as _apply_finding_suppressions
+ 
+ # Import topology analyzers
+ try:
+@@ -274,7 +275,8 @@ def run_analyzers(
+             continue
+         
+         try:
+-            results[name] = fn(shared_graph)
++            raw_res = fn(shared_graph)
++            results[name] = _apply_finding_suppressions(name, raw_res, shared_graph)
+             succeeded.append(name)
+         except Exception as exc:
+             message = str(exc)
+diff --git a/core/cli/__init__.py b/core/cli/__init__.py
+index 3f9665a..dc809b1 100644
+--- a/core/cli/__init__.py
++++ b/core/cli/__init__.py
+@@ -4,6 +4,7 @@ Domain modules (strict acyclic import layering):
+ - common: argument parsing, output normalization, error and receipt helpers
+ - analysis_cmds: context, transitions, kan, check, steer
+ - topology_cmds: topology, mermaid, simplify, angular-anchors
++- calibration_cmds: project-scoped minor calibration (status, init, add, remove, prune, suggest)
+ - ast_cmds: tree-sitter / codesearch-go AST queries
+ - agent_cmds: agent, chain, doctor, capability, skill, resolve-target, candidate, semantic
+ - memory_cmds: compact/recover/attest output, transition/Q-value memory, lineage, accountability
+diff --git a/core/cli/analysis_cmds.py b/core/cli/analysis_cmds.py
+index e7dfede..6da1cc4 100644
+--- a/core/cli/analysis_cmds.py
++++ b/core/cli/analysis_cmds.py
+@@ -236,7 +236,11 @@ def _format_check_output(result: Dict[str, Any], as_json: bool = False) -> None:
+ 
+     total_files = summary.get("total_files", result.get("total_files", "?"))
+     print(f"# [PLW Architecture & Boundary Check]")
+-    print(f"# Total Files: {total_files} | Findings: {total}")
++    if summary.get("calibration_present"):
++        sup_n = summary.get("calibrated_suppressed_count", 0)
++        print(f"# Total Files: {total_files} | Findings: {total} | Calibrated Suppressed: {sup_n}")
++    else:
++        print(f"# Total Files: {total_files} | Findings: {total}")
+     print("-" * 60)
+ 
+     critical_findings = [f for f in findings if f.get("severity") in ("critical", "high", "error")]
+diff --git a/core/cli/calibration_cmds.py b/core/cli/calibration_cmds.py
+new file mode 100644
+index 0000000..8e4aad7
+--- /dev/null
++++ b/core/cli/calibration_cmds.py
+@@ -0,0 +1,465 @@
++"""CLI command handler for project-scoped recursive minor calibration (`plw calibrate`)."""
++
++import json
++import os
++from typing import Any, Dict, List, Optional
++
++from codebase.topology_analyzers import analyze_test_reachability
++from core.analyzer_registry import analyze_orphan
++from core.cli.common import _PlwArgumentParser, _cli_error, _parse_cli_args
++from core.graph_cache import build_cached_shared_graph
++from core.project_calibration import (
++    CALIBRATION_REL_PATH,
++    audit_calibration_rules,
++    empty_calibration_config,
++    load_project_calibration,
++    match_repo_glob,
++    normalize_repo_pattern,
++    prune_stale_rules,
++    repo_relative_path,
++    suggest_calibration_candidates,
++    validate_calibration_payload,
++    validate_dir_name,
++    write_project_calibration,
++)
++from core.shared_graph import DEFAULT_IGNORE_DIRS, discover_source_files
++
++_VALID_OPERATIONS = ("status", "init", "add", "remove", "prune", "suggest")
++_VALID_KINDS = ("entrypoint", "test", "test_helper", "ignore_dir", "exclude_path", "alias", "suppress")
++
++
++def _emit_calibration_result(payload: Dict[str, Any], *, as_json: bool, title: str) -> int:
++    if as_json:
++        print(json.dumps(payload, indent=2, ensure_ascii=False))
++        return 0
++    print(f"# [{title}]")
++    if "status" in payload:
++        print(f"# Status: {payload['status']}")
++    if "path" in payload:
++        print(f"# Path: {payload['path']}")
++    if payload.get("digest"):
++        print(f"# Digest: {payload['digest']}")
++    if "counts" in payload and isinstance(payload["counts"], dict):
++        parts = [f"{k}={v}" for k, v in payload["counts"].items() if v]
++        print("# Rules: " + (", ".join(parts) if parts else "none"))
++    if "stale_count" in payload:
++        print(f"# Stale rules: {payload['stale_count']}")
++    if "removed_count" in payload:
++        print(f"# Removed stale rules: {payload['removed_count']}")
++    if "candidate_count" in payload:
++        print(f"# Candidates: {payload['candidate_count']}")
++        for cand in (payload.get("candidates") or [])[:15]:
++            cmd_str = " ".join(cand.get("apply_command") or [])
++            print(f"  - [{cand.get('action')}:{cand.get('kind')}] {cand.get('pattern')} :: {cand.get('evidence')}")
++            if cmd_str:
++                print(f"    cmd: {cmd_str}")
++    return 0
++
++
++def _discover_rel_paths(root: str, config: Optional[Dict[str, Any]]) -> List[str]:
++    ign = set(DEFAULT_IGNORE_DIRS)
++    if config:
++        ign |= set(config.get("ignore_dirs", []))
++    discovered = discover_source_files(root, ign)
++    return [repo_relative_path(fp, root) for fp in discovered]
++
++
++def cmd_calibrate(args: List[str]) -> int:
++    """Manage project-scoped `.plw/calibration.json` minor conventions cleanly and fail-closed."""
++    parser = _PlwArgumentParser(prog="plw calibrate")
++    parser.add_argument("operation", nargs="?", default="status")
++    parser.add_argument("root", nargs="?", default=".")
++    parser.add_argument("--root", default=None, dest="root_flag")
++    parser.add_argument("--kind", choices=_VALID_KINDS, default=None)
++    parser.add_argument("--pattern", "--prefix", default=None, dest="pattern")
++    parser.add_argument("--reason", default="")
++    parser.add_argument("--entry-kind", default="custom", dest="entry_kind")
++    parser.add_argument("--analyzer", default=None)
++    parser.add_argument("--rule-type", default="", dest="rule_type")
++    parser.add_argument("--target", default=None)
++    parser.add_argument("--added-by", default="agent", dest="added_by")
++    parser.add_argument("--allow-unmatched", action="store_true", dest="allow_unmatched")
++    parser.add_argument("--dry-run", action="store_true", dest="dry_run")
++    parser.add_argument("--json", action="store_true", dest="as_json")
++    opts = _parse_cli_args(parser, args)
++
++    op = str(opts.operation or "status").strip().lower()
++    root = opts.root_flag if opts.root_flag is not None else opts.root
++    if op not in _VALID_OPERATIONS:
++        root_as_op = str(opts.root or "").strip().lower()
++        if opts.root_flag is None and opts.root == "." and os.path.isdir(opts.operation):
++            root = opts.operation
++            op = "status"
++        elif opts.root_flag is None and root_as_op in _VALID_OPERATIONS and os.path.isdir(opts.operation):
++            root = opts.operation
++            op = root_as_op
++        else:
++            return _cli_error(
++                f"Unknown calibrate operation {opts.operation!r}; expected one of: {', '.join(_VALID_OPERATIONS)}",
++                as_json=opts.as_json,
++                rc=2,
++            )
++
++    if not os.path.isdir(root):
++        return _cli_error(
++            f"Target root directory does not exist: {root}",
++            code="root_not_found",
++            as_json=opts.as_json,
++            rc=2,
++        )
++
++    if op == "status":
++        state = load_project_calibration(root)
++        if state is None:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-status-v1",
++                    "status": "absent",
++                    "present": False,
++                    "valid": True,
++                    "path": CALIBRATION_REL_PATH,
++                    "scan_root": os.path.abspath(root),
++                    "counts": {},
++                    "stale_rules": [],
++                    "stale_count": 0,
++                },
++                as_json=opts.as_json,
++                title="PLW Project Calibration",
++            )
++        if not state.get("valid"):
++            return _cli_error(
++                f"Invalid {CALIBRATION_REL_PATH}: {state.get('error')}",
++                code="invalid_calibration",
++                as_json=opts.as_json,
++                rc=2,
++            )
++        cfg = state["config"]
++        rel_paths = _discover_rel_paths(root, cfg)
++        audit = audit_calibration_rules(cfg, rel_paths, scan_root=root)
++        return _emit_calibration_result(
++            {
++                "schema_version": "plw-calibration-status-v1",
++                "status": "active",
++                "present": True,
++                "valid": True,
++                "path": state["path"],
++                "scan_root": os.path.abspath(root),
++                "digest": state["digest"],
++                "counts": audit["counts"],
++                "total_rules": audit["total_rules"],
++                "matched_files": audit["matched_files"],
++                "stale_rules": audit["stale_rules"],
++                "stale_count": audit["stale_count"],
++                "config": cfg,
++            },
++            as_json=opts.as_json,
++            title="PLW Project Calibration",
++        )
++
++    if op == "init":
++        state = load_project_calibration(root)
++        if state is not None:
++            if not state.get("valid"):
++                return _cli_error(
++                    f"Existing {CALIBRATION_REL_PATH} is invalid: {state.get('error')}",
++                    code="invalid_calibration",
++                    as_json=opts.as_json,
++                    rc=2,
++                )
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-init-v1",
++                    "status": "already_initialized",
++                    "path": state["path"],
++                    "digest": state["digest"],
++                    "config": state["config"],
++                },
++                as_json=opts.as_json,
++                title="PLW Project Calibration Init",
++            )
++        cfg = empty_calibration_config()
++        if opts.dry_run:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-init-v1",
++                    "status": "dry_run",
++                    "path": CALIBRATION_REL_PATH,
++                    "config": cfg,
++                },
++                as_json=opts.as_json,
++                title="PLW Project Calibration Init",
++            )
++        written = write_project_calibration(root, cfg)
++        return _emit_calibration_result(
++            {
++                "schema_version": "plw-calibration-init-v1",
++                "status": "initialized",
++                "path": written["path"],
++                "digest": written["digest"],
++                "config": written["config"],
++            },
++            as_json=opts.as_json,
++            title="PLW Project Calibration Init",
++        )
++
++    if op == "suggest":
++        graph = build_cached_shared_graph(root)
++        orphan_res = analyze_orphan(graph)
++        reach_res = analyze_test_reachability(graph)
++        payload = suggest_calibration_candidates(root, graph, orphan_res, reach_res)
++        return _emit_calibration_result(payload, as_json=opts.as_json, title="PLW Calibration Suggestions")
++
++    if op == "prune":
++        state = load_project_calibration(root)
++        if state is None:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-prune-v1",
++                    "status": "absent",
++                    "path": CALIBRATION_REL_PATH,
++                    "removed_count": 0,
++                    "removed_rules": [],
++                },
++                as_json=opts.as_json,
++                title="PLW Calibration Prune",
++            )
++        if not state.get("valid"):
++            return _cli_error(
++                f"Invalid {CALIBRATION_REL_PATH}: {state.get('error')}",
++                code="invalid_calibration",
++                as_json=opts.as_json,
++                rc=2,
++            )
++        cfg = state["config"]
++        rel_paths = _discover_rel_paths(root, cfg)
++        pruned_cfg, removed = prune_stale_rules(cfg, rel_paths, scan_root=root)
++        if not removed:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-prune-v1",
++                    "status": "clean",
++                    "path": state["path"],
++                    "digest": state["digest"],
++                    "removed_count": 0,
++                    "removed_rules": [],
++                },
++                as_json=opts.as_json,
++                title="PLW Calibration Prune",
++            )
++        if opts.dry_run:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-prune-v1",
++                    "status": "dry_run",
++                    "path": state["path"],
++                    "removed_count": len(removed),
++                    "removed_rules": removed,
++                },
++                as_json=opts.as_json,
++                title="PLW Calibration Prune",
++            )
++        written = write_project_calibration(root, pruned_cfg)
++        return _emit_calibration_result(
++            {
++                "schema_version": "plw-calibration-prune-v1",
++                "status": "pruned",
++                "path": written["path"],
++                "digest": written["digest"],
++                "removed_count": len(removed),
++                "removed_rules": removed,
++            },
++            as_json=opts.as_json,
++            title="PLW Calibration Prune",
++        )
++
++    if not opts.kind:
++        return _cli_error(f"calibrate {op} requires --kind", as_json=opts.as_json, rc=2)
++    if not opts.pattern:
++        return _cli_error(f"calibrate {op} requires --pattern", as_json=opts.as_json, rc=2)
++
++    state = load_project_calibration(root)
++    if state is not None and not state.get("valid"):
++        return _cli_error(
++            f"Invalid {CALIBRATION_REL_PATH}: {state.get('error')}",
++            code="invalid_calibration",
++            as_json=opts.as_json,
++            rc=2,
++        )
++
++    if op == "remove":
++        if state is None:
++            return _cli_error(
++                f"Cannot remove rule: {CALIBRATION_REL_PATH} does not exist under {root}",
++                code="calibration_absent",
++                as_json=opts.as_json,
++                rc=2,
++            )
++        cfg = json.loads(json.dumps(state["config"]))
++        removed_count = 0
++        try:
++            if opts.kind == "ignore_dir":
++                dname = validate_dir_name(opts.pattern)
++                before = len(cfg["ignore_dirs"])
++                cfg["ignore_dirs"] = [d for d in cfg["ignore_dirs"] if d != dname]
++                removed_count = before - len(cfg["ignore_dirs"])
++            elif opts.kind == "alias":
++                before = len(cfg["import_aliases"])
++                cfg["import_aliases"] = [a for a in cfg["import_aliases"] if a["prefix"] != opts.pattern.strip()]
++                removed_count = before - len(cfg["import_aliases"])
++            elif opts.kind == "suppress":
++                pat = normalize_repo_pattern(opts.pattern)
++                before = len(cfg["suppress_findings"])
++                kept_sup = []
++                for item in cfg["suppress_findings"]:
++                    same_pat = item["file_pattern"] == pat
++                    same_analyzer = (not opts.analyzer) or (item["analyzer"] == opts.analyzer)
++                    same_type = (not opts.rule_type) or (item.get("rule_type", "") == opts.rule_type)
++                    if same_pat and same_analyzer and same_type:
++                        removed_count += 1
++                    else:
++                        kept_sup.append(item)
++                cfg["suppress_findings"] = kept_sup
++            else:
++                sec = {
++                    "entrypoint": "entrypoints",
++                    "test": "test_paths",
++                    "test_helper": "test_paths",
++                    "exclude_path": "exclude_paths",
++                }[opts.kind]
++                pat = normalize_repo_pattern(opts.pattern)
++                before = len(cfg[sec])
++                cfg[sec] = [r for r in cfg[sec] if r["pattern"] != pat]
++                removed_count = before - len(cfg[sec])
++        except ValueError as exc:
++            return _cli_error(str(exc), as_json=opts.as_json, rc=2)
++
++        if removed_count == 0:
++            return _cli_error(
++                f"No matching {opts.kind} rule found for pattern {opts.pattern!r}",
++                code="rule_not_found",
++                as_json=opts.as_json,
++                rc=2,
++            )
++        if opts.dry_run:
++            return _emit_calibration_result(
++                {
++                    "schema_version": "plw-calibration-remove-v1",
++                    "status": "dry_run",
++                    "path": CALIBRATION_REL_PATH,
++                    "removed_count": removed_count,
++                },
++                as_json=opts.as_json,
++                title="PLW Calibration Remove",
++            )
++        written = write_project_calibration(root, cfg)
++        return _emit_calibration_result(
++            {
++                "schema_version": "plw-calibration-remove-v1",
++                "status": "removed",
++                "path": written["path"],
++                "digest": written["digest"],
++                "removed_count": removed_count,
++            },
++            as_json=opts.as_json,
++            title="PLW Calibration Remove",
++        )
++
++    cfg = json.loads(json.dumps(state["config"])) if state else empty_calibration_config()
++    matched_files: List[str] = []
++    try:
++        if opts.kind == "ignore_dir":
++            dname = validate_dir_name(opts.pattern)
++            if dname not in cfg["ignore_dirs"]:
++                cfg["ignore_dirs"].append(dname)
++            added_rule: Any = dname
++        elif opts.kind == "alias":
++            if not opts.target:
++                return _cli_error("calibrate add --kind alias requires --target", as_json=opts.as_json, rc=2)
++            added_rule = {
++                "prefix": opts.pattern.strip(),
++                "target": opts.target,
++                "reason": opts.reason,
++                "added_by": opts.added_by,
++            }
++            cfg["import_aliases"].append(added_rule)
++        elif opts.kind == "suppress":
++            if not opts.analyzer:
++                return _cli_error("calibrate add --kind suppress requires --analyzer", as_json=opts.as_json, rc=2)
++            pat = normalize_repo_pattern(opts.pattern)
++            added_rule = {
++                "analyzer": opts.analyzer,
++                "file_pattern": pat,
++                "rule_type": opts.rule_type,
++                "reason": opts.reason,
++                "added_by": opts.added_by,
++            }
++            cfg["suppress_findings"].append(added_rule)
++        else:
++            pat = normalize_repo_pattern(opts.pattern)
++            sec = {
++                "entrypoint": "entrypoints",
++                "test": "test_paths",
++                "test_helper": "test_paths",
++                "exclude_path": "exclude_paths",
++            }[opts.kind]
++            added_rule = {"pattern": pat, "reason": opts.reason, "added_by": opts.added_by}
++            if opts.kind == "entrypoint":
++                added_rule["kind"] = opts.entry_kind
++            elif opts.kind in ("test", "test_helper"):
++                added_rule["role"] = opts.kind
++            cfg[sec].append(added_rule)
++
++        validated = validate_calibration_payload(cfg)
++    except ValueError as exc:
++        return _cli_error(str(exc), as_json=opts.as_json, rc=2)
++
++    if opts.kind not in ("ignore_dir", "alias"):
++        check_pat = added_rule["file_pattern"] if opts.kind == "suppress" else added_rule["pattern"]
++        rel_paths = _discover_rel_paths(root, cfg if opts.kind != "exclude_path" else state["config"] if state else None)
++        matched_files = [rp for rp in rel_paths if match_repo_glob(rp, check_pat)]
++        if not matched_files and not opts.allow_unmatched:
++            basename = os.path.basename(check_pat)
++            hints = [rp for rp in rel_paths if os.path.basename(rp) == basename][:3]
++            hint_msg = (
++                f" Did you mean repo-relative path(s): {', '.join(hints)} or '**/{basename}'?"
++                if hints
++                else ""
++            )
++            return _cli_error(
++                f"Pattern {check_pat!r} matched 0 source files under {root}.{hint_msg} "
++                "Pass --allow-unmatched to register intentionally.",
++                code="unmatched_pattern",
++                as_json=opts.as_json,
++                rc=2,
++            )
++
++    if opts.dry_run:
++        return _emit_calibration_result(
++            {
++                "schema_version": "plw-calibration-add-v1",
++                "status": "dry_run",
++                "path": CALIBRATION_REL_PATH,
++                "kind": opts.kind,
++                "matched_files_count": len(matched_files),
++                "matched_files": matched_files[:20],
++                "rule": added_rule,
++            },
++            as_json=opts.as_json,
++            title="PLW Calibration Add",
++        )
++
++    written = write_project_calibration(root, validated)
++    return _emit_calibration_result(
++        {
++            "schema_version": "plw-calibration-add-v1",
++            "status": "added",
++            "path": written["path"],
++            "digest": written["digest"],
++            "kind": opts.kind,
++            "matched_files_count": len(matched_files),
++            "matched_files": matched_files[:20],
++            "rule": added_rule,
++        },
++        as_json=opts.as_json,
++        title="PLW Calibration Add",
++    )
+diff --git a/core/cli/help_text.py b/core/cli/help_text.py
+index f277318..013781e 100644
+--- a/core/cli/help_text.py
++++ b/core/cli/help_text.py
+@@ -68,6 +68,8 @@ Usage:
+ 2. Analysis, quality & context
+   plw check [root] [--analyzers a,b] [--limit N] [--all] [--compact] [--json]
+       -> Quick structural & boundary check (topo.* + hott.* by default; pass --include-perf or --analyzers perf.* to opt into coding-pattern heuristics); --json includes high+medium findings
++  plw calibrate <status|init|add|remove|prune|suggest> [root] [--kind K] [--pattern PAT] [--reason TEXT] [--dry-run] [--json]
++      -> Project-scoped recursive minor calibration (.plw/calibration.json: entrypoints, test helpers, aliases, ignore_dirs, bounded suppressions)
+   plw steer [root] [--json]
+       -> Cross-domain architectural steering guidance
+   plw simplify [root] [--reference stable-root] [--json]
+diff --git a/core/cli/topology_cmds.py b/core/cli/topology_cmds.py
+index 90e3f11..b78a34e 100644
+--- a/core/cli/topology_cmds.py
++++ b/core/cli/topology_cmds.py
+@@ -10,6 +10,11 @@ from typing import Any, Dict, List
+ import hott_kernel
+ from codebase.angular_semantics import analyze_angular_ownership
+ from core.cli.common import _PlwArgumentParser, _cli_error, _parse_cli_args
++from core.project_calibration import (
++    load_project_calibration as _load_project_calibration,
++    match_repo_glob as _match_repo_glob,
++    repo_relative_path as _repo_relative_path,
++)
+ from core.simplification_analyzer import analyze_simplification, compare_simplification
+ from language_semantics import source_extensions
+ 
+@@ -63,6 +68,26 @@ def cmd_simplify(args: List[str]) -> int:
+             target_container["candidates"] = [r for r in target_container["candidates"] if _match_cand(r)]
+             result["filters"] = {"target": opts.target_filter, "kind": opts.kind_filter}
+ 
++    cal_state = _load_project_calibration(root)
++    if cal_state and cal_state.get("valid"):
++        simp_ignores = (
++            (cal_state["config"].get("style_preferences") or {}).get("simplify_ignore_patterns") or []
++        )
++        if simp_ignores:
++            target_container = result.get("candidate", {}) if reference else result
++            if isinstance(target_container, dict) and isinstance(target_container.get("candidates"), list):
++                kept_cands = []
++                suppressed_cands = 0
++                for row in target_container["candidates"]:
++                    row_files = [_repo_relative_path(str(f), root) for f in (row.get("files", []) or [])]
++                    if row_files and all(any(_match_repo_glob(rf, pat) for pat in simp_ignores) for rf in row_files):
++                        suppressed_cands += 1
++                    else:
++                        kept_cands.append(row)
++                if suppressed_cands:
++                    target_container["candidates"] = kept_cands
++                    result["calibration_simplify_suppressed_count"] = suppressed_cands
++
+     if as_json:
+         print(json.dumps(result, indent=2))
+         return 0
+@@ -280,6 +305,12 @@ def cmd_topology(args: List[str]) -> int:
+             _scc_note = f" (type-only SCCs: {_to_scc})" if _to_scc else ""
+             print(f"# Entrypoints: {inv.get('entrypoints', 0)} | tests: {inv.get('tests', 0)} | cyclic SCCs: {inv.get('cyclic_sccs', 0)}{_scc_note}")
+             print(f"# Unresolved imports: {inv.get('unresolved_imports', 0)} | external imports: {inv.get('external_imports', 0)}")
++            cal_orient = orient.get("calibration")
++            if isinstance(cal_orient, dict) and cal_orient.get("present"):
++                print(
++                    f"# Calibration: {'valid' if cal_orient.get('valid') else 'invalid'} "
++                    f"(digest={cal_orient.get('digest')}, stale={cal_orient.get('stale_count', 0)})"
++                )
+             engine = (result.get("target_orientation") or {}).get("engine") or {}
+             if engine:
+                 if engine.get("available"):
+diff --git a/core/graph_cache.py b/core/graph_cache.py
+index b7887c6..146b19c 100644
+--- a/core/graph_cache.py
++++ b/core/graph_cache.py
+@@ -18,6 +18,10 @@ import tempfile
+ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+ 
+ from language_semantics import normalize_path as _normalize_path
++from core.project_calibration import (
++    filter_excluded_paths as _filter_excluded_paths,
++    load_project_calibration as _load_project_calibration,
++)
+ from core.runtime_paths import cache_path
+ 
+ try:
+@@ -360,6 +364,10 @@ def build_cached_shared_graph(
+         )
+ 
+     ignored: Set[str] = set(_normalized_ignore_dirs(ignore_dirs))
++    cal_state = _load_project_calibration(scan_root)
++    cal_config = cal_state.get("config") if cal_state and cal_state.get("valid") else None
++    if cal_config:
++        ignored |= set(cal_config.get("ignore_dirs", []))
+     identity, key, cache_path = _cache_location(scan_root, ignored, cache_dir, include_tool_source=include_tool_source)
+ 
+     if normalized_mode == "off":
+@@ -378,7 +386,13 @@ def build_cached_shared_graph(
+         graph["cache"] = metrics
+         return graph
+ 
+-    discovered = discover_source_files(scan_root, ignored, include_tool_source=include_tool_source)
++    raw_discovered = discover_source_files(scan_root, ignored, include_tool_source=include_tool_source)
++    all_discovered_paths = list(raw_discovered.keys())
++    if cal_config and cal_config.get("exclude_paths"):
++        kept_paths, _excluded_paths = _filter_excluded_paths(all_discovered_paths, scan_root, cal_config)
++        discovered = {p: raw_discovered[p] for p in kept_paths}
++    else:
++        discovered = raw_discovered
+     cached_payload, load_error = _load_cache(cache_path, identity)
+     cached_records: Dict[str, Dict[str, Any]] = (
+         cached_payload.get("files", {}) if cached_payload else {}
+@@ -444,6 +458,7 @@ def build_cached_shared_graph(
+         ignore_dirs=ignored,
+         _file_snapshot=snapshot,
+         include_tool_source=include_tool_source,
++        _calibration_discovered_paths=all_discovered_paths if cal_config else None,
+     )
+     signature = graph_content_signature(graph)
+     metrics["graph_content_signature"] = signature
+@@ -491,8 +506,17 @@ def get_graph_cache_status(
+ ) -> Dict[str, Any]:
+     """Inspect cache freshness using stat metadata without reading sources."""
+     ignored: Set[str] = set(_normalized_ignore_dirs(ignore_dirs))
++    cal_state = _load_project_calibration(scan_root)
++    cal_config = cal_state.get("config") if cal_state and cal_state.get("valid") else None
++    if cal_config:
++        ignored |= set(cal_config.get("ignore_dirs", []))
+     identity, key, cache_path = _cache_location(scan_root, ignored, cache_dir, include_tool_source=include_tool_source)
+-    discovered = discover_source_files(scan_root, ignored, include_tool_source=include_tool_source)
++    raw_discovered = discover_source_files(scan_root, ignored, include_tool_source=include_tool_source)
++    if cal_config and cal_config.get("exclude_paths"):
++        kept_paths, _ = _filter_excluded_paths(raw_discovered.keys(), scan_root, cal_config)
++        discovered = {p: raw_discovered[p] for p in kept_paths}
++    else:
++        discovered = raw_discovered
+     cached_payload, load_error = _load_cache(cache_path, identity)
+     result: Dict[str, Any] = {
+         "cache_key": key,
+@@ -556,6 +580,10 @@ def clear_graph_cache(
+ ) -> Dict[str, Any]:
+     """Delete only the cache entry associated with one root/configuration."""
+     ignored: Set[str] = set(_normalized_ignore_dirs(ignore_dirs))
++    cal_state = _load_project_calibration(scan_root)
++    cal_config = cal_state.get("config") if cal_state and cal_state.get("valid") else None
++    if cal_config:
++        ignored |= set(cal_config.get("ignore_dirs", []))
+     identity, key, cache_path = _cache_location(scan_root, ignored, cache_dir, include_tool_source=include_tool_source)
+     del identity  # Key calculation is the only identity use needed here.
+     paths = [cache_path, *_legacy_cache_paths(scan_root, ignored, cache_dir, include_tool_source=include_tool_source)]
+diff --git a/core/kernel/inspection.py b/core/kernel/inspection.py
+index 6f95a92..d8dfbe8 100644
+--- a/core/kernel/inspection.py
++++ b/core/kernel/inspection.py
+@@ -209,6 +209,17 @@ def kernel_analyze(
+             analyzer_output.get("analyzers_failed", 0),
+         ),
+     }
++    cal_graph = shared_graph.get("calibration")
++    if isinstance(cal_graph, dict) and cal_graph.get("present"):
++        cal_sup_total = sum(
++            int((r.get("summary") or {}).get("calibrated_suppressed_count", 0))
++            for r in analyzer_output.get("results", {}).values()
++            if isinstance(r, dict)
++        )
++        unified_summary["calibration_present"] = True
++        unified_summary["calibration_valid"] = bool(cal_graph.get("valid"))
++        unified_summary["calibration_digest"] = cal_graph.get("digest")
++        unified_summary["calibrated_suppressed_count"] = cal_sup_total
+ 
+     if findings_limit is _CHECK_LIMIT_AUTO:
+         effective_limit: Optional[int] = (
+diff --git a/core/portable_agent.py b/core/portable_agent.py
+index b7436e4..3d6423b 100644
+--- a/core/portable_agent.py
++++ b/core/portable_agent.py
+@@ -11,6 +11,12 @@ import sys
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ 
++from core.project_calibration import (
++    audit_calibration_rules,
++    calibration_file_path,
++    load_project_calibration,
++    repo_relative_path,
++)
+ from core.shared_graph import DEFAULT_IGNORE_DIRS, discover_source_files
+ from core.semantic_affordance import COMMAND_CONTRACTS, describe_command
+ from language_semantics import SOURCE_EXTENSIONS
+@@ -451,6 +457,24 @@ def doctor(root: str = ".") -> Dict[str, Any]:
+     state_root = _state_root().expanduser().resolve()
+     cache_root = _cache_root().expanduser().resolve()
+     target_support = target_topology_support(str(target))
++    cal_state = load_project_calibration(str(target)) if target.is_dir() else None
++    cal_summary: Dict[str, Any] = {
++        "present": bool(cal_state and cal_state.get("present")),
++        "path": calibration_file_path(str(target)) if cal_state else ".plw/calibration.json",
++    }
++    if cal_state:
++        cal_summary["valid"] = bool(cal_state.get("valid"))
++        cal_summary["digest"] = cal_state.get("digest")
++        if cal_state.get("valid"):
++            cfg = cal_state["config"]
++            ign = set(DEFAULT_IGNORE_DIRS) | set(cfg.get("ignore_dirs", []))
++            disc = discover_source_files(str(target), ign)
++            rels = [repo_relative_path(fp, str(target)) for fp in disc]
++            audit = audit_calibration_rules(cfg, rels, scan_root=str(target))
++            cal_summary["total_rules"] = audit["total_rules"]
++            cal_summary["stale_count"] = audit["stale_count"]
++        else:
++            cal_summary["error"] = cal_state.get("error")
+     checks = {
+         "target_root_exists": target.is_dir(),
+         "embedded_version": version != "unknown",
+@@ -459,6 +483,7 @@ def doctor(root: str = ".") -> Dict[str, Any]:
+         "referenced_skills_complete": not skills.get("missing_referenced_skills"),
+         "runtime_state_outside_target": not _path_is_within(state_root, target),
+         "runtime_cache_outside_target": not _path_is_within(cache_root, target),
++        "project_calibration_valid": True if cal_state is None else bool(cal_state.get("valid")),
+     }
+     ready = all(checks.values())
+     return {
+@@ -475,6 +500,7 @@ def doctor(root: str = ".") -> Dict[str, Any]:
+         "version": version,
+         "target_root": str(target),
+         "checks": checks,
++        "project_calibration": cal_summary,
+         "target_support": target_support,
+         "runtime": {
+             "state_root": str(state_root),
+diff --git a/core/project_calibration.py b/core/project_calibration.py
+new file mode 100644
+index 0000000..7a8fbbd
+--- /dev/null
++++ b/core/project_calibration.py
+@@ -0,0 +1,910 @@
++"""Project-scoped minor calibration registry for PLW.
++
++Allows a repository to declare minor project-specific conventions in
++`<scan_root>/.plw/calibration.json` without modifying PLW core binaries:
++  - ignore_dirs: extra directory basenames excluded during discovery
++  - exclude_paths: repo-relative path globs omitted from graph/analysis
++  - entrypoints: repo-relative path globs promoted to entrypoints (e.g. JNI/FFI bridges, tooling)
++  - test_paths: repo-relative path globs marked as test or test_helper
++  - import_aliases: extra alias prefix -> repo-relative target rules merged with tsconfig paths
++  - suppress_findings: bounded finding suppressions ONLY for non-structural-invariant analyzers
++  - style_preferences: optional project preferences (e.g. simplify_ignore_patterns, notes)
++
++Guardrails:
++  - Fail-closed validation: rejects absolute paths, `..` traversal, empty suppression reasons,
++    and strictly forbids suppressing `topo.circular` or `hott.*` structural invariants.
++  - Zero circular dependencies: imports only stdlib and `language_semantics.normalize_path`.
++"""
++from __future__ import annotations
++
++from datetime import datetime, timezone
++import hashlib
++import json
++import os
++import re
++import tempfile
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
++
++from language_semantics import normalize_path
++
++CALIBRATION_SCHEMA_VERSION = "plw-project-calibration-v1"
++CALIBRATION_REL_PATH = ".plw/calibration.json"
++
++ALLOWED_SUPPRESS_ANALYZERS: frozenset[str] = frozenset({
++    "topo.orphan",
++    "topo.test_reachability",
++    "topo.risk",
++    "perf.async",
++    "perf.deopt",
++    "perf.gc",
++    "perf.cache",
++})
++
++FORBIDDEN_SUPPRESS_ANALYZERS: frozenset[str] = frozenset({
++    "topo.circular",
++    "hott.isomorphism",
++    "hott.sheaf",
++    "hott.homotopy",
++    "hott.manifold",
++})
++
++TEST_PATH_ROLES: frozenset[str] = frozenset({"test", "test_helper"})
++
++_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
++_GLOB_CACHE: Dict[str, re.Pattern[str]] = {}
++
++
++def _utc_now() -> str:
++    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
++
++
++def calibration_file_path(scan_root: str = ".") -> str:
++    root_abs = os.path.abspath(str(scan_root or "."))
++    return os.path.join(root_abs, ".plw", "calibration.json")
++
++
++def empty_calibration_config() -> Dict[str, Any]:
++    return {
++        "schema_version": CALIBRATION_SCHEMA_VERSION,
++        "updated_at": _utc_now(),
++        "ignore_dirs": [],
++        "exclude_paths": [],
++        "entrypoints": [],
++        "test_paths": [],
++        "import_aliases": [],
++        "suppress_findings": [],
++        "style_preferences": {
++            "simplify_ignore_patterns": [],
++            "notes": "",
++        },
++    }
++
++
++def validate_dir_name(raw_name: Any) -> str:
++    name = str(raw_name or "").strip()
++    if not name or name in (".", ".."):
++        raise ValueError(f"Invalid ignore_dir name: {raw_name!r}")
++    if "/" in name or "\\" in name or "*" in name or "?" in name or ":" in name:
++        raise ValueError(f"ignore_dir must be a single directory basename without slashes or globs: {raw_name!r}")
++    return name
++
++
++def normalize_repo_pattern(raw_pattern: Any, *, field_name: str = "pattern") -> str:
++    value = str(raw_pattern or "").strip().replace("\\", "/")
++    while value.startswith("./"):
++        value = value[2:]
++    value = value.rstrip("/")
++    if not value:
++        raise ValueError(f"{field_name} must be a non-empty repo-relative path or glob")
++    if value.startswith("/") or _WIN_DRIVE_RE.match(value):
++        raise ValueError(f"{field_name} must be repo-relative (not absolute): {raw_pattern!r}")
++    parts = value.split("/")
++    if any(part == ".." or part == "" for part in parts):
++        raise ValueError(f"{field_name} must not contain empty segments or '..' traversal: {raw_pattern!r}")
++    return value
++
++
++def repo_relative_path(file_path: str, scan_root: str = ".") -> str:
++    """Convert a corpus/graph file path into a normalized repo-relative POSIX path."""
++    root_norm = normalize_path(scan_root or ".")
++    fp_norm = normalize_path(file_path or "")
++    if root_norm in ("", "."):
++        rel = fp_norm
++    elif fp_norm == root_norm:
++        rel = ""
++    elif fp_norm.startswith(root_norm + "/"):
++        rel = fp_norm[len(root_norm) + 1 :]
++    else:
++        try:
++            root_abs = os.path.abspath(str(scan_root or "."))
++            fp_abs = os.path.abspath(str(file_path or ""))
++            candidate = os.path.relpath(fp_abs, root_abs).replace("\\", "/")
++            if candidate != ".." and not candidate.startswith("../"):
++                rel = candidate
++            else:
++                rel = fp_norm
++        except (OSError, ValueError):
++            rel = fp_norm
++    while rel.startswith("./"):
++        rel = rel[2:]
++    return rel
++
++
++def _compile_repo_glob(pattern: str) -> re.Pattern[str]:
++    cached = _GLOB_CACHE.get(pattern)
++    if cached is not None:
++        return cached
++    out: List[str] = ["^"]
++    i = 0
++    n = len(pattern)
++    while i < n:
++        if pattern[i : i + 3] == "**/":
++            out.append("(?:.*/)?")
++            i += 3
++            continue
++        if pattern[i : i + 2] == "**":
++            out.append(".*")
++            i += 2
++            continue
++        ch = pattern[i]
++        if ch == "*":
++            out.append("[^/]*")
++        elif ch == "?":
++            out.append("[^/]")
++        else:
++            out.append(re.escape(ch))
++        i += 1
++    out.append("$")
++    compiled = re.compile("".join(out))
++    _GLOB_CACHE[pattern] = compiled
++    return compiled
++
++
++def match_repo_glob(rel_path: str, pattern: str) -> bool:
++    rel = str(rel_path or "").replace("\\", "/").lstrip("./")
++    if not rel or not pattern:
++        return False
++    regex = _compile_repo_glob(pattern)
++    return bool(regex.match(rel))
++
++
++def _clean_reason(raw_reason: Any, *, required: bool = False, min_len: int = 8, field: str = "reason") -> str:
++    text = str(raw_reason or "").strip()
++    if required and len(text) < min_len:
++        raise ValueError(
++            f"{field} is required and must be at least {min_len} characters for auditability"
++        )
++    return text
++
++
++def _normalize_meta_fields(item: Dict[str, Any]) -> Dict[str, str]:
++    out: Dict[str, str] = {}
++    if item.get("added_by") is not None and str(item.get("added_by")).strip():
++        out["added_by"] = str(item.get("added_by")).strip()
++    if item.get("added_at") is not None and str(item.get("added_at")).strip():
++        out["added_at"] = str(item.get("added_at")).strip()
++    return out
++
++
++def validate_calibration_payload(raw: Any) -> Dict[str, Any]:
++    """Validate and canonicalize a `.plw/calibration.json` payload (fail-closed)."""
++    if not isinstance(raw, dict):
++        raise ValueError("Calibration file must contain a JSON object")
++    schema = str(raw.get("schema_version") or CALIBRATION_SCHEMA_VERSION).strip()
++    if schema != CALIBRATION_SCHEMA_VERSION:
++        raise ValueError(
++            f"Unsupported calibration schema_version {schema!r}; expected {CALIBRATION_SCHEMA_VERSION!r}"
++        )
++
++    raw_ignore = raw.get("ignore_dirs", [])
++    if not isinstance(raw_ignore, list):
++        raise ValueError("ignore_dirs must be a list of directory names")
++    ignore_dirs = sorted({validate_dir_name(item) for item in raw_ignore})
++
++    def _validate_path_entries(key: str, *, allow_kind: bool = False, allow_role: bool = False) -> List[Dict[str, Any]]:
++        items = raw.get(key, [])
++        if not isinstance(items, list):
++            raise ValueError(f"{key} must be a list")
++        by_pattern: Dict[str, Dict[str, Any]] = {}
++        for idx, item in enumerate(items):
++            if not isinstance(item, dict):
++                raise ValueError(f"{key}[{idx}] must be an object")
++            pat = normalize_repo_pattern(item.get("pattern"), field_name=f"{key}[{idx}].pattern")
++            reason = _clean_reason(item.get("reason"), required=False)
++            entry: Dict[str, Any] = {"pattern": pat, "reason": reason}
++            if allow_kind:
++                kind = str(item.get("kind") or "custom").strip().lower()
++                if not re.match(r"^[a-z][a-z0-9_-]{0,40}$", kind):
++                    raise ValueError(f"{key}[{idx}].kind must be alphanumeric/underscore/hyphen: {kind!r}")
++                entry["kind"] = kind
++            if allow_role:
++                role = str(item.get("role") or "test").strip().lower()
++                if role not in TEST_PATH_ROLES:
++                    raise ValueError(f"{key}[{idx}].role must be one of {sorted(TEST_PATH_ROLES)}: {role!r}")
++                entry["role"] = role
++            entry.update(_normalize_meta_fields(item))
++            by_pattern[pat] = entry
++        return [by_pattern[p] for p in sorted(by_pattern)]
++
++    exclude_paths = _validate_path_entries("exclude_paths")
++    entrypoints = _validate_path_entries("entrypoints", allow_kind=True)
++    test_paths = _validate_path_entries("test_paths", allow_role=True)
++
++    raw_aliases = raw.get("import_aliases", [])
++    if not isinstance(raw_aliases, list):
++        raise ValueError("import_aliases must be a list")
++    aliases_by_prefix: Dict[str, Dict[str, Any]] = {}
++    for idx, item in enumerate(raw_aliases):
++        if not isinstance(item, dict):
++            raise ValueError(f"import_aliases[{idx}] must be an object")
++        prefix = str(item.get("prefix") or "").strip()
++        if not prefix or ".." in prefix or prefix.startswith("/"):
++            raise ValueError(f"import_aliases[{idx}].prefix is invalid: {prefix!r}")
++        target = normalize_repo_pattern(item.get("target"), field_name=f"import_aliases[{idx}].target")
++        entry = {
++            "prefix": prefix,
++            "target": target,
++            "reason": _clean_reason(item.get("reason"), required=False),
++            **_normalize_meta_fields(item),
++        }
++        aliases_by_prefix[prefix] = entry
++    import_aliases = [aliases_by_prefix[k] for k in sorted(aliases_by_prefix)]
++
++    raw_sup = raw.get("suppress_findings", [])
++    if not isinstance(raw_sup, list):
++        raise ValueError("suppress_findings must be a list")
++    sup_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
++    for idx, item in enumerate(raw_sup):
++        if not isinstance(item, dict):
++            raise ValueError(f"suppress_findings[{idx}] must be an object")
++        analyzer = str(item.get("analyzer") or "").strip()
++        if analyzer in FORBIDDEN_SUPPRESS_ANALYZERS or analyzer.startswith("hott.") or analyzer == "topo.circular":
++            raise ValueError(
++                f"suppress_findings[{idx}].analyzer={analyzer!r} is forbidden: "
++                "structural cycle and HoTT invariants cannot be suppressed"
++            )
++        if analyzer not in ALLOWED_SUPPRESS_ANALYZERS:
++            raise ValueError(
++                f"suppress_findings[{idx}].analyzer={analyzer!r} is not supported; "
++                f"allowed: {', '.join(sorted(ALLOWED_SUPPRESS_ANALYZERS))}"
++            )
++        file_pattern = normalize_repo_pattern(
++            item.get("file_pattern"), field_name=f"suppress_findings[{idx}].file_pattern"
++        )
++        rule_type = str(item.get("rule_type") or "").strip()
++        reason = _clean_reason(
++            item.get("reason"),
++            required=True,
++            min_len=8,
++            field=f"suppress_findings[{idx}].reason",
++        )
++        entry = {
++            "analyzer": analyzer,
++            "file_pattern": file_pattern,
++            "rule_type": rule_type,
++            "reason": reason,
++            **_normalize_meta_fields(item),
++        }
++        sup_by_key[(analyzer, file_pattern, rule_type)] = entry
++    suppress_findings = [sup_by_key[k] for k in sorted(sup_by_key)]
++
++    raw_style = raw.get("style_preferences") or {}
++    if not isinstance(raw_style, dict):
++        raise ValueError("style_preferences must be an object")
++    raw_simp_ignores = raw_style.get("simplify_ignore_patterns") or []
++    if not isinstance(raw_simp_ignores, list):
++        raise ValueError("style_preferences.simplify_ignore_patterns must be a list")
++    simp_ignores = sorted({
++        normalize_repo_pattern(item, field_name="style_preferences.simplify_ignore_patterns")
++        for item in raw_simp_ignores
++    })
++    style_preferences = {
++        "simplify_ignore_patterns": simp_ignores,
++        "notes": str(raw_style.get("notes") or "").strip(),
++    }
++
++    normalized: Dict[str, Any] = {
++        "schema_version": CALIBRATION_SCHEMA_VERSION,
++        "ignore_dirs": ignore_dirs,
++        "exclude_paths": exclude_paths,
++        "entrypoints": entrypoints,
++        "test_paths": test_paths,
++        "import_aliases": import_aliases,
++        "suppress_findings": suppress_findings,
++        "style_preferences": style_preferences,
++    }
++    if raw.get("updated_at"):
++        normalized["updated_at"] = str(raw["updated_at"]).strip()
++    return normalized
++
++
++def calibration_digest(config: Dict[str, Any]) -> str:
++    """Stable content digest over semantic calibration rules (ignores updated_at)."""
++    semantic = {
++        k: v
++        for k, v in config.items()
++        if k != "updated_at"
++    }
++    encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
++
++
++def load_project_calibration(scan_root: str = ".") -> Optional[Dict[str, Any]]:
++    """Load and validate `<scan_root>/.plw/calibration.json` if present."""
++    path = calibration_file_path(scan_root)
++    if not os.path.exists(path):
++        return None
++    if not os.path.isfile(path):
++        return {
++            "present": True,
++            "valid": False,
++            "path": CALIBRATION_REL_PATH,
++            "error": "Calibration path exists but is not a regular file",
++            "digest": None,
++        }
++    raw_bytes = b""
++    try:
++        with open(path, "rb") as handle:
++            raw_bytes = handle.read()
++        raw_text = raw_bytes.decode("utf-8")
++        raw_obj = json.loads(raw_text)
++        config = validate_calibration_payload(raw_obj)
++    except Exception as exc:
++        return {
++            "present": True,
++            "valid": False,
++            "path": CALIBRATION_REL_PATH,
++            "error": f"{type(exc).__name__}: {exc}",
++            "digest": f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}" if raw_bytes else None,
++        }
++    return {
++        "present": True,
++        "valid": True,
++        "path": CALIBRATION_REL_PATH,
++        "digest": calibration_digest(config),
++        "config": config,
++    }
++
++
++def write_project_calibration(scan_root: str, config: Dict[str, Any]) -> Dict[str, Any]:
++    """Validate and atomically write `<scan_root>/.plw/calibration.json`."""
++    validated = validate_calibration_payload(config)
++    validated["updated_at"] = _utc_now()
++    path = calibration_file_path(scan_root)
++    parent = os.path.dirname(path)
++    os.makedirs(parent, exist_ok=True)
++    tmp_path: Optional[str] = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            mode="w",
++            encoding="utf-8",
++            dir=parent,
++            prefix=".calibration_",
++            suffix=".tmp",
++            delete=False,
++        ) as handle:
++            tmp_path = handle.name
++            json.dump(validated, handle, indent=2, ensure_ascii=False)
++            handle.write("\n")
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(tmp_path, path)
++        tmp_path = None
++    finally:
++        if tmp_path and os.path.exists(tmp_path):
++            try:
++                os.unlink(tmp_path)
++            except OSError:
++                pass
++    return {
++        "path": CALIBRATION_REL_PATH,
++        "digest": calibration_digest(validated),
++        "config": validated,
++    }
++
++
++def calibration_alias_rules(config: Dict[str, Any], scan_root_norm: str = ".") -> List[Dict[str, Any]]:
++    """Convert calibration `import_aliases` to language_semantics alias_rule dicts."""
++    rules: List[Dict[str, Any]] = []
++    for item in config.get("import_aliases", []) or []:
++        prefix = str(item.get("prefix") or "")
++        target = str(item.get("target") or "")
++        if not prefix or not target:
++            continue
++        is_wildcard = prefix.endswith("/*") or prefix.endswith("/")
++        norm_prefix = prefix[:-1] if prefix.endswith("/*") else prefix
++        norm_target = target[:-2] if target.endswith("/*") else target.rstrip("/")
++        full_target = (
++            normalize_path(os.path.join(scan_root_norm, norm_target))
++            if scan_root_norm and scan_root_norm != "."
++            else normalize_path(norm_target)
++        )
++        if is_wildcard:
++            rules.append({
++                "type": "wildcard",
++                "prefix": norm_prefix,
++                "base": full_target,
++                "source": CALIBRATION_REL_PATH,
++            })
++        else:
++            rules.append({
++                "type": "exact",
++                "pattern": norm_prefix,
++                "target": full_target,
++                "source": CALIBRATION_REL_PATH,
++            })
++    rules.sort(
++        key=lambda rule: (
++            len(rule.get("prefix", rule.get("pattern", ""))),
++            rule.get("source", ""),
++        ),
++        reverse=True,
++    )
++    return rules
++
++
++def filter_excluded_paths(
++    paths: Iterable[str],
++    scan_root: str,
++    config: Dict[str, Any],
++) -> Tuple[List[str], List[str]]:
++    """Partition paths into `(kept_paths, excluded_paths)` using `exclude_paths` globs."""
++    rules = config.get("exclude_paths", []) or []
++    if not rules:
++        return list(paths), []
++    patterns = [r["pattern"] for r in rules]
++    kept: List[str] = []
++    excluded: List[str] = []
++    for fp in paths:
++        rel = repo_relative_path(fp, scan_root)
++        if any(match_repo_glob(rel, pat) for pat in patterns):
++            excluded.append(fp)
++        else:
++            kept.append(fp)
++    return kept, excluded
++
++
++def match_entrypoint_rule(rel_path: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    for rule in config.get("entrypoints", []) or []:
++        if match_repo_glob(rel_path, rule["pattern"]):
++            return rule
++    return None
++
++
++def match_test_path_rule(rel_path: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
++    for rule in config.get("test_paths", []) or []:
++        if match_repo_glob(rel_path, rule["pattern"]):
++            return rule
++    return None
++
++
++def _alias_target_exists(scan_root: str, target: str, rel_paths: Sequence[str]) -> bool:
++    clean = target[:-2] if target.endswith("/*") else target.rstrip("/")
++    if not clean:
++        return False
++    prefix = clean + "/"
++    if any(rp == clean or rp.startswith(prefix) for rp in rel_paths):
++        return True
++    candidate = os.path.join(os.path.abspath(scan_root or "."), clean)
++    return os.path.exists(candidate)
++
++
++def audit_calibration_rules(
++    config: Dict[str, Any],
++    rel_paths: Sequence[str],
++    *,
++    scan_root: str = ".",
++) -> Dict[str, Any]:
++    """Audit how many files each rule in calibration matches and report stale rules."""
++    stale_rules: List[Dict[str, Any]] = []
++    match_counts: Dict[str, int] = {}
++
++    def _audit_section(section: str, key: str = "pattern") -> None:
++        rules = config.get(section, []) or []
++        matched = 0
++        for item in rules:
++            pat = item[key]
++            hits = [rp for rp in rel_paths if match_repo_glob(rp, pat)]
++            if hits:
++                matched += len(hits)
++            else:
++                stale_entry: Dict[str, Any] = {
++                    "section": section,
++                    key: pat,
++                    "reason": "matched_zero_source_files",
++                }
++                if section == "suppress_findings":
++                    stale_entry["analyzer"] = item.get("analyzer")
++                    if item.get("rule_type"):
++                        stale_entry["rule_type"] = item.get("rule_type")
++                stale_rules.append(stale_entry)
++        match_counts[section] = matched
++
++    _audit_section("exclude_paths")
++    _audit_section("entrypoints")
++    _audit_section("test_paths")
++    _audit_section("suppress_findings", key="file_pattern")
++
++    alias_matched = 0
++    for item in config.get("import_aliases", []) or []:
++        if _alias_target_exists(scan_root, item["target"], rel_paths):
++            alias_matched += 1
++        else:
++            stale_rules.append({
++                "section": "import_aliases",
++                "prefix": item["prefix"],
++                "target": item["target"],
++                "reason": "alias_target_missing",
++            })
++    match_counts["import_aliases"] = alias_matched
++
++    total_rules = (
++        len(config.get("ignore_dirs", []))
++        + len(config.get("exclude_paths", []))
++        + len(config.get("entrypoints", []))
++        + len(config.get("test_paths", []))
++        + len(config.get("import_aliases", []))
++        + len(config.get("suppress_findings", []))
++    )
++    return {
++        "total_rules": total_rules,
++        "counts": {
++            "ignore_dirs": len(config.get("ignore_dirs", [])),
++            "exclude_paths": len(config.get("exclude_paths", [])),
++            "entrypoints": len(config.get("entrypoints", [])),
++            "test_paths": len(config.get("test_paths", [])),
++            "import_aliases": len(config.get("import_aliases", [])),
++            "suppress_findings": len(config.get("suppress_findings", [])),
++        },
++        "matched_files": match_counts,
++        "stale_rules": stale_rules,
++        "stale_count": len(stale_rules),
++    }
++
++
++def prune_stale_rules(
++    config: Dict[str, Any],
++    rel_paths: Sequence[str],
++    *,
++    scan_root: str = ".",
++) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
++    """Remove stale rules that match 0 source files and return `(pruned_config, removed_rules)`."""
++    audit = audit_calibration_rules(config, rel_paths, scan_root=scan_root)
++    stale = audit["stale_rules"]
++    if not stale:
++        return dict(config), []
++
++    updated = json.loads(json.dumps(config))
++    stale_by_section: Dict[str, Set[Tuple[str, ...]]] = {}
++    for s in stale:
++        sec = s["section"]
++        if sec == "suppress_findings":
++            stale_by_section.setdefault(sec, set()).add(
++                (str(s.get("analyzer") or ""), str(s.get("file_pattern") or ""), str(s.get("rule_type") or ""))
++            )
++        elif sec == "import_aliases":
++            stale_by_section.setdefault(sec, set()).add((str(s.get("prefix") or ""),))
++        else:
++            stale_by_section.setdefault(sec, set()).add((str(s.get("pattern") or ""),))
++
++    for sec in ("exclude_paths", "entrypoints", "test_paths"):
++        drop = stale_by_section.get(sec, set())
++        if drop:
++            updated[sec] = [r for r in updated.get(sec, []) if (r["pattern"],) not in drop]
++    if "suppress_findings" in stale_by_section:
++        drop_sup = stale_by_section["suppress_findings"]
++        updated["suppress_findings"] = [
++            r
++            for r in updated.get("suppress_findings", [])
++            if (r["analyzer"], r["file_pattern"], str(r.get("rule_type") or "")) not in drop_sup
++        ]
++    if "import_aliases" in stale_by_section:
++        drop_alias = stale_by_section["import_aliases"]
++        updated["import_aliases"] = [
++            r for r in updated.get("import_aliases", []) if (r["prefix"],) not in drop_alias
++        ]
++    return validate_calibration_payload(updated), stale
++
++
++def _finding_matches_rule(
++    finding: Dict[str, Any],
++    rule: Dict[str, Any],
++    scan_root: str,
++) -> bool:
++    rule_type = str(rule.get("rule_type") or "").strip()
++    if rule_type and str(finding.get("type") or "") != rule_type:
++        return False
++    pattern = str(rule.get("file_pattern") or "")
++    if not pattern:
++        return False
++    fp = finding.get("file")
++    if isinstance(fp, str) and fp.strip():
++        return match_repo_glob(repo_relative_path(fp, scan_root), pattern)
++    multi = finding.get("source_files") or finding.get("files")
++    if isinstance(multi, list) and multi:
++        rels = [repo_relative_path(str(item), scan_root) for item in multi if str(item).strip()]
++        return bool(rels) and all(match_repo_glob(rel, pattern) for rel in rels)
++    return False
++
++
++def apply_finding_suppressions(
++    analyzer_name: str,
++    result: Dict[str, Any],
++    shared_graph: Dict[str, Any],
++) -> Dict[str, Any]:
++    """Apply bounded project-calibration finding suppressions transparently."""
++    calibration = shared_graph.get("calibration")
++    if not isinstance(calibration, dict) or not calibration.get("valid"):
++        return result
++    if analyzer_name not in ALLOWED_SUPPRESS_ANALYZERS:
++        return result
++    if not isinstance(result, dict) or "error" in result:
++        return result
++    raw_findings = result.get("findings")
++    if not isinstance(raw_findings, list) or not raw_findings:
++        return result
++    rules = [
++        rule
++        for rule in (calibration.get("suppress_findings") or [])
++        if isinstance(rule, dict) and rule.get("analyzer") == analyzer_name
++    ]
++    if not rules:
++        return result
++
++    scan_root = str(shared_graph.get("scan_root") or ".")
++    kept: List[Dict[str, Any]] = []
++    suppressed: List[Dict[str, Any]] = []
++    for finding in raw_findings:
++        if not isinstance(finding, dict):
++            kept.append(finding)
++            continue
++        matched_rule: Optional[Dict[str, Any]] = None
++        for rule in rules:
++            if _finding_matches_rule(finding, rule, scan_root):
++                matched_rule = rule
++                break
++        if matched_rule is None:
++            kept.append(finding)
++        else:
++            target_label = finding.get("file")
++            if not target_label:
++                multi = finding.get("source_files") or finding.get("files") or []
++                target_label = multi[0] if len(multi) == 1 else f"({len(multi)} files)"
++            else:
++                target_label = repo_relative_path(str(target_label), scan_root)
++            suppressed.append({
++                "analyzer": analyzer_name,
++                "type": finding.get("type"),
++                "severity": finding.get("severity"),
++                "target": target_label,
++                "file_pattern": matched_rule["file_pattern"],
++                "reason": matched_rule["reason"],
++            })
++
++    if not suppressed:
++        return result
++
++    updated = dict(result)
++    updated["findings"] = kept
++    summary = dict(result.get("summary") or {})
++    if "total_findings" in summary:
++        summary["total_findings"] = len(kept)
++    if analyzer_name == "topo.test_reachability":
++        summary["high_influence_without_test_path"] = sum(
++            1 for item in kept if item.get("type") == "high_influence_without_test_path"
++        )
++        summary["isolated_test_count"] = sum(
++            1 for item in kept if item.get("type") == "isolated_test"
++        )
++        summary["testless_component_count"] = sum(
++            1 for item in kept if item.get("type") == "testless_component"
++        )
++    elif analyzer_name == "topo.risk":
++        summary["high_risk"] = sum(1 for item in kept if item.get("risk_level") == "high")
++        summary["medium_risk"] = sum(1 for item in kept if item.get("risk_level") == "medium")
++        summary["low_risk"] = sum(1 for item in kept if item.get("risk_level") == "low")
++    summary["calibrated_suppressed_count"] = len(suppressed)
++    summary["calibrated_suppressed"] = suppressed
++    updated["summary"] = summary
++    return updated
++
++
++def suggest_calibration_candidates(
++    scan_root: str,
++    shared_graph: Dict[str, Any],
++    orphan_result: Dict[str, Any],
++    reach_result: Dict[str, Any],
++) -> Dict[str, Any]:
++    """Derive read-only minor calibration candidates from structural evidence."""
++    root_abs = os.path.abspath(str(scan_root or "."))
++    rel_paths = [repo_relative_path(fp, scan_root) for fp in shared_graph.get("vertices", [])]
++    file_map = shared_graph.get("file_map") or {}
++    cal_state = load_project_calibration(scan_root)
++    config = cal_state.get("config") if cal_state and cal_state.get("valid") else None
++
++    candidates: List[Dict[str, Any]] = []
++    seen_keys: Set[Tuple[str, str, str]] = set()
++
++    def _add_candidate(
++        action: str,
++        kind: str,
++        pattern: str,
++        reason: str,
++        evidence: str,
++        confidence: float,
++        *,
++        entry_kind: str = "",
++        analyzer: str = "",
++        rule_type: str = "",
++        target: str = "",
++    ) -> None:
++        key = (action, kind, pattern)
++        if key in seen_keys:
++            return
++        seen_keys.add(key)
++        cmd_parts = ["plw", "calibrate"]
++        if action == "prune":
++            cmd_parts.append("prune")
++        else:
++            cmd_parts.extend(["add", "--kind", kind, "--pattern", pattern])
++            if entry_kind:
++                cmd_parts.extend(["--entry-kind", entry_kind])
++            if analyzer:
++                cmd_parts.extend(["--analyzer", analyzer])
++            if rule_type:
++                cmd_parts.extend(["--rule-type", rule_type])
++            if target:
++                cmd_parts.extend(["--target", target])
++            cmd_parts.extend(["--reason", reason])
++        cmd_parts.extend(["--root", scan_root])
++        candidates.append({
++            "action": action,
++            "kind": kind,
++            "pattern": pattern,
++            "entry_kind": entry_kind or None,
++            "analyzer": analyzer or None,
++            "rule_type": rule_type or None,
++            "target": target or None,
++            "reason": reason,
++            "evidence": evidence,
++            "confidence": confidence,
++            "apply_command": cmd_parts,
++        })
++
++    if config is not None:
++        audit = audit_calibration_rules(config, rel_paths, scan_root=root_abs)
++        for stale in audit["stale_rules"]:
++            label = stale.get("pattern") or stale.get("file_pattern") or stale.get("prefix") or ""
++            _add_candidate(
++                "prune",
++                stale["section"],
++                label,
++                f"Existing {stale['section']} rule matches zero source files",
++                str(stale),
++                0.95,
++            )
++
++    test_dir_markers = ("/test/", "/tests/", "/__tests__/", "/e2e/", "/androidTest/", "/src/test/")
++    for finding in orphan_result.get("findings", []) or []:
++        fp = finding.get("file")
++        if not isinstance(fp, str) or not fp:
++            continue
++        rel = repo_relative_path(fp, scan_root)
++        norm_wrapped = "/" + rel.lower()
++        content = file_map.get(fp, "")
++        base = os.path.basename(rel).lower()
++
++        if any(m in norm_wrapped for m in test_dir_markers):
++            _add_candidate(
++                "add",
++                "test_helper",
++                rel,
++                "File sits inside test directory without production dependents; likely test harness/setup helper",
++                f"topo.orphan on {rel} under test directory",
++                0.88,
++            )
++            continue
++
++        if fp.endswith(".kt") and ("external fun " in content or "@JavascriptInterface" in content or "bridge" in base):
++            _add_candidate(
++                "add",
++                "entrypoint",
++                rel,
++                "Kotlin native/JNI bridge invoked across language boundary rather than Kotlin callers",
++                f"topo.orphan + bridge/external symbol markers in {rel}",
++                0.9,
++                entry_kind="jni_bridge",
++            )
++            continue
++
++        if fp.endswith(".rs") and ("#[no_mangle]" in content or 'extern "C"' in content):
++            _add_candidate(
++                "add",
++                "entrypoint",
++                rel,
++                "Rust FFI boundary module exported via extern/no_mangle",
++                f"topo.orphan + FFI markers in {rel}",
++                0.9,
++                entry_kind="ffi_entry",
++            )
++            continue
++
++        if "/scripts/" in norm_wrapped or rel.startswith("scripts/") or base in ("build.ts", "build.js", "global-setup.ts", "global-setup.js"):
++            _add_candidate(
++                "add",
++                "entrypoint",
++                rel,
++                "Build/automation helper script executed directly rather than imported",
++                f"topo.orphan on build/script helper {rel}",
++                0.85,
++                entry_kind="tooling",
++            )
++
++    for finding in reach_result.get("findings", []) or []:
++        ftype = finding.get("type")
++        fp = finding.get("file")
++        if not isinstance(fp, str) or not fp:
++            continue
++        rel = repo_relative_path(fp, scan_root)
++        norm_wrapped = "/" + rel.lower()
++        base = os.path.basename(rel).lower()
++        if ftype == "isolated_test":
++            _add_candidate(
++                "add",
++                "test_helper",
++                rel,
++                "Test-surface file has no direct production import; review if shared fixture/setup helper",
++                f"topo.test_reachability isolated_test on {rel}",
++                0.75,
++            )
++        elif ftype == "high_influence_without_test_path":
++            if "/scripts/" in norm_wrapped or rel.startswith("scripts/") or base in ("build.ts", "build.js", "vite.config.ts", "playwright.config.ts"):
++                _add_candidate(
++                    "add",
++                    "entrypoint",
++                    rel,
++                    "Tooling/build config entrypoint verified by build workflow rather than unit test imports",
++                    f"topo.test_reachability high_influence_without_test_path on {rel}",
++                    0.82,
++                    entry_kind="tooling",
++                )
++
++    return {
++        "schema_version": "plw-calibration-suggestions-v1",
++        "scan_root": root_abs,
++        "calibration_present": bool(cal_state and cal_state.get("present")),
++        "calibration_digest": cal_state.get("digest") if cal_state else None,
++        "candidate_count": len(candidates),
++        "candidates": candidates,
++        "authority": {
++            "read_only": True,
++            "auto_mutates_calibration": False,
++        },
++    }
++
++
++__all__ = [
++    "ALLOWED_SUPPRESS_ANALYZERS",
++    "CALIBRATION_REL_PATH",
++    "CALIBRATION_SCHEMA_VERSION",
++    "FORBIDDEN_SUPPRESS_ANALYZERS",
++    "TEST_PATH_ROLES",
++    "apply_finding_suppressions",
++    "audit_calibration_rules",
++    "calibration_alias_rules",
++    "calibration_digest",
++    "calibration_file_path",
++    "empty_calibration_config",
++    "filter_excluded_paths",
++    "load_project_calibration",
++    "match_entrypoint_rule",
++    "match_repo_glob",
++    "match_test_path_rule",
++    "normalize_repo_pattern",
++    "prune_stale_rules",
++    "repo_relative_path",
++    "suggest_calibration_candidates",
++    "validate_calibration_payload",
++    "validate_dir_name",
++    "write_project_calibration",
++]
+diff --git a/core/semantic_affordance.py b/core/semantic_affordance.py
+index e5a40f9..7ef08db 100644
+--- a/core/semantic_affordance.py
++++ b/core/semantic_affordance.py
+@@ -441,6 +441,18 @@ COMMAND_CONTRACTS.update({
+         ["runtime correctness", "postcondition"],
+         "skills/analysis-output-reference.md",
+     ),
++    "calibrate": _contract(
++        "Project Minor Calibration",
++        ["project calibration", "recursive repo conventions", "custom entrypoints and suppressions"],
++        ["eslint overrides", "tsconfig paths customization", "repo-specific rule tuning"],
++        ["modifying PLW core binary", "suppressing circular/HoTT structural invariants"],
++        "A project has minor framework/tooling conventions (JNI bridges, test helpers, custom aliases) causing structural check noise.",
++        "Validated `.plw/calibration.json` state, stale-rule audit, and read-only calibration suggestions.",
++        ["calibration status", "matched/stale rules", "minor rule suggestions"],
++        ["CALIBRATION_ACTIVE", "CALIBRATION_ABSENT", "SUGGESTIONS_READY"],
++        ["suppression of real dependency cycles", "runtime correctness"],
++        "skills/target-codebase-topology-workflow.md",
++    ),
+     "steer": _contract(
+         "Topology Steering Advice",
+         ["architecture diagnostics", "graph invariant guidance", "dependency steering"],
+diff --git a/core/shared_graph.py b/core/shared_graph.py
+index a598bfc..6dbead3 100644
+--- a/core/shared_graph.py
++++ b/core/shared_graph.py
+@@ -21,8 +21,17 @@ import json
+ import hashlib
+ import datetime
+ from dataclasses import dataclass
+-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+-
++from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
++
++from core.project_calibration import (
++    audit_calibration_rules as _audit_calibration_rules,
++    calibration_alias_rules as _calibration_alias_rules,
++    filter_excluded_paths as _filter_excluded_paths,
++    load_project_calibration as _load_project_calibration,
++    match_entrypoint_rule as _match_entrypoint_rule,
++    match_test_path_rule as _match_test_path_rule,
++    repo_relative_path as _repo_relative_path,
++)
+ from language_semantics import (
+     JS_RESOLUTION_EXTENSIONS as RESOLUTION_EXTENSIONS,
+     RUST_STDLIB_CRATES,
+@@ -1189,6 +1198,7 @@ def _build_node_metadata_table(
+     all_files_set: Set[str],
+     file_map: Dict[str, str],
+     ignore_dirs: Set[str],
++    calibration_config: Optional[Dict[str, Any]] = None,
+ ) -> Dict[str, Dict[str, Any]]:
+     """PASS 2: Extract node classifications, test markers, and multi-source entrypoints."""
+     manifest_entrypoints = _android_manifest_entrypoints(
+@@ -1237,10 +1247,23 @@ def _build_node_metadata_table(
+             if _is_tool_config_file(fp)
+             else (False, "none", 0.0)
+         )
++        cal_ep = (False, "none", 0.0)
++        cal_test = False
++        cal_test_helper = False
++        if calibration_config is not None:
++            rel_fp = _repo_relative_path(fp, scan_root_norm)
++            ep_rule = _match_entrypoint_rule(rel_fp, calibration_config)
++            if ep_rule is not None:
++                cal_ep = (True, f"project_calibration:{ep_rule.get('kind', 'custom')}", 0.90)
++            test_rule = _match_test_path_rule(rel_fp, calibration_config)
++            if test_rule is not None:
++                cal_test = True
++                if test_rule.get("role") == "test_helper":
++                    cal_test_helper = True
+         is_entrypoint, ep_kind, ep_conf = _pick_preferred_entrypoint(
+-            base_ep, manifest_ep, rust_ep, pkg_ep, shebang_ep, config_ep
++            base_ep, manifest_ep, rust_ep, pkg_ep, cal_ep, shebang_ep, config_ep
+         )
+-        is_test_node = _is_test_file(fp)
++        is_test_node = _is_test_file(fp) or cal_test
+         meta_entry: Dict[str, Any] = {
+             "type": _classify_node(fp, content),
+             "is_entrypoint": is_entrypoint,
+@@ -1248,6 +1271,8 @@ def _build_node_metadata_table(
+             "entrypoint_confidence": ep_conf,
+             "is_test": is_test_node,
+         }
++        if cal_test_helper:
++            meta_entry["is_test_helper"] = True
+         if fp.endswith(".rs") and not is_test_node and _rust_has_inline_tests(content):
+             meta_entry["has_inline_tests"] = True
+         node_metadata[fp] = meta_entry
+@@ -2202,6 +2227,7 @@ def build_shared_graph(
+     ignore_dirs: Optional[Set[str]] = None,
+     _file_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
+     include_tool_source: bool = False,
++    _calibration_discovered_paths: Optional[Sequence[str]] = None,
+ ) -> Dict[str, Any]:
+     """
+     Bangun SharedGraph dari satu discovery pass atau snapshot tervalidasi.
+@@ -2211,13 +2237,43 @@ def build_shared_graph(
+     """
+     if ignore_dirs is None:
+         ignore_dirs = set(DEFAULT_IGNORE_DIRS)
++    else:
++        ignore_dirs = set(ignore_dirs)
+ 
+     scan_root_norm = _normalize_path(scan_root)
++    calibration_state = _load_project_calibration(scan_root)
++    cal_config = (
++        calibration_state.get("config")
++        if calibration_state and calibration_state.get("valid")
++        else None
++    )
++    if cal_config:
++        ignore_dirs = ignore_dirs | set(cal_config.get("ignore_dirs", []))
++
+     alias_rules = _load_alias_rules([scan_root_norm, "."])
++    if cal_config and cal_config.get("import_aliases"):
++        cal_aliases = _calibration_alias_rules(cal_config, scan_root_norm)
++        alias_rules = sorted(
++            cal_aliases + alias_rules,
++            key=lambda rule: (
++                len(rule.get("prefix", rule.get("pattern", ""))),
++                rule.get("source", ""),
++            ),
++            reverse=True,
++        )
+ 
+     all_files, file_map, file_imports = _collect_corpus_sources(
+         scan_root, ignore_dirs, _file_snapshot, include_tool_source
+     )
++    pre_exclude_files = list(all_files)
++    excluded_by_calibration: List[str] = []
++    if cal_config and cal_config.get("exclude_paths"):
++        all_files, excluded_by_calibration = _filter_excluded_paths(
++            all_files, scan_root_norm, cal_config
++        )
++        for ex_fp in excluded_by_calibration:
++            file_map.pop(ex_fp, None)
++            file_imports.pop(ex_fp, None)
+     all_files_set = set(all_files)
+ 
+     kotlin_index = _build_kotlin_index(
+@@ -2229,7 +2285,12 @@ def build_shared_graph(
+     rust_index = _build_rust_index(all_files, file_map)
+ 
+     node_metadata = _build_node_metadata_table(
+-        scan_root_norm, all_files, all_files_set, file_map, ignore_dirs
++        scan_root_norm,
++        all_files,
++        all_files_set,
++        file_map,
++        ignore_dirs,
++        calibration_config=cal_config,
+     )
+ 
+     resolution_state = _ImportResolutionState(
+@@ -2314,6 +2375,36 @@ def build_shared_graph(
+             ),
+         },
+     }
++    if calibration_state is not None:
++        if cal_config is not None:
++            audit_source_paths = (
++                list(_calibration_discovered_paths)
++                if _calibration_discovered_paths is not None
++                else pre_exclude_files
++            )
++            audit_rels = [_repo_relative_path(fp, scan_root_norm) for fp in audit_source_paths]
++            audit = _audit_calibration_rules(cal_config, audit_rels, scan_root=scan_root_norm)
++            result["calibration"] = {
++                "schema_version": calibration_state["config"]["schema_version"],
++                "present": True,
++                "valid": True,
++                "path": calibration_state["path"],
++                "digest": calibration_state["digest"],
++                "counts": audit["counts"],
++                "matched_files": audit["matched_files"],
++                "stale_rules": audit["stale_rules"],
++                "stale_count": audit["stale_count"],
++                "excluded_count": len(excluded_by_calibration),
++                "suppress_findings": cal_config.get("suppress_findings", []),
++            }
++        else:
++            result["calibration"] = {
++                "present": True,
++                "valid": False,
++                "path": calibration_state.get("path"),
++                "digest": calibration_state.get("digest"),
++                "error": calibration_state.get("error"),
++            }
+     if include_tool_source:
+         result["source_ownership_policy"] = {
+             "tool_source_included": True,
+diff --git a/core/target_topology.py b/core/target_topology.py
+index 44c6184..ce1eda7 100644
+--- a/core/target_topology.py
++++ b/core/target_topology.py
+@@ -432,6 +432,15 @@ def build_target_topology_orientation(
+             "commit_truth": False,
+         },
+     }
++    cal_info = shared_graph.get("calibration")
++    if isinstance(cal_info, dict) and cal_info.get("present"):
++        result["calibration"] = {
++            "present": True,
++            "valid": bool(cal_info.get("valid")),
++            "digest": cal_info.get("digest"),
++            "stale_count": cal_info.get("stale_count", 0),
++            "counts": cal_info.get("counts", {}),
++        }
+     if include_edges:
+         result["import_edges"] = [
+             {"source": _display(src, scan_root), "target": _display(dst, scan_root)}
+diff --git a/language_semantics.py b/language_semantics.py
+index f3b7e5e..f6fb64a 100644
+--- a/language_semantics.py
++++ b/language_semantics.py
+@@ -1882,7 +1882,8 @@ def pick_preferred_entrypoint(
+     for is_ep, kind, conf in candidates:
+         if not is_ep or not kind or kind == "none":
+             continue
+-        score = (_ENTRYPOINT_KIND_PRIORITY.get(kind, 50), float(conf), kind)
++        prio = 110 if kind.startswith("project_calibration:") else _ENTRYPOINT_KIND_PRIORITY.get(kind, 50)
++        score = (prio, float(conf), kind)
+         if score > best:
+             best = score
+     if best[0] < 0:
+diff --git a/plw_cli.py b/plw_cli.py
+index 18bc507..6c1604f 100644
+--- a/plw_cli.py
++++ b/plw_cli.py
+@@ -154,6 +154,7 @@ try:
+         cmd_topology,
+         cmd_mermaid,
+     )
++    from core.cli.calibration_cmds import cmd_calibrate
+     from core.cli.ast_cmds import (
+         _resolve_ast_positionals,
+         cmd_ast,
+@@ -280,6 +281,7 @@ def _build_cli_dispatch() -> Dict[str, Callable[[List[str]], int]]:
+         (("transitions", "transition", "proof-transitions", "proof_transitions"), cmd_transitions),
+         (("kan",), cmd_kan),
+         (("check",), cmd_check),
++        (("calibrate", "calibration", "calibrations"), cmd_calibrate),
+         (("steer",), cmd_steer),
+         (("compact-output", "compact_output", "observe-output", "observe_output"), cmd_compact_output),
+         (("recover-output", "recover_output"), cmd_recover_output),
