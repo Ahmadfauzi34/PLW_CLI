@@ -105,7 +105,14 @@ grep -Fq "def rust_cargo_bin_exe_refs(" language_semantics.py
 grep -Fq "rust_facade_reexport" core/shared_graph.py
 python3 -m py_compile language_semantics.py core/shared_graph.py core/target_topology.py codebase/hott_analyzers.py codebase/cycle_break.py codebase/topology_analyzers.py codebase/performance_analyzers.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 8 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1, kotlin_extension_attribution_v1, calibration_rust_kt_topo_v1 on baked capsule v0.2.41)"
+apply_reviewable_overlay "project_calibration_v1"
+grep -Fq "CALIBRATION_SCHEMA_VERSION = \"plw-project-calibration-v1\"" core/project_calibration.py
+grep -Fq "def cmd_calibrate(" core/cli/calibration_cmds.py
+grep -Fq "FORBIDDEN_SUPPRESS_ANALYZERS" core/project_calibration.py
+grep -Fq "project_calibration_valid" core/portable_agent.py
+python3 -m py_compile core/project_calibration.py core/cli/calibration_cmds.py plw_cli.py core/shared_graph.py core/graph_cache.py core/analyzer_registry.py core/portable_agent.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 9 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1, kotlin_extension_attribution_v1, calibration_rust_kt_topo_v1, project_calibration_v1 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py
@@ -117,6 +124,8 @@ grep -Fq 'shlex.quote(' codebase/mermaid_graph.py
 grep -Fq 'KNOWN_SCHEMA = "go16"' core/codesearch_engine.py
 grep -Fq '"go16": "plw-codesearch-engine-v1"' core/codesearch_engine.py
 grep -Fq '4ace319063b87e3c120ad5d971ea2aa12e0a3c94f009550ca48193982bdb78b3' core/codesearch_engine.py
+grep -Fq 'plw-project-calibration-v1' core/project_calibration.py
+grep -Fq '"calibrate"' plw_cli.py
 
 python3 -m py_compile core/operation_plan.py
 python3 - <<'PY'

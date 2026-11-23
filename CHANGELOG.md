@@ -5,6 +5,7 @@ This file records user-facing changes in published PLW releases. Development wor
 ## Unreleased
 
 ### Added
+- Project-scoped recursive minor calibration (`.plw/calibration.json` + `plw calibrate <status|init|add|remove|prune|suggest>`): project-local overrides for `ignore_dirs`, `exclude_paths`, custom `entrypoints` (JNI/FFI bridges, tooling scripts), `test_paths` (`test` / `test_helper`), `import_aliases`, `style_preferences.simplify_ignore_patterns`, and bounded non-invariant `suppress_findings` with fail-closed validation (forbids `topo.circular` and `hott.*`), read-only candidate discovery (`suggest`), stale rule `prune`, transparent `calibrated_suppressed` accounting, cache invalidation, and `plw doctor` checks.
 - Rust & Android Kotlin `topology`, `cycle-break`, and `check` calibration: Layer-0 `non_cyclic_rust_edges`, `#[cfg(test)]` block/import/module isolation, `rust_facade_reexport` filtering, `env!("CARGO_BIN_EXE_<bin>")` target resolution, inline `#[cfg(test)]` reachability & `tests.rs`/`test.rs` test classification, Kotlin extension/top-level cycle symbol extraction, and test-helper `isolated_test` suppression.
 
 - Kotlin extension members now resolve by receiver type (`Modifier.onUnhandledTap`, `ErrorCause.text`, `JSONArray.text`): a member name shared by two files no longer attributes to the first declaring file, an ambiguous import without receiver evidence stays unresolved (`kotlin_ambiguous`), and a build-variant file shadowed by a live twin leaves the orphan list (`variant_shadow`).
