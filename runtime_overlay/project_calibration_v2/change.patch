@@ -1,0 +1,142 @@
+diff --git a/core/cli/calibration_cmds.py b/core/cli/calibration_cmds.py
+index 8e4aad7..787500e 100644
+--- a/core/cli/calibration_cmds.py
++++ b/core/cli/calibration_cmds.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import os
++import shlex
+ from typing import Any, Dict, List, Optional
+ 
+ from codebase.topology_analyzers import analyze_test_reachability
+@@ -49,10 +50,17 @@ def _emit_calibration_result(payload: Dict[str, Any], *, as_json: bool, title: s
+     if "candidate_count" in payload:
+         print(f"# Candidates: {payload['candidate_count']}")
+         for cand in (payload.get("candidates") or [])[:15]:
+-            cmd_str = " ".join(cand.get("apply_command") or [])
++            cmd_str = shlex.join(cand.get("apply_command") or [])
+             print(f"  - [{cand.get('action')}:{cand.get('kind')}] {cand.get('pattern')} :: {cand.get('evidence')}")
+             if cmd_str:
+                 print(f"    cmd: {cmd_str}")
++    if payload.get("review_hint_count"):
++        print(f"# Optional review hints (verify runtime/E2E coverage before applying): {payload['review_hint_count']}")
++        for hint in (payload.get("review_hints") or [])[:15]:
++            cmd_str = shlex.join(hint.get("apply_command") or [])
++            print(f"  - [optional:{hint.get('kind')}] {hint.get('pattern')} :: {hint.get('evidence')}")
++            if cmd_str:
++                print(f"    cmd: {cmd_str}")
+     return 0
+ 
+ 
+diff --git a/core/project_calibration.py b/core/project_calibration.py
+index 7a8fbbd..965c77c 100644
+--- a/core/project_calibration.py
++++ b/core/project_calibration.py
+@@ -50,6 +50,14 @@ FORBIDDEN_SUPPRESS_ANALYZERS: frozenset[str] = frozenset({
+ 
+ TEST_PATH_ROLES: frozenset[str] = frozenset({"test", "test_helper"})
+ 
++BRIDGE_ENTRYPOINT_KINDS: frozenset[str] = frozenset({
++    "project_calibration:jni_bridge",
++    "project_calibration:ffi_entry",
++    "project_calibration:ffi_bridge",
++    "project_calibration:jni_entry",
++    "project_calibration:native_bridge",
++})
++
+ _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+ _GLOB_CACHE: Dict[str, re.Pattern[str]] = {}
+ 
+@@ -719,11 +727,18 @@ def suggest_calibration_candidates(
+     root_abs = os.path.abspath(str(scan_root or "."))
+     rel_paths = [repo_relative_path(fp, scan_root) for fp in shared_graph.get("vertices", [])]
+     file_map = shared_graph.get("file_map") or {}
++    node_metadata = shared_graph.get("node_metadata") or {}
+     cal_state = load_project_calibration(scan_root)
+     config = cal_state.get("config") if cal_state and cal_state.get("valid") else None
+ 
++    # Respect existing bounded suppressions so already-suppressed findings are not re-suggested.
++    orphan_result = apply_finding_suppressions("topo.orphan", orphan_result, shared_graph)
++    reach_result = apply_finding_suppressions("topo.test_reachability", reach_result, shared_graph)
++
+     candidates: List[Dict[str, Any]] = []
++    review_hints: List[Dict[str, Any]] = []
+     seen_keys: Set[Tuple[str, str, str]] = set()
++    seen_hint_keys: Set[Tuple[str, str, str]] = set()
+ 
+     def _add_candidate(
+         action: str,
+@@ -868,6 +883,55 @@ def suggest_calibration_candidates(
+                     0.82,
+                     entry_kind="tooling",
+                 )
++                continue
++            meta = node_metadata.get(fp) or {}
++            ep_kind = str(meta.get("entrypoint_kind") or "")
++            if ep_kind in BRIDGE_ENTRYPOINT_KINDS:
++                hint_key = ("suppress", "topo.test_reachability", rel)
++                if hint_key not in seen_hint_keys:
++                    seen_hint_keys.add(hint_key)
++                    fan_in = int(meta.get("fan_in", finding.get("fan_in", 0)) or 0)
++                    hint_reason = (
++                        "Cross-language JNI/FFI bridge entrypoint verified via runtime/instrumentation "
++                        "tests outside the static import graph"
++                    )
++                    review_hints.append({
++                        "action": "add",
++                        "kind": "suppress",
++                        "optional": True,
++                        "requires_verification": (
++                            "Confirm runtime, instrumentation, or E2E test coverage exists before suppressing; "
++                            "PLW will not silence bridge reachability automatically."
++                        ),
++                        "pattern": rel,
++                        "entrypoint_kind": ep_kind,
++                        "fan_in": fan_in,
++                        "analyzer": "topo.test_reachability",
++                        "rule_type": "high_influence_without_test_path",
++                        "reason": hint_reason,
++                        "evidence": (
++                            f"Calibrated {ep_kind} entrypoint '{rel}' (fan_in={fan_in}) has no static "
++                            "unit-test import path (topo.test_reachability high_influence_without_test_path)"
++                        ),
++                        "confidence": 0.65,
++                        "apply_command": [
++                            "plw",
++                            "calibrate",
++                            "add",
++                            "--kind",
++                            "suppress",
++                            "--analyzer",
++                            "topo.test_reachability",
++                            "--rule-type",
++                            "high_influence_without_test_path",
++                            "--pattern",
++                            rel,
++                            "--reason",
++                            hint_reason,
++                            "--root",
++                            scan_root,
++                        ],
++                    })
+ 
+     return {
+         "schema_version": "plw-calibration-suggestions-v1",
+@@ -876,6 +940,8 @@ def suggest_calibration_candidates(
+         "calibration_digest": cal_state.get("digest") if cal_state else None,
+         "candidate_count": len(candidates),
+         "candidates": candidates,
++        "review_hint_count": len(review_hints),
++        "review_hints": review_hints,
+         "authority": {
+             "read_only": True,
+             "auto_mutates_calibration": False,
+@@ -885,6 +951,7 @@ def suggest_calibration_candidates(
+ 
+ __all__ = [
+     "ALLOWED_SUPPRESS_ANALYZERS",
++    "BRIDGE_ENTRYPOINT_KINDS",
+     "CALIBRATION_REL_PATH",
+     "CALIBRATION_SCHEMA_VERSION",
+     "FORBIDDEN_SUPPRESS_ANALYZERS",

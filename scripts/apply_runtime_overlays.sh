@@ -112,7 +112,13 @@ grep -Fq "FORBIDDEN_SUPPRESS_ANALYZERS" core/project_calibration.py
 grep -Fq "project_calibration_valid" core/portable_agent.py
 python3 -m py_compile core/project_calibration.py core/cli/calibration_cmds.py plw_cli.py core/shared_graph.py core/graph_cache.py core/analyzer_registry.py core/portable_agent.py
 
-echo "RUNTIME_OVERLAYS_APPLIED: 9 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1, kotlin_extension_attribution_v1, calibration_rust_kt_topo_v1, project_calibration_v1 on baked capsule v0.2.41)"
+apply_reviewable_overlay "project_calibration_v2"
+grep -Fq "BRIDGE_ENTRYPOINT_KINDS" core/project_calibration.py
+grep -Fq "\"review_hints\"" core/project_calibration.py
+grep -Fq "Optional review hints" core/cli/calibration_cmds.py
+python3 -m py_compile core/project_calibration.py core/cli/calibration_cmds.py
+
+echo "RUNTIME_OVERLAYS_APPLIED: 10 (plw_cli_modular_v1, engine_pin_v16, solid_architecture_v3, engine_state_v8, engine_pin_v17, calibration_py_topo_v1, kotlin_extension_attribution_v1, calibration_rust_kt_topo_v1, project_calibration_v1, project_calibration_v2 on baked capsule v0.2.41)"
 
 # Post-unpack invariant checks on the baked runtime baseline
 grep -Fq 'plw-portable-agent-v1' core/portable_agent.py
