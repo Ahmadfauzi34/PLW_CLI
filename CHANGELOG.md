@@ -5,6 +5,7 @@ This file records user-facing changes in published PLW releases. Development wor
 ## Unreleased
 
 ### Added
+- `plw calibrate suggest` now emits dedicated optional `review_hints` for calibrated JNI/FFI bridge entrypoints (`jni_bridge`, `ffi_entry`, `ffi_bridge`, `jni_entry`, `native_bridge`) reported by `topo.test_reachability` (`high_influence_without_test_path`) without auto-silencing them, filters already-suppressed findings out of suggestions, and formats suggested CLI commands with `shlex.join`.
 - Project-scoped recursive minor calibration (`.plw/calibration.json` + `plw calibrate <status|init|add|remove|prune|suggest>`): project-local overrides for `ignore_dirs`, `exclude_paths`, custom `entrypoints` (JNI/FFI bridges, tooling scripts), `test_paths` (`test` / `test_helper`), `import_aliases`, `style_preferences.simplify_ignore_patterns`, and bounded non-invariant `suppress_findings` with fail-closed validation (forbids `topo.circular` and `hott.*`), read-only candidate discovery (`suggest`), stale rule `prune`, transparent `calibrated_suppressed` accounting, cache invalidation, and `plw doctor` checks.
 - Rust & Android Kotlin `topology`, `cycle-break`, and `check` calibration: Layer-0 `non_cyclic_rust_edges`, `#[cfg(test)]` block/import/module isolation, `rust_facade_reexport` filtering, `env!("CARGO_BIN_EXE_<bin>")` target resolution, inline `#[cfg(test)]` reachability & `tests.rs`/`test.rs` test classification, Kotlin extension/top-level cycle symbol extraction, and test-helper `isolated_test` suppression.
 

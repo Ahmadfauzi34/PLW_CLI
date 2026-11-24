@@ -499,5 +499,93 @@ class ProjectCalibrationTests(unittest.TestCase):
             self.assertTrue(cal_orient.get("present"))
             self.assertTrue(cal_orient.get("valid"))
 
+
+    def test_optional_review_hints_for_jni_and_ffi_bridge_entrypoints(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="plw_cal_hints_") as tmp:
+            root = Path(tmp)
+            self._make_sample_repo(root)
+            (root / "rust_ffi").mkdir(parents=True, exist_ok=True)
+            (root / "rust_ffi" / "bridge.rs").write_text(
+                "#[no_mangle]\npub extern \"C\" fn invoke_bridge() -> i32 { 1 }\n",
+                encoding="utf-8",
+            )
+            # Regular untested entrypoint (not a bridge) must NOT receive a bridge review hint
+            (root / "src" / "cli_main.ts").write_text(
+                "export function runApp(): number { return 1; }\n",
+                encoding="utf-8",
+            )
+            (root / "package.json").write_text(
+                json.dumps({"name": "demo", "bin": {"demo": "src/cli_main.ts"}}),
+                encoding="utf-8",
+            )
+
+            # Before calibration: bridge files appear in structural candidates, review_hints is empty
+            rc0, out0 = _run_cli("calibrate", "suggest", str(root), "--json")
+            self.assertEqual(rc0, 0)
+            s0 = json.loads(out0)
+            self.assertEqual(s0["review_hint_count"], 0)
+            self.assertEqual(s0["review_hints"], [])
+            cand_pats = {c["pattern"] for c in s0["candidates"]}
+            self.assertIn("kotlin/NativeBridge.kt", cand_pats)
+            self.assertIn("rust_ffi/bridge.rs", cand_pats)
+
+            # Calibrate Kotlin JNI bridge & Rust FFI entry via suggested apply_commands
+            self.assertEqual(_run_cli("calibrate", "init", str(root), "--json")[0], 0)
+            for cand in s0["candidates"]:
+                if cand["pattern"] in ("kotlin/NativeBridge.kt", "rust_ffi/bridge.rs"):
+                    rc_a, out_a = _run_cli("calibrate", *cand["apply_command"][2:], "--json")
+                    self.assertEqual(rc_a, 0, out_a)
+
+            # Now suggest emits optional review_hints ONLY for the calibrated bridge entrypoints
+            rc1, out1 = _run_cli("calibrate", "suggest", str(root), "--json")
+            self.assertEqual(rc1, 0)
+            s1 = json.loads(out1)
+            self.assertEqual(s1["review_hint_count"], 2)
+            hint_by_pat = {h["pattern"]: h for h in s1["review_hints"]}
+            self.assertEqual(set(hint_by_pat.keys()), {"kotlin/NativeBridge.kt", "rust_ffi/bridge.rs"})
+            self.assertNotIn("src/cli_main.ts", hint_by_pat)
+            self.assertTrue(hint_by_pat["kotlin/NativeBridge.kt"]["optional"])
+            self.assertEqual(hint_by_pat["kotlin/NativeBridge.kt"]["analyzer"], "topo.test_reachability")
+            self.assertEqual(hint_by_pat["kotlin/NativeBridge.kt"]["rule_type"], "high_influence_without_test_path")
+            self.assertEqual(hint_by_pat["kotlin/NativeBridge.kt"]["entrypoint_kind"], "project_calibration:jni_bridge")
+            self.assertEqual(hint_by_pat["rust_ffi/bridge.rs"]["entrypoint_kind"], "project_calibration:ffi_entry")
+
+            # Human output renders optional review hints section with shell-quoted reason
+            rc_h, out_h = _run_cli("calibrate", "suggest", str(root))
+            self.assertEqual(rc_h, 0)
+            self.assertIn("Optional review hints", out_h)
+            self.assertIn("kotlin/NativeBridge.kt", out_h)
+
+            # Applying one optional hint clears ONLY that hint and records transparent suppression
+            kt_cmd = hint_by_pat["kotlin/NativeBridge.kt"]["apply_command"][2:]
+            rc_sup, out_sup = _run_cli("calibrate", *kt_cmd, "--json")
+            self.assertEqual(rc_sup, 0, out_sup)
+
+            rc2, out2 = _run_cli("calibrate", "suggest", str(root), "--json")
+            self.assertEqual(rc2, 0)
+            s2 = json.loads(out2)
+            self.assertEqual(s2["review_hint_count"], 1)
+            self.assertEqual(s2["review_hints"][0]["pattern"], "rust_ffi/bridge.rs")
+
+            # Also verify an already-suppressed orphan is not re-suggested in candidates
+            rc_sup_or, _ = _run_cli(
+                "calibrate",
+                "add",
+                str(root),
+                "--kind",
+                "suppress",
+                "--analyzer",
+                "topo.orphan",
+                "--pattern",
+                "test/global_setup.ts",
+                "--reason",
+                "Suppressed orphan fixture must not re-appear in suggest",
+                "--json",
+            )
+            self.assertEqual(rc_sup_or, 0)
+            rc3, out3 = _run_cli("calibrate", "suggest", str(root), "--json")
+            self.assertEqual(rc3, 0)
+            self.assertNotIn("test/global_setup.ts", {c["pattern"] for c in json.loads(out3)["candidates"]})
+
 if __name__ == "__main__":
     unittest.main()
